@@ -332,10 +332,16 @@
             : api.sshOpen(sessionId, hostId, terminal.cols, terminal.rows);
         // The overlay above the terminal shows the connection animation while
         // the session is opening; it goes away on the first terminal state.
-        openRequest.catch(error => {
-          status = 'error';
-          terminal.writeln(`\r\n\x1b[31m${String(error)}\x1b[0m`);
-        });
+        openRequest
+          .then(() => {
+            // Local PTYs have no handshake frame ('connected' is emitted only
+            // for SSH); once the spawn resolves the overlay must go away.
+            if (kind === 'local' && status === 'connecting') status = 'connected';
+          })
+          .catch(error => {
+            status = 'error';
+            terminal.writeln(`\r\n\x1b[31m${String(error)}\x1b[0m`);
+          });
       })();
     });
   });
