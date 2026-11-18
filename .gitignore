@@ -61,3 +61,5 @@ nohup.out
 npm-debug.log*
 yarn-error.log*
 .tsbuildinfo
+# Local staging for installers — distributed via GitHub Releases, not git
+/dist/
