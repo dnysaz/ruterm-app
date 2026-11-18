@@ -8,6 +8,7 @@ use rterm_core::model::{AuthMethod, Identity, IdentityKind, Vault};
 use rterm_core::oauth::{self, GoogleAccount};
 use rterm_core::ssh::{self, SshEvent, SshTarget, TermSize};
 use serde::Serialize;
+use std::path::PathBuf;
 use std::time::Duration;
 use tauri::{Emitter, Manager};
 use uuid::Uuid;
@@ -386,6 +387,146 @@ pub async fn vault_save(
     vault: Vault,
 ) -> Result<VaultPayload, String> {
     persist_vault(&state, vault).await
+}
+
+// --------------------------------------------------------------- raw JSON
+
+/// A JSON file as shown in the in-app editor. `vault.json` holds sealed
+/// secrets, so editing it is a structural edit, not a way to read passwords.
+#[derive(Serialize)]
+pub struct JsonDoc {
+    pub kind: String,
+    pub path: String,
+    pub text: String,
+}
+
+fn json_path(state: &AppState, kind: &str) -> Result<PathBuf, String> {
+    match kind {
+        "vault" => Ok(state.paths.vault.clone()),
+        "settings" => Ok(state.paths.settings.clone()),
+        other => Err(format!("Unknown JSON file: {other}")),
+    }
+}
+
+#[tauri::command]
+pub async fn json_read(
+    state: tauri::State<'_, AppState>,
+    kind: String,
+) -> Result<JsonDoc, String> {
+    let path = json_path(&state, &kind)?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        // A missing settings.json is fine: show what the app would write.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && kind == "settings" => {
+            let settings = state.settings_rw.read().await.clone();
+            serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err("No vault.json on this device yet — create a vault first".into())
+        }
+        Err(e) => return Err(format!("Failed to read {}: {e}", path.display())),
+    };
+    Ok(JsonDoc {
+        kind,
+        path: path.display().to_string(),
+        text,
+    })
+}
+
+/// Validates raw JSON before it touches disk, then keeps memory in sync.
+///
+/// `vault.json` must deserialize as the same `VaultFile` the app reads at
+/// startup; while unlocked it must also still decrypt with the current key,
+/// so a bad edit can never brick the vault or lock the user out.
+#[tauri::command]
+pub async fn json_write(
+    state: tauri::State<'_, AppState>,
+    kind: String,
+    text: String,
+) -> Result<Option<VaultPayload>, String> {
+    match kind.as_str() {
+        "vault" => {
+            let file: VaultFile = serde_json::from_str(&text)
+                .map_err(|e| format!("vault.json is not a valid vault: {e}"))?;
+            if file.schema != 1 {
+                return Err(format!(
+                    "Unsupported vault schema {} — this build reads schema 1",
+                    file.schema
+                ));
+            }
+
+            let key = state.key.read().await.clone();
+            let Some(key) = key else {
+                // Locked: structural validation is all that is possible.
+                store::write_atomic(&state.paths.vault, &file)?;
+                *state.revision.write().await = file.revision;
+                return Ok(None);
+            };
+
+            if file.kdf.is_none() {
+                return Err("vault.json must keep its kdf block, or the vault can no longer be unlocked".into());
+            }
+            let canary = secrets::open_str(&key, &file.canary)
+                .map_err(|_| "vault.json was sealed with a different key (canary failed)".to_string())?;
+            if canary != CANARY {
+                return Err("vault.json canary does not match this vault".into());
+            }
+            let vault = secrets::open_vault(&file.vault, &key).map_err(|_| {
+                "A sealed secret in vault.json no longer decrypts with this vault's key".to_string()
+            })?;
+
+            store::write_atomic(&state.paths.vault, &file)?;
+            *state.vault.write().await = Some(vault.clone());
+            *state.kdf.write().await = file.kdf.clone();
+            *state.revision.write().await = file.revision;
+            Ok(Some(VaultPayload {
+                vault,
+                revision: file.revision,
+            }))
+        }
+        "settings" => {
+            let settings: AppSettings = serde_json::from_str(&text)
+                .map_err(|e| format!("settings.json is not valid: {e}"))?;
+            store::write_settings(&state.paths.settings, &settings)?;
+            *state.settings_rw.write().await = settings;
+            Ok(None)
+        }
+        other => Err(format!("Unknown JSON file: {other}")),
+    }
+}
+
+/// Copies the current file to the user's Downloads folder (never overwrites)
+/// and returns the path so the UI can point at it.
+#[tauri::command]
+pub async fn json_download(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    kind: String,
+) -> Result<String, String> {
+    let path = json_path(&state, &kind)?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && kind == "settings" => {
+            let settings = state.settings_rw.read().await.clone();
+            serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err("No vault.json on this device yet — create a vault first".into())
+        }
+        Err(e) => return Err(format!("Failed to read {}: {e}", path.display())),
+    };
+
+    let dir = app
+        .path()
+        .download_dir()
+        .or_else(|_| app.path().home_dir())
+        .map_err(|e| format!("No download folder available: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+
+    let stamp = Utc::now().format("%Y%m%d-%H%M%S");
+    let dest = dir.join(format!("ruterm-{kind}-{stamp}.json"));
+    std::fs::write(&dest, text).map_err(|e| format!("Failed to save {}: {e}", dest.display()))?;
+    Ok(dest.display().to_string())
 }
 
 /// One-shot probe of a host to detect its OS family for the sidebar glyph.

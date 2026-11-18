@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api } from '$lib/api';
-  import { app, lock, signIn, signOut, syncNow } from '$lib/state.svelte';
+  import { app, fail, lock, notify, signIn, signOut, syncNow } from '$lib/state.svelte';
   import { applyTheme, ui, THEMES, type Theme } from '$lib/ui.svelte';
   import { isRestoreEnabled, setRestoreEnabled } from '$lib/scrollback';
   import Icon from './Icon.svelte';
@@ -11,10 +11,12 @@
     onclose,
     onopeninfo,
     onopenwhatsnew,
+    onopenjson,
   }: {
     onclose?: () => void;
     onopeninfo?: (page: 'about' | 'terms' | 'privacy' | 'contact' | 'github') => void;
     onopenwhatsnew?: () => void;
+    onopenjson?: (kind: 'vault' | 'settings') => void;
   } = $props();
 
   let version = $state('');
@@ -26,6 +28,15 @@
   }
 
   const account = $derived(app.status?.account ?? null);
+
+  async function downloadJson(kind: 'vault' | 'settings') {
+    try {
+      const dest = await api.jsonDownload(kind);
+      notify(`Saved a copy to ${dest}`);
+    } catch (error) {
+      fail(error);
+    }
+  }
 
   onMount(() => {
     // Opening the page clears any stuck text selection from behind it
@@ -149,6 +160,48 @@
           <Icon name="lock" size={14} />
           Lock vault
         </button>
+      </section>
+
+      <section class="card">
+        <h3>Data files</h3>
+
+        <div class="file-row">
+          <div class="file-text">
+            <span class="mono file-name">vault.json</span>
+            <small>Hosts, groups, keys and preferences. Secrets stay sealed.</small>
+          </div>
+          <span class="spacer"></span>
+          {#if onopenjson}
+            <button class="btn sm" type="button" onclick={() => onopenjson?.('vault')}>
+              <Icon name="edit" size={13} /> Edit JSON
+            </button>
+          {/if}
+          <button class="btn sm" type="button" onclick={() => void downloadJson('vault')}>
+            <Icon name="download" size={13} /> Download
+          </button>
+        </div>
+
+        <div class="file-row">
+          <div class="file-text">
+            <span class="mono file-name">settings.json</span>
+            <small>Google client id, bridge URL and device flags for this install.</small>
+          </div>
+          <span class="spacer"></span>
+          {#if onopenjson}
+            <button class="btn sm" type="button" onclick={() => onopenjson?.('settings')}>
+              <Icon name="edit" size={13} /> Edit JSON
+            </button>
+          {/if}
+          <button class="btn sm" type="button" onclick={() => void downloadJson('settings')}>
+            <Icon name="download" size={13} /> Download
+          </button>
+        </div>
+
+        <p class="muted tiny hint">
+          Saves are validated before they reach disk — the app refuses a vault it could not reopen
+          and keeps a <span class="mono">.bak</span> copy of the previous file. Download saves a
+          timestamped copy to your Downloads folder.
+        </p>
       </section>
 
       <section class="card">
@@ -392,6 +445,33 @@
 
   .actions {
     margin-top: 18px;
+  }
+
+  .file-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 13px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--surface);
+  }
+  .file-row + .file-row {
+    margin-top: 8px;
+  }
+  .file-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  .file-name {
+    font-size: 13.5px;
+    font-weight: 550;
+  }
+  .file-text small {
+    font-size: 12.5px;
+    color: var(--muted);
   }
 
   .legal {

@@ -116,6 +116,15 @@ export interface VaultPayload {
   revision: number;
 }
 
+/** The raw JSON files the in-app editor can show. */
+export type JsonKind = 'vault' | 'settings';
+
+export interface JsonDoc {
+  kind: JsonKind;
+  path: string;
+  text: string;
+}
+
 /** Returned by `session_attach` when a session is still alive (or recently finished). */
 export interface SessionAttach {
   found: boolean;
@@ -144,6 +153,13 @@ export const api = {
   vaultGet: () => invoke<VaultPayload | null>('vault_get'),
   vaultSave: (vault: Vault) => invoke<VaultPayload>('vault_save', { vault }),
   vaultSync: () => invoke<VaultPayload>('vault_sync'),
+
+  jsonRead: (kind: JsonKind) => invoke<JsonDoc>('json_read', { kind }),
+  /** Returns a fresh payload when the edited file was vault.json while unlocked. */
+  jsonWrite: (kind: JsonKind, text: string) =>
+    invoke<VaultPayload | null>('json_write', { kind, text }),
+  /** Saves a copy to Downloads and returns its absolute path. */
+  jsonDownload: (kind: JsonKind) => invoke<string>('json_download', { kind }),
 
   sshOpen: (sessionId: string, hostId: string, cols: number, rows: number) =>
     invoke<void>('ssh_open', { sessionId, hostId, cols, rows }),

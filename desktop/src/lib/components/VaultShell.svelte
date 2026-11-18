@@ -9,6 +9,7 @@
   import Settings from './Settings.svelte';
   import Terminal from './Terminal.svelte';
   import InfoPage from './InfoPage.svelte';
+  import JsonEditor from './JsonEditor.svelte';
   import WhatsNew from './WhatsNew.svelte';
   import { initNews, newsState } from '$lib/news.svelte';
   import { THEMES, ui } from '$lib/ui.svelte';
@@ -18,7 +19,7 @@
     hostId: string;
     title: string;
     status: SessionStatus;
-    kind: 'ssh' | 'local' | 'settings' | 'hostform' | 'info' | 'whatsnew';
+    kind: 'ssh' | 'local' | 'settings' | 'hostform' | 'info' | 'whatsnew' | 'json';
   }
 
   type InfoPageKind = 'about' | 'terms' | 'privacy' | 'contact' | 'github';
@@ -470,6 +471,27 @@
       title: "What's New",
       status: 'connected',
       kind: 'whatsnew',
+    };
+    tabs = [...tabs, tab];
+    addTabToPane(tab.id, lastFocusedOrFirst());
+  }
+
+  /** Open (or retarget and reuse) the singleton JSON editor tab. */
+  function openJsonTab(kind: 'vault' | 'settings') {
+    const existing = tabs.find(t => t.kind === 'json');
+    if (existing) {
+      if (existing.hostId !== kind) {
+        tabs = tabs.map(t => (t.kind === 'json' ? { ...t, hostId: kind } : t));
+      }
+      activateTab(existing.id);
+      return;
+    }
+    const tab: Tab = {
+      id: 'json',
+      hostId: kind,
+      title: 'JSON editor',
+      status: 'connected',
+      kind: 'json',
     };
     tabs = [...tabs, tab];
     addTabToPane(tab.id, lastFocusedOrFirst());
@@ -1240,7 +1262,15 @@
                         onclose={() => closeTab(tab.id)}
                         onopeninfo={openInfoTab}
                         onopenwhatsnew={openWhatsNewTab}
+                        onopenjson={openJsonTab}
                       />
+                    {:else if tab.kind === 'json'}
+                      {#key tab.hostId}
+                        <JsonEditor
+                          kind={tab.hostId === 'settings' ? 'settings' : 'vault'}
+                          onclose={() => closeTab(tab.id)}
+                        />
+                      {/key}
                     {:else if tab.kind === 'info'}
                       <InfoPage
                         page={tab.hostId as InfoPageKind}
