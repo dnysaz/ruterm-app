@@ -92,6 +92,30 @@ docs/                   ARCHITECTURE · BUILD · SYNC · TESTING · GOOGLE_OAUTH
 
 The frontend calls Rust directly through Tauri — no FFI/JNI/ObjC layer.
 
+## Install (prebuilt)
+
+macOS / Linux — one line, verified against the release checksums:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dnysaz/ruterm-app/main/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/dnysaz/ruterm-app/main/install.ps1 | iex
+```
+
+Or download the installers manually from the
+[releases page](https://github.com/dnysaz/ruterm-app/releases):
+`.dmg` (macOS) · `*-setup.exe` / `.msi` (Windows) · `.deb` / `.AppImage` (Linux).
+
+Builds are unsigned: macOS → right-click → **Open** (or System Settings →
+Privacy & Security → **Open Anyway**); Windows → SmartScreen → **More info →
+Run anyway**. `install.sh` clears the macOS quarantine flag for you. The script
+asks for confirmation before changing anything, never touches your vault or
+SSH keys, and supports `--dry-run`, `--yes` and `--version vX.Y.Z`.
+
 ## Quick start (macOS)
 
 Only Command Line Tools are needed — no full Xcode.

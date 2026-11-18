@@ -75,6 +75,7 @@ jobs:
         run: npm ci
 
       - name: Build & upload installers
+        # generates SHA256SUMS in a separate job below, after all builds finish
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -105,3 +106,29 @@ jobs:
             contact address in the README, never a public issue.
           releaseDraft: true
           prerelease: false
+
+  checksums:
+    name: SHA256SUMS
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir sums
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.dmg' --pattern '*.msi' --pattern '*.exe' \
+            --pattern '*.deb' --pattern '*.AppImage' \
+            --dir sums
+      - name: Generate and upload SHA256SUMS
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          (cd sums && sha256sum * > SHA256SUMS)
+          cat sums/SHA256SUMS
+          gh release upload "$GITHUB_REF_NAME" sums/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --clobber
