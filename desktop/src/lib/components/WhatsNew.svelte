@@ -186,7 +186,7 @@
   }
   .column {
     width: 100%;
-    max-width: 48rem;
+    max-width: 42rem;
     margin: 0 auto;
     display: flex;
     flex-direction: column;
@@ -243,7 +243,7 @@
   }
   .md :global(h1) {
     margin: 2px 0 10px;
-    font-size: 18px;
+    font-size: 21px;
     font-weight: 650;
     letter-spacing: -0.015em;
     line-height: 1.3;

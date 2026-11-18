@@ -204,7 +204,7 @@
   }
   .titles h1 {
     margin: 0;
-    font-size: 18px;
+    font-size: 20.5px;
     font-weight: 600;
     letter-spacing: -0.01em;
   }
@@ -220,7 +220,7 @@
   }
   .column {
     width: 100%;
-    max-width: 48rem;
+    max-width: 42rem;
     margin: 0 auto;
     display: flex;
     flex-direction: column;
