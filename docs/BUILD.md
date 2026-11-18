@@ -145,6 +145,34 @@ again and sync to re-download it).
 | Google sign-in: `redirect_uri_mismatch` | the client is not a *Desktop app* — see `GOOGLE_OAUTH.md` |
 | Slow build / OOM | `cargo build -j 2`, or cut down to release builds |
 
+## Releasing (GitHub Actions)
+
+The repository ships a `.github/workflows/release.yml` that builds all three
+installers from a version tag and uploads them to a **draft** GitHub Release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Produced artifacts:
+
+| Platform | Artifact |
+| --- | --- |
+| macOS | `RuTerm_<version>_<arch>.dmg` (`.app` inside) |
+| Windows | `RuTerm_<version>_x64-setup.exe` (NSIS) + `…_x64_en-US.msi` |
+| Linux | `RuTerm_<version>_amd64.deb` + `.AppImage` |
+
+Cross-compilation is not supported, which is why the release matrix runs
+`macos-latest`, `windows-latest` and `ubuntu-22.04` (`tauri-apps/tauri-action`).
+Everything is **unsigned by default** so the first run succeeds; see the
+commented `env` block in the workflow for the macOS signing/notarization
+secrets (`APPLE_CERTIFICATE`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`,
+`APPLE_PASSWORD`, `APPLE_TEAM_ID`) and the release notes in each artifact
+target. Signing secrets are GitHub encrypted secrets — never in the repo,
+never in the binary. A local smoke-build before tagging is still useful:
+`npm run tauri build`.
+
 ## Mobile (not active yet)
 
 The Android/iOS targets are deliberately deferred: they need the Android
