@@ -57,7 +57,7 @@ without ever being readable by anyone else.</p>
   <li>Nothing to configure. Sign in with Google and you are synced.</li>
 </ul>
 <hr />
-<p class="muted">Source: <a href="https://github.com/ketutdana/rterm">github.com/ketutdana/rterm</a> &middot;
+<p class="muted">Source: <a href="https://github.com/dnysaz/ruterm-app">github.com/dnysaz/ruterm-app</a> &middot;
 <a href="/privacy">Privacy policy</a> &middot; <a href="/health">Status</a></p>
 `);
 }
