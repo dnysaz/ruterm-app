@@ -369,7 +369,7 @@
   }
   .titles h1 {
     margin: 0;
-    font-size: 20.5px;
+    font-size: 18px;
     font-weight: 600;
     letter-spacing: -0.01em;
   }

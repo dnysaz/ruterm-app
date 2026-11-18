@@ -243,7 +243,7 @@
   }
   .md :global(h1) {
     margin: 2px 0 10px;
-    font-size: 21px;
+    font-size: 18px;
     font-weight: 650;
     letter-spacing: -0.015em;
     line-height: 1.3;
