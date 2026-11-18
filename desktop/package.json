@@ -1,0 +1,45 @@
+{
+  "name": "ruterm",
+  "version": "0.1.0",
+  "description": "RuTerm \u2014 open-source SSH workspace for the desktop: local JSON vault, sealed secrets, zero-knowledge sync",
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "preview": "vite preview",
+    "prepare": "svelte-kit sync || echo ''",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+    "tauri": "tauri",
+    "predev": "node ../News/build-index.mjs",
+    "prebuild": "node ../News/build-index.mjs"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-ligatures": "^0.10.0",
+    "@xterm/addon-serialize": "^0.14.0",
+    "@xterm/xterm": "^6.0.0",
+    "dompurify": "^3.4.18",
+    "marked": "^18.2.1"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-static": "^3.0.10",
+    "@sveltejs/kit": "^2.65.1",
+    "@sveltejs/vite-plugin-svelte": "^7.1.2",
+    "@tauri-apps/cli": "^2",
+    "svelte": "^5.56.3",
+    "svelte-check": "^4.6.0",
+    "typescript": "~6.0.3",
+    "vite": "^8.0.16"
+  },
+  "private": true,
+  "author": "dnysaz",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dnysaz/ruterm-app.git"
+  },
+  "homepage": "https://github.com/dnysaz/ruterm-app",
+  "bugs": "https://github.com/dnysaz/ruterm-app/issues"
+}

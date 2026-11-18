@@ -1,0 +1,63 @@
+# RuTerm — monorepo ignores (desktop Tauri app · rust engine · sync bridge)
+
+# Rust
+target/
+**/*.rs.bk
+
+# Desktop app (Tauri v2 + Svelte 5)
+desktop/node_modules/
+desktop/build/
+desktop/.svelte-kit/
+desktop/dist/
+desktop/static/news/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+
+# Sync bridge (Cloudflare Worker)
+bridge/node_modules/
+bridge/.wrangler/
+bridge/.dev.vars
+
+# Env / secrets — never commit these
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+**/.dev.vars
+**/.wrangler/
+**/secrets.json
+
+# Vault material (normally lives in the OS app-data dir — belt and braces)
+vault.json
+vault.json.bak
+vault.json.tmp
+settings.json
+*.key
+*.pem
+id_rsa*
+*.p12
+*.keystore
+
+# Local data / dbs
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs and scratch
+*.log
+nohup.out
+
+# OS / editors
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# Node housekeeping
+npm-debug.log*
+yarn-error.log*
+.tsbuildinfo

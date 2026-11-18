@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="%sveltekit.assets%/favicon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#131110" />
+    <title>RuTerm</title>
+    <script>
+      try {
+        var t = localStorage.getItem('rterm.theme');
+        var legacy = { dark: 'ember-black', light: 'ember-light' };
+        if (legacy[t]) t = legacy[t];
+        if (t === 'ember-black' || t === 'ember-light' || t === 'pine-black') {
+          document.documentElement.dataset.theme = t;
+        }
+      } catch (e) {}
+    </script>
+    <style>
+      /* Painted before the bundle loads so the window never flashes white. */
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background-color: #131110;
+        color: #f4f1ec;
+      }
+      html[data-theme='ember-light'],
+      html[data-theme='ember-light'] body {
+        background-color: #f4f2ee;
+        color: #201d1a;
+      }
+      html[data-theme='pine-black'],
+      html[data-theme='pine-black'] body {
+        background-color: #101312;
+        color: #eef2ee;
+      }
+    </style>
+    %sveltekit.head%
+  </head>
+  <body data-sveltekit-preload-data="hover">
+    <div style="display: contents">%sveltekit.body%</div>
+  </body>
+</html>

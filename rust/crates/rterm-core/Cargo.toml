@@ -1,0 +1,32 @@
+[package]
+name = "rterm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+russh.workspace = true
+base64.workspace = true
+rand.workspace = true
+chacha20poly1305.workspace = true
+argon2.workspace = true
+zeroize.workspace = true
+hex.workspace = true
+open = "5"
+sha2 = "0.10"
+getrandom = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "generated_at": "2026-11-18T08:46:31.864Z",
+  "entries": [
+    {
+      "file": "2026-11-18-whats-new.md",
+      "date": "2026-11-18",
+      "title": "What's New? This very tab",
+      "summary": "RuTerm now has a What's New button on the homepage. Clicking it opens this tab,"
+    },
+    {
+      "file": "2026-11-18-page-tabs.md",
+      "date": "2026-11-18",
+      "title": "Settings & host editor became full tabs",
+      "summary": "No more slide-over sheets. Settings and the host editor now open as regular"
+    },
+    {
+      "file": "2026-11-18-fresh-look.md",
+      "date": "2026-11-18",
+      "title": "A fresh coat: IBM Plex, ligatures & a calmer homepage",
+      "summary": "The whole UI switched from Manrope to IBM Plex Sans (with IBM Plex Mono for"
+    }
+  ]
+}

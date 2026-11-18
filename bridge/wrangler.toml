@@ -1,0 +1,23 @@
+# RuTerm bridge Worker — production endpoint: https://sync.lagitest.xyz
+name = "rterm-bridge"
+main = "src/index.ts"
+compatibility_date = "2025-11-01"
+
+# Custom domain: Cloudflare provisions DNS + TLS automatically and attaches the Worker.
+routes = [ { pattern = "sync.lagitest.xyz", custom_domain = true } ]
+
+# D1 database (created with `wrangler d1 create rterm-sync`).
+[[d1_databases]]
+binding = "DB"
+database_name = "rterm-sync"
+database_id = "77647b48-2403-4ecd-8ad6-c5d891833c0d"
+migrations_dir = "migrations"
+
+# Google Desktop-app client id (public identifier, safe to commit).
+# The desktop app is a PKCE public client: no client secret exists anywhere.
+[vars]
+GOOGLE_CLIENT_ID = "862686830243-0puhqofdgvdij8curlen9ic1odc2je7g.apps.googleusercontent.com"
+MAX_VAULT_BYTES = "8388608"
+
+# Secrets are NOT stored here. Set once with:
+#   wrangler secret put JWT_SECRET

@@ -1,0 +1,4 @@
+# Local dev only — never committed (repo-root .gitignore covers .dev.vars via !.env.example? no:)
+# copy to .dev.vars and fill a random value.
+JWT_SECRET=dev-only-change-me-0123456789abcdef0123456789abcdef
+GOOGLE_CLIENT_SECRET=dev-only-placeholder-desktop-client-secret
