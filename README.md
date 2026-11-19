@@ -285,7 +285,7 @@ One document, on disk and on the bridge (field-level ciphertext inside):
 | What's New (News/ → in-app tab + unread badge) | working |
 | Bridge sync | `bridge/` (Worker + D1) — hosted experimental instance at sync.lagitest.xyz |
 | Windows / Linux builds | source is portable; bundles not set up yet |
-| SFTP, port forwarding, snippets, groups UI | modelled in the vault, UI pending |
+| Port forwarding, snippets, groups UI | modelled in the vault, UI pending |
 
 ## Roadmap
 
