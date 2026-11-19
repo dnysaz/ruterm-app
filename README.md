@@ -21,9 +21,13 @@ A Termius-class workflow, built in the open.
   real terminals, not emulated panes.
 - One tab per session; drag tabs to reorder; split any session into two panes
   (left/right/top/bottom); pin, duplicate, or close from the tab's context menu.
-- **Reload-proof sessions.** Cmd+R or a crash replays each tab's scrollback
-  locally, then reconnects SSH below the restored text. Scrollback never leaves
-  your machine and is never synced; clear it any time in Settings → Sessions.
+- **Reload-proof, restart-proof sessions.** Cmd+R or a crash re-attaches each tab
+  to its live backend session — nothing reconnects. Restarting the app restores
+  the whole layout (tab order, splits, active tab per pane), replays your last
+  scrollback, reconnects SSH tabs automatically, respawns local shells in the
+  same directory, and restores quick-connect and note tabs. Scrollback never
+  leaves your machine and is never synced; clear it any time in
+  Settings → Sessions.
 - Per-tab connection status, automatic OS detection on connect, and
   trust-on-first-use host-key pinning with fingerprint shown and stored.
 - Tab right-click menu: split, duplicate, close — plus page tabs for Settings
@@ -32,9 +36,12 @@ A Termius-class workflow, built in the open.
 ### The vault
 
 - One document — `vault.json` — holds hosts, groups, identities, snippets,
-  port forwards and settings. It's plain JSON: readable, diffable, backup-able.
+  port forwards, **notes** and settings. It's plain JSON: readable, diffable,
+  backup-able.
 - **Field-level encryption.** Passwords and private keys are sealed with
   XChaCha20-Poly1305 (Argon2id-derived key); everything else stays readable.
+- **Notes** (free-form Markdown) live in the same document — sealed like
+  everything else, synced like everything else — and open as full tabs in the UI.
 - Atomic writes (tmp → fsync → rename) with the previous file kept as
   `vault.json.bak`.
 - The vault key is cached in the OS keychain so reopening the app doesn't ask
@@ -53,6 +60,13 @@ A Termius-class workflow, built in the open.
   hosted instance at `sync.lagitest.xyz`.
 - New device? Point it at the bridge, sign in, enter the same vault passphrase —
   the vault is adopted and decrypted locally.
+- Sign-in is a real identity: RuTerm shows your **Google profile photo, display
+  name and Google account ID** in Settings → Google and sync, and the sidebar
+  footer shows your photo + name. The bridge stores and returns the avatar —
+  it persists across sign-out/in cycles.
+- **Honest sync status**: a green check when this device matches the cloud, a
+  red X when local changes haven't been pushed, plus the time of the last
+  successful sync ("Last synced 5 minutes ago") — persisted across restarts.
 - Prefer no cloud at all? RuTerm is fully usable offline with nothing but the
   JSON file.
 
@@ -66,12 +80,22 @@ A Termius-class workflow, built in the open.
 
 ### Interface
 
-- Three themes: Ember Black, Ember Light, Pine Black. No gradients, no noise.
+- **Two themes** — Dark and Light — in a flat, native macOS look: grouped inset
+  lists, hairline separators, no shadows or gradients. The sidebar is
+  translucent with a backdrop blur.
 - IBM Plex Sans + IBM Plex Mono for the UI; JetBrains Mono Nerd Font in the
   terminal with programming ligatures (`->`, `=>`, `!=` render as one glyph).
+- **Backdrops** (Settings → Background): 8 bundled photos or 6 patterns — or
+  upload your own image (stored on-device, never synced) — with Frost &
+  Terminal sliders; *Terminal* makes the terminal and the note editor
+  translucent over it.
+- **Home tab** (pinned, always first): one-line **quick connect**
+  (`ssh you@host:port`), recent sessions, and one click to launch any local
+  **AI agent** you have installed (opencode & friends) — auto-detected, agent
+  icon in the bottom-right dock.
 - Page tabs instead of modals: Settings, host editor and resource pages
   (About, Terms, Privacy, Contact, GitHub) all open as regular, closable,
-  splittable tabs.
+  splittable tabs. Quick-connect and note tabs survive reload and restart.
 
 ---
 
@@ -184,7 +208,8 @@ One document, on disk and on the bridge (field-level ciphertext inside):
         "tags": ["production"], "favorite": true, "deleted": false
       }
     ],
-    "identities": [], "groups": [], "settings": { "font_size": 13 }
+    "identities": [], "groups": [], "snippets": [], "notes": [],
+    "settings": { "font_size": 13 }
   }
 }
 ```
@@ -220,8 +245,11 @@ One document, on disk and on the bridge (field-level ciphertext inside):
 | --- | --- |
 | Rust core — model, crypto, ssh, bridge, oauth | working, tested |
 | Tauri command layer | working on macOS |
-| Svelte 5 UI — unlock, host list/form, terminal, tabs, split panes, settings | working |
+| Svelte 5 UI — unlock, host list/form, terminal, tabs, split panes, settings, notes | working |
+| Session restore across reload & restart (tabs, panes, scrollback, quick-connect, notes) | working |
+| Backgrounds (bundled photos/patterns, custom upload, Frost & Terminal) | working |
 | Scrollback restore (local, never synced) | working |
+| Notes (Markdown, in the sealed vault, synced) | working |
 | What's New (News/ → in-app tab + unread badge) | working |
 | Bridge sync | `bridge/` (Worker + D1) — hosted experimental instance at sync.lagitest.xyz |
 | Windows / Linux builds | source is portable; bundles not set up yet |
