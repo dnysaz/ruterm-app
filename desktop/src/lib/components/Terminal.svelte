@@ -9,6 +9,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { api } from '$lib/api';
   import { ui, type Theme } from '$lib/ui.svelte';
+  import { terminalTint } from '$lib/background.svelte';
   import { isRestoreEnabled, readSnapshot, saveSnapshot } from '$lib/scrollback';
   import Icon from './Icon.svelte';
   import '@xterm/xterm/css/xterm.css';
@@ -19,35 +20,44 @@
     title,
     address,
     kind = 'ssh',
+    adhoc,
+    cwd,
+    command,
     onfingerprint,
     onstatus,
   }: {
     sessionId: string;
     hostId: string;
     /** `local` runs the user's own shell in a PTY instead of SSH. */
-    kind?: 'ssh' | 'local';
+    kind?: 'ssh' | 'local' | 'adhoc';
     title: string;
     /** Shown under the title in the connecting overlay. */
     address?: string;
+    /** One-shot target for quick-connect tabs (never persisted). */
+    adhoc?: { username: string; address: string; port: number };
+    /** Local PTY only: start the shell in this directory. */
+    cwd?: string;
+    /** Local PTY only: command typed into the shell right after spawn. */
+    command?: string;
     onfingerprint?: (fingerprint: string) => void;
     onstatus?: (status: SessionStatus) => void;
   } = $props();
 
   const palettes: Record<Theme, Record<string, string>> = {
-    'ember-black': {
-      background: '#171513',
-      foreground: '#edeae4',
-      cursor: '#f74c00',
-      cursorAccent: '#171513',
-      selectionBackground: 'rgba(247, 76, 0, 0.3)',
+    dark: {
+      background: '#141414',
+      foreground: '#ffffff',
+      cursor: '#0a84ff',
+      cursorAccent: '#141414',
+      selectionBackground: 'rgba(10, 132, 255, 0.3)',
       black: '#17171a',
       red: '#e8898b',
-      green: '#8fd3a8',
+      green: '#34c759',
       yellow: '#e4c082',
-      blue: '#9db8cf',
+      blue: '#0a84ff',
       magenta: '#c3a8cf',
-      cyan: '#8fd0cf',
-      white: '#d9d7d2',
+      cyan: '#64d2ee',
+      white: '#ffffff',
       brightBlack: '#5d5b57',
       brightRed: '#f0a0a1',
       brightGreen: '#a8e2bc',
@@ -57,43 +67,20 @@
       brightCyan: '#a8e0df',
       brightWhite: '#ffffff',
     },
-    'pine-black': {
-      background: '#141917',
-      foreground: '#e6ece8',
-      cursor: '#a9d4bd',
-      cursorAccent: '#141917',
-      selectionBackground: 'rgba(169, 212, 189, 0.28)',
-      black: '#1a201d',
-      red: '#ee8b8b',
-      green: '#8fd3a8',
-      yellow: '#e4c082',
-      blue: '#9db8cf',
-      magenta: '#c3a8cf',
-      cyan: '#8fd0cf',
-      white: '#d5dbd2',
-      brightBlack: '#5b6660',
-      brightRed: '#f0a0a1',
-      brightGreen: '#a8e2bc',
-      brightYellow: '#f0d29b',
-      brightBlue: '#b3c9dc',
-      brightMagenta: '#d4bcdc',
-      brightCyan: '#a8e0df',
-      brightWhite: '#ffffff',
-    },
-    'ember-light': {
-      background: '#fdfcf9',
-      foreground: '#25221f',
-      cursor: '#bf4303',
-      cursorAccent: '#fdfcf9',
-      selectionBackground: 'rgba(191, 67, 3, 0.22)',
+    light: {
+      background: '#ffffff',
+      foreground: '#1c1c1e',
+      cursor: '#0a84ff',
+      cursorAccent: '#ffffff',
+      selectionBackground: 'rgba(10, 132, 255, 0.22)',
       black: '#2f2f33',
       red: '#b3392f',
       green: '#2f7d5b',
       yellow: '#9a6a12',
-      blue: '#2f5f96',
+      blue: '#0a84ff',
       magenta: '#7a4d8c',
       cyan: '#1f6f74',
-      white: '#c9c7c2',
+      white: '#1c1c1e',
       brightBlack: '#6a6862',
       brightRed: '#c25248',
       brightGreen: '#3c9370',
@@ -111,10 +98,14 @@
   let observer: ResizeObserver | null = null;
   let flushSave: (() => void) | null = null;
   let status = $state<SessionStatus>('connecting');
+  /** Reactive tint for the terminal backdrop — see Settings → Background. */
+  const tint = $derived(terminalTint());
 
   $effect(() => {
     onstatus?.(status);
   });
+  /** Safety net for AI-agent tabs that draw nothing for a long time. */
+  let launchTimeout: ReturnType<typeof setTimeout> | undefined;
   let disposed = false;
 
   // Follow theme changes without rebuilding the terminal.
@@ -155,6 +146,8 @@
       letterSpacing: 0,
       cursorBlink: true,
       cursorStyle: 'bar',
+      // Terminal backdrop can go translucent (Settings → Background → Terminal).
+      allowTransparency: true,
       allowProposedApi: true,
       macOptionIsMeta: true,
       theme: palettes[ui.theme],
@@ -207,7 +200,103 @@
       );
     };
 
-    terminal.onData(write);
+    // -------------------------------------------------- adhoc password mode
+    /// Quick-connect ("ssh user@host:port") tries the SSH agent first. When
+    /// that fails, the terminal itself asks for a password — echo off — and
+    /// the same session is retried with it. Nothing is persisted anywhere.
+    let passwordMode = false;
+    let passwordBuffer = '';
+    let commandSentAt = 0;
+
+    const isAuthError = (message: string) => {
+      const m = message.toLowerCase();
+      return (
+        m.includes('authentication failed') ||
+        m.includes('agent error') ||
+        m.includes('permission denied') ||
+        m.includes('publickey')
+      );
+    };
+    const errorText = (error: unknown) => String((error as Error)?.message ?? error);
+
+    const openAdhoc = (password?: string) =>
+      api.sshOpenAdhoc(
+        sessionId,
+        adhoc?.username ?? '',
+        adhoc?.address ?? '',
+        adhoc?.port ?? 22,
+        password === undefined ? 'agent' : 'password',
+        password,
+        terminal.cols,
+        terminal.rows,
+      );
+
+    const startPasswordMode = (reason: string) => {
+      passwordMode = true;
+      passwordBuffer = '';
+      // 'error' hides the connecting overlay so the prompt is visible.
+      status = 'error';
+      if (reason) terminal.writeln(`\x1b[2m${reason}\x1b[0m`);
+      terminal.writeln(`\x1b[2mPassword for ${adhoc?.username}@${adhoc?.address}:\x1b[0m`);
+      terminal.write('\x1b[1mPassword:\x1b[0m ');
+      terminal.focus();
+    };
+
+    const cancelPasswordMode = () => {
+      passwordMode = false;
+      passwordBuffer = '';
+      terminal.writeln('\r\n\x1b[2m[auth cancelled — Ctrl-C]\x1b[0m');
+    };
+
+    const submitPassword = () => {
+      const password = passwordBuffer;
+      passwordBuffer = '';
+      passwordMode = false;
+      if (!password) {
+        terminal.writeln('\x1b[2m(empty password)\x1b[0m');
+        startPasswordMode('');
+        return;
+      }
+      terminal.write('\r\n');
+      status = 'connecting';
+      openAdhoc(password).catch(error => {
+        const message = errorText(error);
+        if (isAuthError(message)) {
+          startPasswordMode('authentication failed');
+        } else {
+          status = 'error';
+          terminal.writeln(`\r\n\x1b[31m${message}\x1b[0m`);
+        }
+      });
+    };
+
+    const handlePasswordInput = (data: string) => {
+      for (const char of data) {
+        if (char === '\r' || char === '\n') {
+          submitPassword();
+          return;
+        }
+        if (char === '\x7f' || char === '\b') {
+          // No echo — just drop the last buffered char.
+          passwordBuffer = passwordBuffer.slice(0, -1);
+          continue;
+        }
+        if (char === '\x03' || char === '\x04') {
+          // Ctrl-C / Ctrl-D aborts auth.
+          cancelPasswordMode();
+          return;
+        }
+        if (char >= ' ') passwordBuffer += char;
+      }
+    };
+
+    terminal.onData(data => {
+      if (passwordMode) {
+        handlePasswordInput(data);
+        return;
+      }
+      write(data);
+    });
     terminal.onResize(({ cols, rows }) => resize(cols, rows));
 
     observer = new ResizeObserver(() => {
@@ -270,6 +359,19 @@
         if (bytes) {
           terminal.write(bytes);
           scheduleSave();
+          // AI-agent tabs: the agent usually takes a few seconds to render
+          // its first frame — keep the overlay until something shows up
+          // (after the command was actually typed into the shell).
+          if (
+            kind === 'local' &&
+            command &&
+            status === 'connecting' &&
+            commandSentAt > 0 &&
+            Date.now() - commandSentAt >= 250
+          ) {
+            clearTimeout(launchTimeout);
+            status = 'connected';
+          }
         }
         return;
       }
@@ -328,19 +430,45 @@
 
         const openRequest =
           kind === 'local'
-            ? api.localOpen(sessionId, terminal.cols, terminal.rows)
-            : api.sshOpen(sessionId, hostId, terminal.cols, terminal.rows);
+            ? api.localOpen(sessionId, terminal.cols, terminal.rows, cwd).then(() => {
+                // AI-agent tabs: type the agent command once the PTY is up.
+                // The kernel buffers the write until the login shell reads
+                // it, so no timing hack is needed.
+                if (command) {
+                  const payload = toBase64(new TextEncoder().encode(`${command}\n`));
+                  commandSentAt = Date.now();
+                  void api.localWrite(sessionId, payload).catch(() => {});
+                }
+              })
+            : kind === 'adhoc'
+              ? openAdhoc()
+              : api.sshOpen(sessionId, hostId, terminal.cols, terminal.rows);
         // The overlay above the terminal shows the connection animation while
         // the session is opening; it goes away on the first terminal state.
         openRequest
           .then(() => {
             // Local PTYs have no handshake frame ('connected' is emitted only
-            // for SSH); once the spawn resolves the overlay must go away.
-            if (kind === 'local' && status === 'connecting') status = 'connected';
+            // for SSH). Without a pending agent startup we go connected right
+            // away; with one, the first output byte flips the status.
+            if (kind === 'local' && !command && status === 'connecting') status = 'connected';
+            if (kind === 'local' && command && status === 'connecting' && !launchTimeout) {
+              // Safety net: never leave the overlay up forever, even for
+              // agents that take long to draw (or stay silent).
+              launchTimeout = setTimeout(() => {
+                if (status === 'connecting') status = 'connected';
+              }, 10000);
+            }
           })
           .catch(error => {
+            const message = errorText(error);
+            // Quick-connect with a dead/empty agent falls back to an
+            // in-terminal password prompt instead of dying silently.
+            if (kind === 'adhoc' && isAuthError(message)) {
+              startPasswordMode('ssh agent sign-in failed');
+              return;
+            }
             status = 'error';
-            terminal.writeln(`\r\n\x1b[31m${String(error)}\x1b[0m`);
+            terminal.writeln(`\r\n\x1b[31m${message}\x1b[0m`);
           });
       })();
     });
@@ -348,6 +476,7 @@
 
   onDestroy(() => {
     disposed = true;
+    clearTimeout(launchTimeout);
     if (flushSave) {
       window.removeEventListener('beforeunload', flushSave);
       flushSave = null;
@@ -359,7 +488,7 @@
   });
 </script>
 
-<div class="terminal">
+<div class="terminal" style:--term-alpha={`${tint.alpha}%`} style:--term-blur={`${tint.blur}px`}>
   <div class="canvas" bind:this={container}></div>
 
   <!-- Termius-style connecting overlay: covers the blank terminal while the
@@ -371,8 +500,8 @@
           <span></span><span></span><span></span>
         </div>
         <div class="connect-text">
-          <strong>{kind === 'local' ? 'Starting shell' : 'Connecting'}<span class="ellipsis"><i>.</i><i>.</i><i>.</i></span></strong>
-          <span class="connect-addr">{address || title}</span>
+          <strong>{command ? `Launching ${title}` : kind === 'local' ? 'Starting shell' : 'Connecting'}<span class="ellipsis"><i>.</i><i>.</i><i>.</i></span></strong>
+          <span class="connect-addr">{command && cwd ? `${command} · ${cwd}` : address || title}</span>
         </div>
       </div>
       <div class="track"><span class="bar"></span></div>
@@ -385,13 +514,33 @@
     height: 100%;
     display: flex;
     flex-direction: column;
-    background: var(--panel);
+    background: transparent;
     position: relative;
   }
   .canvas {
     flex: 1;
     min-height: 0;
     padding: 10px 6px 6px 14px;
+    background: color-mix(in srgb, var(--panel) var(--term-alpha, 100%), transparent);
+    backdrop-filter: blur(var(--term-blur, 0px)) saturate(125%);
+    -webkit-backdrop-filter: blur(var(--term-blur, 0px)) saturate(125%);
+  }
+
+  /* xterm layers must stay transparent — the tint + blur live on .canvas so
+     the backdrop shows through as frosted glass. xterm v6 paints the theme
+     background as an *inline* background-color on .xterm-scrollable-element,
+     so it needs the same !important override. */
+  :global(.xterm),
+  :global(.xterm-canvas),
+  :global(.xterm .xterm-canvas),
+  :global(.xterm-scrollable-element),
+  :global(.xterm .xterm-scrollable-element),
+  :global(.xterm .xterm-viewport),
+  :global(.xterm .xterm-screen),
+  :global(.xterm .xterm-helpers .xterm-text-layer),
+  :global(.xterm .xterm-helpers .xterm-text-layer canvas),
+  :global(.xterm .xterm-helpers .xterm-text-layer .xterm-selection) {
+    background-color: transparent !important;
   }
 
   /* ------------------------------------------------------- connect overlay */
@@ -411,10 +560,9 @@
     padding: 16px 22px;
     border: 1px solid var(--line);
     border-radius: 14px;
-    background: var(--glass);
+    background: var(--bg-elevated);
     backdrop-filter: blur(24px) saturate(140%);
     -webkit-backdrop-filter: blur(24px) saturate(140%);
-    box-shadow: var(--shadow-strong);
   }
   .pulse {
     display: flex;
@@ -442,7 +590,7 @@
     min-width: 0;
   }
   .connect-text strong {
-    font-size: 16.5px;
+    font-size: 13.5px;
     font-weight: 600;
     letter-spacing: -0.01em;
     white-space: nowrap;
@@ -450,7 +598,7 @@
   .connect-addr {
     font-family: var(--mono);
     font-size: 14px;
-    color: var(--muted);
+    color: var(--text-secondary);
     white-space: nowrap;
   }
   .ellipsis i {

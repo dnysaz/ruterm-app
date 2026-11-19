@@ -60,6 +60,12 @@ pub struct BridgeUser {
     pub email: String,
     #[serde(default)]
     pub name: String,
+    /// Google profile photo URL, when the bridge provides it.
+    #[serde(default)]
+    pub picture: Option<String>,
+    /// The user's Google account id (`sub`), when the bridge provides it.
+    #[serde(default)]
+    pub sub: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

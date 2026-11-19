@@ -2,9 +2,10 @@
   import { onMount } from 'svelte';
   import { api } from '$lib/api';
   import { app, fail, lock, notify, signIn, signOut, syncNow } from '$lib/state.svelte';
-  import { applyTheme, ui, THEMES, type Theme } from '$lib/ui.svelte';
+  import { applyTheme, ui, type Theme } from '$lib/ui.svelte';
   import { isRestoreEnabled, setRestoreEnabled } from '$lib/scrollback';
   import Icon from './Icon.svelte';
+  import BackgroundSettings from './BackgroundSettings.svelte';
   import { newsState } from '$lib/news.svelte';
 
   let {
@@ -29,6 +30,26 @@
 
   const account = $derived(app.status?.account ?? null);
 
+  const relativeLastSync = (iso: string | null | undefined): string => {
+    if (!iso) return 'never';
+    const then = new Date(iso);
+    if (Number.isNaN(then.getTime())) return 'never';
+    const secs = Math.max(0, Math.floor((Date.now() - then.getTime()) / 1000));
+    if (secs < 45) return 'just now';
+    const mins = Math.floor(secs / 60);
+    if (mins < 60) return `${mins} minute${mins === 1 ? '' : 's'} ago`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+    const days = Math.floor(hours / 24);
+    if (days < 31) return `${days} day${days === 1 ? '' : 's'} ago`;
+    return then.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
+  };
+  const lastSyncAt = $derived(app.status?.last_synced_at ?? null);
+  const synced = $derived(
+    !!account && !!lastSyncAt && app.revision === (app.status?.synced_revision ?? -1),
+  );
+  const lastSyncText = $derived(relativeLastSync(lastSyncAt));
+
   async function downloadJson(kind: 'vault' | 'settings') {
     try {
       const dest = await api.jsonDownload(kind);
@@ -47,11 +68,11 @@
 
 </script>
 
-<div class="settings-page">
+<div class="page">
   <header class="page-head">
     <div class="titles">
       <h1>Settings</h1>
-      <p class="muted sub">Google sync, appearance and sessions — everything lives on this device.</p>
+      <p class="sub">Google sync, appearance and sessions — everything lives on this device.</p>
     </div>
     <span class="spacer"></span>
     {#if onclose}
@@ -63,186 +84,258 @@
 
   <div class="scroll">
     <div class="column">
-      <section class="card">
-        <h3>Google and sync</h3>
 
-        {#if account}
-          <div class="account">
-            <span class="avatar">{account.email.slice(0, 1).toUpperCase()}</span>
-            <div class="who">
-              <div class="email">{account.email}</div>
-              <div class="muted tiny">Refresh token kept in the OS keychain</div>
+      <section class="section">
+        <h2 class="section-title">Google and sync</h2>
+        <div class="group">
+          {#if account}
+            <div class="row">
+              {#if account.picture}
+                <img
+                  class="avatar avatar-img"
+                  src={account.picture}
+                  alt=""
+                  referrerpolicy="no-referrer"
+                />
+              {:else}
+                <span class="avatar">{(account.name ?? account.email).slice(0, 1).toUpperCase()}</span>
+              {/if}
+              <div class="cell">
+                <div class="strong">{account.name ?? account.email}</div>
+                <small>{account.email}</small>
+              </div>
+              <button class="btn sm" onclick={() => void signOut()}>Sign out</button>
             </div>
-            <span class="spacer"></span>
-            <button class="btn sm" onclick={() => void signOut()}>Sign out</button>
-          </div>
-        {:else}
-          <button class="btn" onclick={() => void signIn()}>Sign in with Google</button>
-        {/if}
+            {#if account.sub}
+              <div class="row kv">
+                <span class="kv-label">Google ID</span>
+                <span class="value mono">{account.sub}</span>
+              </div>
+            {/if}
+          {:else}
+            <div class="row">
+              <div class="cell">
+                <div class="strong">Not signed in</div>
+                <small>Sign in once to start syncing this vault between your devices.</small>
+              </div>
+              <button class="btn sm primary" onclick={() => void signIn()}>Sign in with Google</button>
+            </div>
+          {/if}
 
-        <p class="muted tiny hint">
+          <div class="row">
+            {#if account}
+              <span class="sync-badge" class:bad={!synced} aria-hidden="true">
+                {#if synced}
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2.6"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  ><path d="M5.5 12.9l4.2 4.1L18.5 8.4" /></svg>
+                {:else}
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2.6"
+                    stroke-linecap="round"
+                  ><path d="M7 7l10 10M17 7L7 17" /></svg>
+                {/if}
+              </span>
+              <div class="cell">
+                <div class="strong">{synced ? 'Synced' : 'Not synced'}</div>
+                <small>Last synced: {lastSyncText}</small>
+              </div>
+            {:else}
+              <span class="sync-badge off" aria-hidden="true">
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2.2"
+                  stroke-linecap="round"
+                ><path d="M6.5 12h11" /></svg>
+              </span>
+              <div class="cell">
+                <div class="strong">Sync is off</div>
+                <small>Sign in with Google to sync this vault between your devices.</small>
+              </div>
+            {/if}
+            <button class="btn sm" disabled={app.busy || !account} onclick={() => void syncNow()}>
+              <Icon name="sync" size={14} />
+              Sync now
+            </button>
+          </div>
+        </div>
+        <p class="hint">
           Zero configuration — one tap signs in with Google and starts sync. Your refresh token
           lives in the OS keychain on this device only.
         </p>
+      </section>
 
-        <div class="row actions">
-          <button class="btn sm" disabled={app.busy || !account} onclick={() => void syncNow()}>
-            <Icon name="sync" size={14} />
-            Sync now
-          </button>
-          <span class="muted tiny">revision {app.revision}</span>
+      <section class="section">
+        <h2 class="section-title">Appearance</h2>
+        <div class="group">
+          <label class="row switch-row">
+            <div class="cell">
+              <div class="strong">Dark theme</div>
+              <small>Both themes are macOS-native. Flip to pick your contrast.</small>
+            </div>
+            <input
+              type="checkbox"
+              class="switch"
+              checked={ui.theme === 'dark'}
+              onchange={event => applyTheme(event.currentTarget.checked ? 'dark' : 'light')}
+              aria-label="Dark theme"
+            />
+          </label>
         </div>
       </section>
 
-      <section class="card">
-        <h3>Appearance</h3>
-        <div class="theme-row">
-          {#each THEMES as option (option.id)}
-            <button
-              class="theme-card"
-              class:on={ui.theme === option.id}
-              type="button"
-              onclick={() => applyTheme(option.id as Theme)}
-            >
-              <span class="preview {option.id}">
-                <span class="preview-accent {option.id}"></span>
-                <span class="preview-bar"></span>
-                <span class="preview-body">
-                  <span class="preview-pane"></span>
-                  <span class="preview-pane wide"></span>
-                </span>
-              </span>
-              <span class="theme-label">
-                {option.label}
-                <span class="theme-hint">{option.hint}</span>
-                {#if ui.theme === option.id}<Icon name="check" size={13} />{/if}
-              </span>
-            </button>
-          {/each}
+      <BackgroundSettings />
+
+      <section class="section">
+        <h2 class="section-title">Sessions</h2>
+        <div class="group">
+          <label class="row switch-row">
+            <div class="cell">
+              <div class="strong">Restore scrollback after restart</div>
+              <small>Last lines of each terminal, kept on this device only.</small>
+            </div>
+            <input
+              type="checkbox"
+              class="switch"
+              checked={restoreScrollback}
+              onchange={event => toggleScrollback(event.currentTarget.checked)}
+            />
+          </label>
         </div>
-        <p class="muted tiny hint">
-          Ember Black is the default. Same layout in all three — pick your contrast.
+        <p class="hint">
+          Quitting the app stops every session — the text you read is saved so it is still there
+          when the app reopens, with a fresh connection below it. Stored as plain text in local
+          storage, never synced. Turn off to store nothing; existing snapshots are erased.
         </p>
       </section>
 
-      <section class="card">
-        <h3>Sessions</h3>
-        <label class="switch-row">
-          <input
-            type="checkbox"
-            class="switch"
-            checked={restoreScrollback}
-            onchange={event => toggleScrollback(event.currentTarget.checked)}
-          />
-          <span class="switch-text">
-            Restore scrollback after restart
-            <small>Last lines of each terminal, kept on this device only.</small>
-          </span>
-        </label>
-        <p class="muted tiny hint">
-          Quitting the app stops every session — the text you read is saved so it is still
-          there when the app reopens, with a fresh connection below it. Stored as plain text in
-          local storage, never synced. Turn off to store nothing; existing snapshots are erased.
-        </p>
+      <section class="section">
+        <h2 class="section-title">Local vault</h2>
+        <div class="group">
+          <div class="row kv">
+            <span class="kv-label">Location</span>
+            <span class="value mono">{app.status?.vault_path ?? '—'}</span>
+          </div>
+          <div class="row kv">
+            <span class="kv-label">Device</span>
+            <span class="value mono">{app.status?.device_id ?? '—'}</span>
+          </div>
+          <div class="row kv">
+            <span class="kv-label">Encryption</span>
+            <span class="value">XChaCha20-Poly1305 · Argon2id</span>
+          </div>
+          <div class="row">
+            <div class="cell">
+              <div class="strong">Lock vault</div>
+              <small>Require your password again before opening hosts.</small>
+            </div>
+            <button class="btn sm danger" onclick={() => void lock()}>
+              <Icon name="lock" size={14} />
+              Lock vault
+            </button>
+          </div>
+        </div>
       </section>
 
-      <section class="card">
-        <h3>Local vault</h3>
-        <dl>
-          <dt>Location</dt>
-          <dd class="mono">{app.status?.vault_path ?? '—'}</dd>
-          <dt>Device</dt>
-          <dd class="mono">{app.status?.device_id ?? '—'}</dd>
-          <dt>Format</dt>
-          <dd>JSON with sealed secrets — XChaCha20-Poly1305, Argon2id</dd>
-        </dl>
-        <button class="btn sm danger" onclick={() => void lock()}>
-          <Icon name="lock" size={14} />
-          Lock vault
-        </button>
-      </section>
-
-      <section class="card">
-        <h3>Data files</h3>
-
-        <div class="file-row">
-          <div class="file-text">
-            <span class="mono file-name">vault.json</span>
-            <small>Hosts, groups, keys and preferences. Secrets stay sealed.</small>
+      <section class="section">
+        <h2 class="section-title">Data files</h2>
+        <div class="group">
+          <div class="row">
+            <div class="cell">
+              <div class="strong mono file-name">vault.json</div>
+              <small>Hosts, groups, keys and preferences. Secrets stay sealed.</small>
+            </div>
+            <div class="row-actions">
+              {#if onopenjson}
+                <button class="btn sm ghost" type="button" onclick={() => onopenjson?.('vault')}>
+                  <Icon name="edit" size={13} /> Edit
+                </button>
+              {/if}
+              <button class="btn sm" type="button" onclick={() => void downloadJson('vault')}>
+                <Icon name="download" size={13} /> Download
+              </button>
+            </div>
           </div>
-          <span class="spacer"></span>
-          {#if onopenjson}
-            <button class="btn sm" type="button" onclick={() => onopenjson?.('vault')}>
-              <Icon name="edit" size={13} /> Edit JSON
-            </button>
-          {/if}
-          <button class="btn sm" type="button" onclick={() => void downloadJson('vault')}>
-            <Icon name="download" size={13} /> Download
-          </button>
-        </div>
 
-        <div class="file-row">
-          <div class="file-text">
-            <span class="mono file-name">settings.json</span>
-            <small>Google client id, bridge URL and device flags for this install.</small>
+          <div class="row">
+            <div class="cell">
+              <div class="strong mono file-name">settings.json</div>
+              <small>Google client id, bridge URL and device flags for this install.</small>
+            </div>
+            <div class="row-actions">
+              {#if onopenjson}
+                <button class="btn sm ghost" type="button" onclick={() => onopenjson?.('settings')}>
+                  <Icon name="edit" size={13} /> Edit
+                </button>
+              {/if}
+              <button class="btn sm" type="button" onclick={() => void downloadJson('settings')}>
+                <Icon name="download" size={13} /> Download
+              </button>
+            </div>
           </div>
-          <span class="spacer"></span>
-          {#if onopenjson}
-            <button class="btn sm" type="button" onclick={() => onopenjson?.('settings')}>
-              <Icon name="edit" size={13} /> Edit JSON
-            </button>
-          {/if}
-          <button class="btn sm" type="button" onclick={() => void downloadJson('settings')}>
-            <Icon name="download" size={13} /> Download
-          </button>
         </div>
-
-        <p class="muted tiny hint">
+        <p class="hint">
           Saves are validated before they reach disk — the app refuses a vault it could not reopen
           and keeps a <span class="mono">.bak</span> copy of the previous file. Download saves a
           timestamped copy to your Downloads folder.
         </p>
       </section>
 
-      <section class="card">
-        <h3>About</h3>
-        <p class="muted tiny about">
-          RuTerm {version} — Tauri and Svelte with a Rust core. The vault stays in a JSON
-          document on this device and on the RuTerm sync bridge, where it is only ever
-          ciphertext.
-        </p>
-      </section>
+      <section class="section">
+        <h2 class="section-title">About</h2>
+        <div class="group">
+          <div class="row">
+            <div class="cell">
+              <div class="strong">RuTerm {version}</div>
+              <small>
+                Tauri and Svelte with a Rust core. The vault stays in a JSON document on this
+                device and on the RuTerm sync bridge, where it is only ever ciphertext.
+              </small>
+            </div>
+          </div>
+        </div>
 
-      {#if onopeninfo}
-        <nav class="legal" aria-label="RuTerm resources">
-          <button type="button" onclick={() => onopeninfo?.('about')}>About</button>
-          <span aria-hidden="true">·</span>
-          <button type="button" onclick={() => onopeninfo?.('terms')}>Terms</button>
-          <span aria-hidden="true">·</span>
-          <button type="button" onclick={() => onopeninfo?.('privacy')}>Privacy</button>
-          <span aria-hidden="true">·</span>
-          <button type="button" onclick={() => onopeninfo?.('contact')}>Contact</button>
-          <span aria-hidden="true">·</span>
-          <button type="button" onclick={() => onopeninfo?.('github')}>GitHub</button>
-          {#if onopenwhatsnew}
+        {#if onopeninfo}
+          <nav class="legal" aria-label="RuTerm resources">
+            <button type="button" onclick={() => onopeninfo?.('about')}>About</button>
             <span aria-hidden="true">·</span>
-            <button type="button" class="whatsnew-link" onclick={onopenwhatsnew}>
-              What's New
-              {#if newsState.unread > 0}<span class="nav-badge">{newsState.unread > 9 ? '9+' : newsState.unread}</span>{/if}
-            </button>
-          {/if}
-        </nav>
-      {/if}
+            <button type="button" onclick={() => onopeninfo?.('terms')}>Terms</button>
+            <span aria-hidden="true">·</span>
+            <button type="button" onclick={() => onopeninfo?.('privacy')}>Privacy</button>
+            <span aria-hidden="true">·</span>
+            <button type="button" onclick={() => onopeninfo?.('contact')}>Contact</button>
+            <span aria-hidden="true">·</span>
+            <button type="button" onclick={() => onopeninfo?.('github')}>GitHub</button>
+            {#if onopenwhatsnew}
+              <span aria-hidden="true">·</span>
+              <button type="button" class="whatsnew-link" onclick={onopenwhatsnew}>
+                What's New
+                {#if newsState.unread > 0}<span class="nav-badge">{newsState.unread > 9 ? '9+' : newsState.unread}</span>{/if}
+              </button>
+            {/if}
+          </nav>
+        {/if}
+      </section>
     </div>
   </div>
 </div>
 
 <style>
-  .settings-page {
+  .page {
     height: 100%;
     display: flex;
     flex-direction: column;
-    background: var(--panel);
+    background: var(--bg);
     overflow: hidden;
   }
 
@@ -251,61 +344,143 @@
     display: flex;
     align-items: center;
     gap: 16px;
-    padding: 16px 26px;
-    border-bottom: 1px solid var(--line);
-    background: var(--panel);
+    padding: 22px 32px 16px;
+    background: var(--bg);
   }
   .titles h1 {
     margin: 0;
-    font-size: 20.5px;
+    font-size: 20px;
     font-weight: 600;
-    letter-spacing: -0.01em;
+    letter-spacing: -0.02em;
   }
   .sub {
     margin: 3px 0 0;
-    font-size: 14px;
+    font-size: 13px;
+    color: var(--text-secondary);
   }
 
   .scroll {
     flex: 1;
     overflow-y: auto;
-    padding: 22px 26px 44px;
+    padding: 10px 32px 80px;
   }
   .column {
     width: 100%;
-    max-width: 42rem;
+    max-width: 700px;
     margin: 0 auto;
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    gap: 36px;
   }
 
-  .card {
-    border: 1px solid var(--line);
-    border-radius: 14px;
-    background: transparent;
-    padding: 17px 20px 15px;
-  }
-  .card h3 {
-    margin: 0 0 14px;
-    padding-bottom: 10px;
-    border-bottom: 1px solid var(--line);
-    font-size: 13.5px;
+  .section-title {
+    margin: 0 0 10px 4px;
+    font-size: 15px;
     font-weight: 600;
-    letter-spacing: 0.09em;
-    text-transform: uppercase;
-    color: var(--dim);
+    letter-spacing: -0.015em;
+    color: var(--text);
     user-select: none;
   }
 
-  .switch-row {
-    display: flex;
-    align-items: flex-start;
-    gap: 12px;
-    padding: 11px 13px;
-    border: 1px solid var(--line);
+  .group {
     border-radius: 12px;
-    background: var(--surface);
+    background: var(--bg-elevated);
+    overflow: hidden;
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    min-height: 50px;
+    padding: 12px 16px;
+    margin: 0;
+  }
+  .row + .row {
+    border-top: 1px solid var(--line);
+  }
+
+  .cell {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .strong {
+    font-size: 13.5px;
+    font-weight: 500;
+    color: var(--text);
+    letter-spacing: -0.01em;
+  }
+  .cell small {
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-tertiary);
+  }
+
+  .avatar-img {
+    display: block;
+    object-fit: cover;
+    border-radius: 50%;
+  }
+  .sync-badge {
+    flex: 0 0 auto;
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    background: color-mix(in srgb, var(--ok) 15%, transparent);
+    color: var(--ok);
+  }
+  .sync-badge.bad {
+    background: color-mix(in srgb, var(--bad) 13%, transparent);
+    color: var(--bad);
+  }
+  .sync-badge.off {
+    background: color-mix(in srgb, var(--text) 7%, transparent);
+    color: var(--text-tertiary);
+  }
+  .sync-badge svg {
+    width: 15px;
+    height: 15px;
+  }
+  .kv {
+    align-items: baseline;
+  }
+  .kv-label {
+    flex: 0 0 120px;
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+  .value {
+    flex: 1;
+    min-width: 0;
+    font-size: 13px;
+    color: var(--text);
+    word-break: break-all;
+  }
+
+  .row-actions {
+    display: flex;
+    flex: 0 0 auto;
+    gap: 6px;
+  }
+
+  .file-name {
+    font-size: 13px;
+    font-weight: 550;
+  }
+
+  .hint {
+    margin: 9px 4px 0;
+    font-size: 12.5px;
+    line-height: 1.6;
+    color: var(--text-tertiary);
+  }
+
+  /* ---------------------------------------------------------- switch ------- */
+  .switch-row {
     cursor: pointer;
     user-select: none;
     -webkit-user-select: none;
@@ -320,14 +495,11 @@
     padding: 0;
     border: 0;
     border-radius: 999px;
-    background: var(--hover-strong);
-    box-shadow: inset 0 0 0 1px var(--line);
+    background: color-mix(in srgb, var(--text) 16%, transparent);
     position: relative;
     outline: none;
     cursor: pointer;
-    transition:
-      background 0.2s ease,
-      box-shadow 0.2s ease;
+    transition: background 0.2s ease;
   }
   .switch::after {
     content: '';
@@ -338,26 +510,18 @@
     height: 16px;
     border-radius: 50%;
     background: #ffffff;
-    box-shadow:
-      0 1px 3px rgba(0, 0, 0, 0.32),
-      0 0 0 0.5px rgba(0, 0, 0, 0.06);
     transition:
       transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1),
-      background 0.2s ease,
       width 0.15s ease;
-  }
-  .switch:hover {
-    background: color-mix(in srgb, var(--hover-strong) 70%, var(--line-strong));
   }
   .switch:active::after {
     width: 19px;
   }
   .switch:checked {
     background: var(--accent);
-    box-shadow: inset 0 0 0 1px transparent;
   }
   .switch:checked:hover {
-    background: var(--accent-strong);
+    background: var(--accent-hover);
   }
   .switch:checked::after {
     /* The global checkbox rule sets width/height/left/top/border here —
@@ -375,12 +539,8 @@
     width: 19px;
   }
   .switch:focus-visible {
-    box-shadow:
-      0 0 0 3px var(--accent-dim),
-      inset 0 0 0 1px var(--line);
-  }
-  .switch:checked:focus-visible {
-    box-shadow: 0 0 0 3px var(--accent-dim);
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
   @media (prefers-reduced-motion: reduce) {
     .switch,
@@ -388,115 +548,31 @@
       transition: none;
     }
   }
-  .switch-text {
-    font-size: 14.5px;
-    line-height: 1.35;
-  }
-  .switch-text small {
-    display: block;
-    margin-top: 3px;
-    font-size: 12.5px;
-    color: var(--muted);
-  }
 
-  .account {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    margin-bottom: 20px;
-  }
-  .avatar {
-    width: 36px;
-    height: 36px;
-    display: grid;
-    place-items: center;
-    border-radius: 50%;
-    background: var(--avatar-bg);
-    border: 1px solid var(--line-strong);
-    font-size: 15.5px;
-    font-weight: 600;
-  }
-  .email {
-    font-size: 15px;
-    font-weight: 550;
-  }
-  .hint {
-    margin: 8px 0 0;
-    line-height: 1.55;
-  }
-  .tiny {
-    font-size: 13.5px;
-  }
-
-  dl {
-    display: grid;
-    grid-template-columns: 104px minmax(0, 1fr);
-    gap: 12px 16px;
-    margin: 0 0 18px;
-    font-size: 14.5px;
-  }
-  dt {
-    color: var(--dim);
-  }
-  dd {
-    margin: 0;
-    word-break: break-word;
-  }
-
-  .actions {
-    margin-top: 18px;
-  }
-
-  .file-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 10px 13px;
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    background: var(--surface);
-  }
-  .file-row + .file-row {
-    margin-top: 8px;
-  }
-  .file-text {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    min-width: 0;
-  }
-  .file-name {
-    font-size: 13.5px;
-    font-weight: 550;
-  }
-  .file-text small {
-    font-size: 12.5px;
-    color: var(--muted);
-  }
-
+  /* ---------------------------------------------------------- links -------- */
   .legal {
     display: flex;
     justify-content: center;
     align-items: center;
     gap: 12px;
-    padding-top: 4px;
-    color: var(--dim);
-    font-size: 13.5px;
+    margin-top: 18px;
+    color: var(--text-tertiary);
+    font-size: 12px;
     user-select: none;
   }
   .legal button {
     border: 0;
     background: none;
-    padding: 2px 2px;
-    color: var(--dim);
+    padding: 2px;
+    color: var(--accent);
     font: inherit;
     cursor: pointer;
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 2px;
   }
   .legal button:hover {
-    color: var(--text);
-    text-decoration: underline;
-    text-decoration-color: var(--accent-line);
-    text-underline-offset: 4px;
+    color: var(--accent-hover);
   }
   .whatsnew-link {
     display: inline-flex;
@@ -517,122 +593,22 @@
     line-height: 1;
   }
 
-  .about {
-    margin: 0;
-    line-height: 1.65;
-  }
-
-  .theme-row {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 12px;
-    margin-bottom: 10px;
-  }
-  @media (max-width: 900px) {
-    .theme-row {
-      grid-template-columns: 1fr 1fr;
+  @media (max-width: 720px) {
+    .page-head {
+      padding: 18px 20px 14px;
     }
-  }
-  .theme-card {
-    padding: 8px;
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    background: transparent;
-    color: var(--muted);
-    cursor: pointer;
-    text-align: left;
-    transition:
-      border-color 0.15s ease,
-      background 0.15s ease;
-  }
-  .theme-card:hover {
-    border-color: var(--line-strong);
-    background: var(--surface-hover);
-  }
-  .theme-card.on {
-    border-color: var(--accent-line);
-    background: var(--accent-dim);
-    color: var(--text);
-  }
-  .preview {
-    display: block;
-    height: 74px;
-    border-radius: 8px;
-    overflow: hidden;
-    border: 1px solid var(--line);
-    margin-bottom: 8px;
-    position: relative;
-  }
-  .preview.ember-black,
-  .preview.pine-black {
-    background: #171513;
-  }
-  .preview.pine-black {
-    background: #141917;
-  }
-  .preview.ember-light {
-    background: #f4f2ee;
-  }
-  .preview-accent {
-    display: block;
-    height: 4px;
-    width: 34%;
-    border-radius: 0 0 6px 0;
-    margin-bottom: 6px;
-  }
-  .preview-accent.ember-black,
-  .preview-accent.ember-light {
-    background: #f74c00;
-  }
-  .preview-accent.pine-black {
-    background: #a9d4bd;
-  }
-  .preview-bar {
-    display: block;
-    height: 12px;
-  }
-  .preview.ember-black .preview-bar,
-  .preview.pine-black .preview-bar {
-    background: rgba(255, 255, 255, 0.14);
-  }
-  .preview.ember-light .preview-bar {
-    background: rgba(0, 0, 0, 0.1);
-  }
-  .preview-body {
-    display: flex;
-    gap: 5px;
-    padding: 7px 8px;
-  }
-  .preview-pane {
-    display: block;
-    width: 26px;
-    height: 42px;
-    border-radius: 4px;
-  }
-  .preview-pane.wide {
-    flex: 1;
-    width: auto;
-  }
-  .preview.ember-black .preview-pane,
-  .preview.pine-black .preview-pane {
-    background: rgba(255, 255, 255, 0.07);
-  }
-  .preview.ember-light .preview-pane {
-    background: rgba(0, 0, 0, 0.06);
-  }
-  .theme-label {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 0 2px 2px;
-    font-size: 14.5px;
-    font-weight: 550;
-  }
-  .theme-hint {
-    font-size: 12.5px;
-    font-weight: 500;
-    color: var(--dim);
-    margin-left: auto;
-    margin-right: 2px;
+    .scroll {
+      padding: 6px 20px 56px;
+    }
+    .column {
+      gap: 28px;
+    }
+    .row {
+      flex-wrap: wrap;
+    }
+    .kv-label {
+      flex-basis: 110px;
+    }
+
   }
 </style>

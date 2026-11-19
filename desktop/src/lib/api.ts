@@ -8,6 +8,12 @@ export type AuthMethod =
   | { type: 'agent' }
   | { type: 'keyboard_interactive'; password: string };
 
+export interface AiAgent {
+  id: string;
+  label: string;
+  command: string;
+  path: string;
+}
 export interface TerminalPrefs {
   term?: string | null;
   font_size?: number | null;
@@ -47,6 +53,16 @@ export interface Host {
 }
 
 export type SessionStatus = 'connecting' | 'connected' | 'closed' | 'error';
+
+/// Free-form note. Lists derive their title from the first words of `body`.
+export interface Note {
+  id: string;
+  body: string;
+  favorite: boolean;
+  created_at: string;
+  updated_at: string;
+  deleted: boolean;
+}
 
 export interface Identity {
   id: string;
@@ -88,6 +104,7 @@ export interface Vault {
   groups: Group[];
   identities: Identity[];
   snippets: unknown[];
+  notes?: Note[];
   port_forwards: unknown[];
   settings: VaultSettings;
   updated_at?: string | null;
@@ -109,6 +126,10 @@ export interface AppStatus {
   revision: number;
   vault_path: string;
   key_saved: boolean;
+  /** Revision as of the last successful sync (persisted). */
+  synced_revision: number;
+  /** RFC 3339 timestamp of the last successful sync, or null if never. */
+  last_synced_at: string | null;
 }
 
 export interface VaultPayload {
@@ -163,6 +184,17 @@ export const api = {
 
   sshOpen: (sessionId: string, hostId: string, cols: number, rows: number) =>
     invoke<void>('ssh_open', { sessionId, hostId, cols, rows }),
+  sshOpenAdhoc: (
+    sessionId: string,
+    username: string,
+    address: string,
+    port: number,
+    auth: 'agent' | 'password',
+    password: string | undefined,
+    cols: number,
+    rows: number,
+  ) =>
+    invoke<void>('ssh_open_adhoc', { sessionId, username, address, port, auth, password, cols, rows }),
   sshWrite: (sessionId: string, dataB64: string) =>
     invoke<void>('ssh_write', { sessionId, dataB64 }),
   sshResize: (sessionId: string, cols: number, rows: number) =>
@@ -171,6 +203,7 @@ export const api = {
 
   localOpen: (sessionId: string, cols: number, rows: number, cwd?: string) =>
     invoke<void>('local_open', { sessionId, cols, rows, cwd: cwd ?? null }),
+  aiAgentsDetect: () => invoke<AiAgent[]>('ai_agents_detect'),
   localWrite: (sessionId: string, dataB64: string) =>
     invoke<void>('local_write', { sessionId, dataB64 }),
   localResize: (sessionId: string, cols: number, rows: number) =>

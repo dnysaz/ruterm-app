@@ -86,13 +86,10 @@
 
   .confirm-dialog {
     width: min(430px, 100%);
-    border: 1px solid var(--line-strong);
+    border: 1px solid var(--line);
     border-radius: 16px;
-    background: var(--glass-strong);
-    box-shadow:
-      0 32px 72px rgba(0, 0, 0, 0.5),
-      inset 0 1px 0 rgba(255, 255, 255, 0.06);
-    padding: 26px 26px 20px;
+    background: var(--panel);
+    padding: 24px 24px 18px;
     text-align: center;
     animation: dialog-in 0.22s cubic-bezier(0.2, 1.15, 0.4, 1);
   }
@@ -129,15 +126,15 @@
 
   h2 {
     margin: 0;
-    font-size: 19px;
+    font-size: 16px;
     font-weight: 600;
     letter-spacing: -0.01em;
   }
 
   .dialog-body {
     margin: 9px 2px 0;
-    color: var(--muted);
-    font-size: 14.5px;
+    color: var(--text-secondary);
+    font-size: 13.5px;
     line-height: 1.6;
   }
   .dialog-body :global(strong) {

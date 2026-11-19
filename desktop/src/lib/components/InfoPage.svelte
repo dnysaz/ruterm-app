@@ -61,7 +61,7 @@
     <div class="column">
 
       {#if page === 'about'}
-        <section class="card">
+        <section class="section">
           <h3>What is RuTerm</h3>
           <p>
             RuTerm is an open-source SSH workspace for the desktop — hosts, keys and terminal
@@ -77,7 +77,7 @@
           </p>
         </section>
 
-        <section class="card">
+        <section class="section">
           <h3>How it works</h3>
           <ul class="list">
             <li><strong>Local-first.</strong> The vault is a plain JSON file you can read, diff and back up.</li>
@@ -88,20 +88,38 @@
           </ul>
         </section>
 
-        <section class="card">
+        <section class="section">
           <h3>Under the hood</h3>
-          <dl>
-            <dt>Frontend</dt><dd>Tauri v2 · Svelte 5 · xterm.js</dd>
-            <dt>Engine</dt><dd class="mono">russh · Rust · Argon2id · XChaCha20-Poly1305</dd>
-            <dt>UI type</dt><dd>IBM Plex Sans · IBM Plex Mono</dd>
-            <dt>Terminal type</dt><dd>JetBrains Mono Nerd Font</dd>
-            <dt>License</dt><dd>MIT — do what you like, attribution appreciated</dd>
-            <dt>Version</dt><dd class="mono">{version || '…'}</dd>
-          </dl>
+          <div class="group">
+            <div class="row">
+              <span class="row-label">Frontend</span>
+              <span class="value">Tauri v2 · Svelte 5 · xterm.js</span>
+            </div>
+            <div class="row">
+              <span class="row-label">Engine</span>
+              <span class="value mono">russh · Rust · Argon2id · XChaCha20-Poly1305</span>
+            </div>
+            <div class="row">
+              <span class="row-label">UI type</span>
+              <span class="value">SF Pro · macOS system font</span>
+            </div>
+            <div class="row">
+              <span class="row-label">Terminal type</span>
+              <span class="value">SF Mono · JetBrains Mono NF</span>
+            </div>
+            <div class="row">
+              <span class="row-label">License</span>
+              <span class="value">MIT — attribution appreciated</span>
+            </div>
+            <div class="row">
+              <span class="row-label">Version</span>
+              <span class="value mono">{version || '…'}</span>
+            </div>
+          </div>
         </section>
 
       {:else if page === 'terms'}
-        <section class="card">
+        <section class="section">
           <h3>1 · License</h3>
           <p>
             RuTerm is released under the MIT License. You may use, modify and redistribute it,
@@ -110,7 +128,7 @@
           </p>
         </section>
 
-        <section class="card">
+        <section class="section">
           <h3>2 · Acceptable use</h3>
           <p>
             RuTerm is a tool for connecting to computers. You agree to use it only for systems
@@ -119,7 +137,7 @@
           </p>
         </section>
 
-        <section class="card">
+        <section class="section">
           <h3>3 · Your vault, your responsibility</h3>
           <ul class="list">
             <li>Passwords and private keys are sealed in your vault with your vault password. If you lose the vault file or forget the password, the secrets are unrecoverable — by design. Keep your own backups.</li>
@@ -128,7 +146,7 @@
           </ul>
         </section>
 
-        <section class="card">
+        <section class="section">
           <h3>4 · Sync bridge</h3>
           <p>
             Sync is opt-in and self-hosted. The hosted testing instance at
@@ -140,7 +158,7 @@
           </p>
         </section>
 
-        <section class="card">
+        <section class="section">
           <h3>5 · No warranty &amp; liability</h3>
           <p>
             RuTerm is provided “as is”, without warranty of any kind, express or implied —
@@ -151,7 +169,7 @@
           </p>
         </section>
 
-        <section class="card">
+        <section class="section">
           <h3>6 · Third parties</h3>
           <p>
             Google Sign-In is used only to establish an identity for sync; Google’s own terms
@@ -160,7 +178,7 @@
           </p>
         </section>
 
-        <section class="card">
+        <section class="section">
           <h3>7 · Changes</h3>
           <p>
             These terms evolve with the project. Material changes will be noted in the release
@@ -171,7 +189,7 @@
         </section>
 
       {:else if page === 'privacy'}
-        <section class="card">
+        <section class="section">
           <h3>The short version</h3>
           <p>
             RuTerm does not collect telemetry, analytics or crash reports. Nothing leaves your
@@ -180,7 +198,7 @@
           </p>
         </section>
 
-        <section class="card">
+        <section class="section">
           <h3>Stored on this device</h3>
           <ul class="list">
             <li><strong>Vault file</strong> (<span class="mono">vault.json</span>) — your hosts and settings in readable JSON; passwords and private keys are sealed, not readable.</li>
@@ -190,7 +208,7 @@
           </ul>
         </section>
 
-        <section class="card">
+        <section class="section">
           <h3>Sent to the bridge (only if you sign in)</h3>
           <ul class="list">
             <li>Your Google account email and device name — so the bridge knows which devices may pull revisions.</li>
@@ -199,7 +217,7 @@
           </ul>
         </section>
 
-        <section class="card">
+        <section class="section">
           <h3>What never happens</h3>
           <ul class="list">
             <li>No telemetry, metrics, ads, A/B tests or “phone home” of any kind.</li>
@@ -208,7 +226,7 @@
           </ul>
         </section>
 
-        <section class="card">
+        <section class="section">
           <h3>Your controls</h3>
           <ul class="list">
             <li>Use RuTerm fully offline in local mode — nothing is sent anywhere.</li>
@@ -219,7 +237,7 @@
         </section>
 
       {:else if page === 'contact'}
-        <section class="card">
+        <section class="section">
           <h3>Where to reach us</h3>
           <div class="copy-row">
             <div>
@@ -238,7 +256,7 @@
           </p>
         </section>
 
-        <section class="card">
+        <section class="section">
           <h3>Security reports</h3>
           <p>
             Found a vulnerability — command injection, keychain misuse, bridge auth bypass,
@@ -248,7 +266,7 @@
           </p>
         </section>
 
-        <section class="card">
+        <section class="section">
           <h3>Response times</h3>
           <p class="muted">
             This is a nights-and-weekends open-source project, not a support desk. Expect a
@@ -258,7 +276,7 @@
         </section>
 
       {:else if page === 'github'}
-        <section class="card banner">
+        <section class="section">
           <h3>Open source on GitHub</h3>
           <p>
             RuTerm is developed in the open at <strong>github.com/dnysaz/ruterm-app</strong>.
@@ -277,7 +295,7 @@
           </div>
         </section>
 
-        <section class="card">
+        <section class="section">
           <h3>Build from source</h3>
           <div class="code-block">
             <pre class="mono">{BUILD_SNIPPET}</pre>
@@ -290,7 +308,7 @@
           </p>
         </section>
 
-        <section class="card">
+        <section class="section">
           <h3>What will be there</h3>
           <ul class="list">
             <li>MIT-licensed source: desktop app, Rust engine (<span class="mono">rterm-core</span>), and the sync bridge (<span class="mono">bridge/</span>).</li>
@@ -310,7 +328,7 @@
     height: 100%;
     display: flex;
     flex-direction: column;
-    background: var(--panel);
+    background: var(--bg);
     overflow: hidden;
   }
 
@@ -319,102 +337,106 @@
     display: flex;
     align-items: center;
     gap: 14px;
-    padding: 16px 26px;
-    border-bottom: 1px solid var(--line);
-    background: var(--panel);
+    padding: 20px 28px 14px;
+    background: var(--bg);
   }
   .page-icon {
     display: grid;
     place-items: center;
-    width: 38px;
-    height: 38px;
+    width: 34px;
+    height: 34px;
     border-radius: 10px;
-    border: 1px solid var(--line-strong);
+    border: 0;
     color: var(--accent);
     background: var(--accent-dim);
     flex: 0 0 auto;
   }
   .titles h1 {
     margin: 0;
-    font-size: 20.5px;
+    font-size: 20px;
     font-weight: 600;
-    letter-spacing: -0.01em;
+    letter-spacing: -0.02em;
   }
   .sub {
     margin: 3px 0 0;
-    font-size: 14px;
+    font-size: 13px;
+    color: var(--text-secondary);
   }
 
   .scroll {
     flex: 1;
     overflow-y: auto;
-    padding: 22px 26px 44px;
+    padding: 4px 28px 48px;
   }
   .column {
     width: 100%;
-    max-width: 42rem;
+    max-width: 680px;
     margin: 0 auto;
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
   }
 
-  .card {
-    border: 1px solid var(--line);
-    border-radius: 14px;
-    background: transparent;
-    padding: 17px 20px 15px;
+  .section {
+    margin-bottom: 26px;
   }
-  .card.banner {
-    border-color: var(--accent-line);
-    background: var(--accent-dim);
-  }
-  .card h3 {
-    margin: 0 0 12px;
-    padding-bottom: 9px;
-    border-bottom: 1px solid var(--line);
-    font-size: 13.5px;
+  .section h3 {
+    margin: 0 0 8px 2px;
+    font-size: 12.5px;
     font-weight: 600;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--dim);
+    letter-spacing: -0.01em;
+    color: var(--text-secondary);
     user-select: none;
   }
-  .card p {
+  .section p {
     margin: 0 0 10px;
-    line-height: 1.65;
-    max-width: 62ch;
+    font-size: 13.5px;
+    line-height: 1.7;
+    color: var(--text);
+    max-width: 66ch;
   }
-  .card p:last-child {
+  .section p:last-child {
     margin-bottom: 0;
   }
+  .section p.muted {
+    color: var(--text-secondary);
+  }
   .fine {
-    font-size: 14px;
-    line-height: 1.6;
+    font-size: 12.5px;
+    line-height: 1.65;
   }
 
   .list {
     margin: 0;
-    padding-left: 1.15em;
+    padding-left: 1.2em;
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    line-height: 1.6;
+    gap: 7px;
+    font-size: 13.5px;
+    line-height: 1.65;
     max-width: 66ch;
   }
 
-  dl {
-    display: grid;
-    grid-template-columns: 150px minmax(0, 1fr);
-    gap: 10px 16px;
-    margin: 0;
-    font-size: 15px;
+  .group {
+    border-radius: 12px;
+    background: var(--bg-elevated);
+    overflow: hidden;
   }
-  dt {
-    color: var(--dim);
+  .row {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    padding: 11px 16px;
   }
-  dd {
-    margin: 0;
+  .row + .row {
+    border-top: 1px solid var(--line);
+  }
+  .row-label {
+    flex: 0 0 132px;
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+  .value {
+    flex: 1;
+    min-width: 0;
+    font-size: 13px;
     word-break: break-word;
   }
 
@@ -424,41 +446,54 @@
     justify-content: space-between;
     gap: 14px;
     padding: 12px 14px;
-    border: 1px solid var(--line);
     border-radius: 12px;
-    background: var(--surface);
-    margin: 12px 0;
+    background: var(--bg-elevated);
+    margin: 14px 0;
   }
   .copy-label {
-    font-size: 12.5px;
-    color: var(--dim);
+    font-size: 12px;
+    color: var(--text-tertiary);
     margin-bottom: 3px;
   }
   .copy-value {
-    font-size: 14px;
+    font-size: 13px;
     word-break: break-all;
   }
 
   .code-block {
     position: relative;
-    border: 1px solid var(--line-strong);
     border-radius: 12px;
-    background: #161311;
-    margin: 12px 0;
+    background: var(--bg-elevated);
+    margin: 14px 0;
   }
   .code-block pre {
     margin: 0;
     padding: 16px 52px 16px 18px;
     overflow-x: auto;
-    font-size: 13.5px;
+    font-size: 12.5px;
     line-height: 1.7;
-    color: #e8e2d8;
+    color: var(--text);
     white-space: pre;
   }
   .copy-code {
     position: absolute;
     top: 8px;
     right: 8px;
-    color: #a89f93;
+    color: var(--text-tertiary);
+  }
+
+  @media (max-width: 720px) {
+    .page-head {
+      padding: 18px 20px 14px;
+    }
+    .scroll {
+      padding: 4px 20px 44px;
+    }
+    .row {
+      gap: 12px;
+    }
+    .row-label {
+      flex-basis: 104px;
+    }
   }
 </style>

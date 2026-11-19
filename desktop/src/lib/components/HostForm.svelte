@@ -121,207 +121,212 @@
   }
 </script>
 
-<form class="hostform-page" onsubmit={save}>
+<form class="page" onsubmit={save}>
   <header class="page-head">
     <div class="titles">
       <h1>{existing ? 'Edit host' : 'New host'}</h1>
-      <p class="muted sub">Connection details are stored in your JSON vault.</p>
+      <p class="sub">Connection details are stored in your JSON vault.</p>
     </div>
     <span class="spacer"></span>
     {#if existing && ondelete}
-      <button
-        class="btn sm danger"
-        type="button"
-        onclick={() => (showDelete = true)}
-      >
+      <button class="btn sm danger" type="button" onclick={() => (showDelete = true)}>
         <Icon name="trash" size={14} />
         Delete
       </button>
     {/if}
-    <button class="btn sm ghost" type="button" onclick={onclose}>Cancel</button>
-    <button class="btn sm primary" type="submit">Save host</button>
+    <button class="btn ghost" type="button" onclick={onclose}>Cancel</button>
+    <button class="btn primary" type="submit">Save host</button>
   </header>
 
   <div class="scroll">
     <div class="column">
-    <section class="card">
-      <h3>Connection</h3>
-      <div class="field">
-        <label for="label">Label</label>
-        <input autocapitalize="off" autocorrect="off" spellcheck="false" id="label" bind:value={draft.label} placeholder="Tokyo web server" />
-      </div>
-      <div class="grid-2">
-        <div class="field">
-          <label for="address">Host or IP</label>
-          <input autocapitalize="off" autocorrect="off" spellcheck="false" id="address" bind:value={draft.address} placeholder="203.0.113.10" />
+      <section class="section">
+        <h2 class="section-title">Connection</h2>
+        <div class="group">
+          <label class="row">
+            <span class="row-label">Label</span>
+            <input autocapitalize="off" autocorrect="off" spellcheck="false" id="label" bind:value={draft.label} placeholder="Tokyo web server" />
+          </label>
+          <div class="row">
+            <label class="row-label" for="address">Host or IP</label>
+            <div class="pair">
+              <input autocapitalize="off" autocorrect="off" spellcheck="false" id="address" bind:value={draft.address} placeholder="203.0.113.10" />
+              <input class="port" autocapitalize="off" autocorrect="off" spellcheck="false" id="port" type="number" min="1" max="65535" bind:value={draft.port} aria-label="Port" />
+            </div>
+          </div>
+          <label class="row">
+            <span class="row-label">Username</span>
+            <input autocapitalize="off" autocorrect="off" spellcheck="false" id="username" bind:value={draft.username} placeholder="root" />
+          </label>
+          <label class="row">
+            <span class="row-label">Tags</span>
+            <input autocapitalize="off" autocorrect="off" spellcheck="false" id="tags" bind:value={tagsText} placeholder="production, tokyo" />
+          </label>
+          <label class="row check">
+            <input type="checkbox" bind:checked={draft.favorite} />
+            <span class="check-text">Mark as favorite</span>
+          </label>
         </div>
-        <div class="field">
-          <label for="port">Port</label>
-          <input autocapitalize="off" autocorrect="off" spellcheck="false" id="port" type="number" min="1" max="65535" bind:value={draft.port} />
-        </div>
-      </div>
-      <div class="field">
-        <label for="username">Username</label>
-        <input autocapitalize="off" autocorrect="off" spellcheck="false" id="username" bind:value={draft.username} placeholder="root" />
-      </div>
-      <div class="field">
-        <label for="tags">Tags</label>
-        <input autocapitalize="off" autocorrect="off" spellcheck="false" id="tags" bind:value={tagsText} placeholder="production, tokyo" />
-      </div>
-      <label class="check">
-        <input type="checkbox" bind:checked={draft.favorite} />
-        Mark as favorite
-      </label>
-    </section>
+      </section>
 
-    <section class="card">
-      <h3>Authentication</h3>
-      <div class="field">
-        <label for="auth">Method</label>
-        <select id="auth" value={draft.auth.type} onchange={e => setAuthType(e.currentTarget.value)}>
-          <option value="password">Password</option>
-          <option value="key">SSH key</option>
-          <option value="keyboard_interactive">Keyboard-interactive</option>
-          <option value="agent">SSH agent</option>
-        </select>
-      </div>
+      <section class="section">
+        <h2 class="section-title">Authentication</h2>
+        <div class="group">
+          <div class="row">
+            <label class="row-label" for="auth">Method</label>
+            <select id="auth" value={draft.auth.type} onchange={e => setAuthType(e.currentTarget.value)}>
+              <option value="password">Password</option>
+              <option value="key">SSH key</option>
+              <option value="keyboard_interactive">Keyboard-interactive</option>
+              <option value="agent">SSH agent</option>
+            </select>
+          </div>
 
-      {#if draft.auth.type === 'password' || draft.auth.type === 'keyboard_interactive'}
-        <div class="field">
-          <label for="password">Password</label>
-          <input autocapitalize="off" autocorrect="off" spellcheck="false"
-            id="password"
-            type="password"
-            value={passwordValue()}
-            oninput={e => setPassword(e.currentTarget.value)}
-            placeholder="Stored encrypted"
-          />
-        </div>
-      {/if}
+          {#if draft.auth.type === 'password' || draft.auth.type === 'keyboard_interactive'}
+            <div class="row">
+              <label class="row-label" for="password">Password</label>
+              <input autocapitalize="off" autocorrect="off" spellcheck="false"
+                id="password"
+                type="password"
+                value={passwordValue()}
+                oninput={e => setPassword(e.currentTarget.value)}
+                placeholder="Stored encrypted"
+              />
+            </div>
+          {/if}
 
-      {#if draft.auth.type === 'key'}
-        <div class="field">
-          <label for="identity">Identity</label>
-          <select
-            id="identity"
-            value={draft.auth.type === 'key' ? draft.auth.identity_id : ''}
-            onchange={e => {
-              if (draft.auth.type === 'key') draft.auth.identity_id = e.currentTarget.value;
-            }}
-          >
-            {#if identities().length === 0}
-              <option value="">No keys yet — import or create one</option>
+          {#if draft.auth.type === 'key'}
+            <div class="row">
+              <label class="row-label" for="identity">Identity</label>
+              <select
+                id="identity"
+                value={draft.auth.type === 'key' ? draft.auth.identity_id : ''}
+                onchange={e => {
+                  if (draft.auth.type === 'key') draft.auth.identity_id = e.currentTarget.value;
+                }}
+              >
+                {#if identities().length === 0}
+                  <option value="">No keys yet — import or create one</option>
+                {/if}
+                {#each identities() as identity (identity.id)}
+                  <option value={identity.id}>
+                    {identity.label}
+                    {identity.kind ? `· ${identity.kind}` : ''}
+                  </option>
+                {/each}
+              </select>
+            </div>
+
+            <div class="row">
+              <span class="row-label">Keys</span>
+              <div class="row-actions">
+                <button
+                  class="btn sm"
+                  type="button"
+                  disabled={busy || importing}
+                  title="Import a PEM or OpenSSH private key"
+                  onclick={() => fileInput?.click()}
+                >
+                  <Icon name="key" size={14} />
+                  {importing ? 'Reading key…' : 'Import .pem'}
+                </button>
+                <button class="btn sm ghost" type="button" disabled={busy} onclick={generateKey}>
+                  Create Ed25519
+                </button>
+              </div>
+            </div>
+
+            <div class="row top">
+              <label class="row-label" for="keyPass">Passphrase</label>
+              <div class="stack">
+                <input autocapitalize="off" autocorrect="off" spellcheck="false"
+                  id="keyPass"
+                  type="password"
+                  value={draft.auth.type === 'key' ? draft.auth.passphrase ?? '' : ''}
+                  oninput={e => {
+                    if (draft.auth.type === 'key') draft.auth.passphrase = e.currentTarget.value;
+                  }}
+                  placeholder="Only if the file is encrypted"
+                />
+                <p class="hint">
+                  Stored sealed in the vault, so the key works on every device without retyping it.
+                </p>
+              </div>
+            </div>
+
+            <input
+              bind:this={fileInput}
+              class="file"
+              type="file"
+              accept=".pem,.key,.ppk,.txt,.openssh"
+              onchange={importKeyFile}
+            />
+          {/if}
+
+          <div class="row top">
+            <span class="row-label">Host key</span>
+            {#if draft.host_key_fingerprint}
+              <div class="stack">
+                <code class="fp">{draft.host_key_fingerprint}</code>
+                <div class="row-actions">
+                  <button
+                    class="btn sm ghost"
+                    type="button"
+                    onclick={() => (draft.host_key_fingerprint = null)}
+                  >
+                    Forget fingerprint
+                  </button>
+                </div>
+              </div>
+            {:else}
+              <p class="note">
+                Empty means trust on first use — the fingerprint is pinned automatically on the
+                first connection.
+              </p>
             {/if}
-            {#each identities() as identity (identity.id)}
-              <option value={identity.id}>
-                {identity.label}
-                {identity.kind ? `· ${identity.kind}` : ''}
-              </option>
-            {/each}
-          </select>
+          </div>
         </div>
+      </section>
 
-        <div class="key-actions">
-          <button
-            class="btn sm"
-            type="button"
-            disabled={busy || importing}
-            title="Import a PEM or OpenSSH private key"
-            onclick={() => fileInput?.click()}
-          >
-            <Icon name="key" size={14} />
-            {importing ? 'Reading key…' : 'Import .pem'}
-          </button>
-          <button class="btn sm ghost" type="button" disabled={busy} onclick={generateKey}>
-            Create Ed25519
-          </button>
+      <section class="section">
+        <h2 class="section-title">Terminal and network</h2>
+        <div class="group">
+          <div class="row">
+            <label class="row-label" for="fontSize">Font size</label>
+            <input class="narrow" autocapitalize="off" autocorrect="off" spellcheck="false" id="fontSize" type="number" min="9" max="24" bind:value={draft.terminal.font_size} />
+          </div>
+          <div class="row">
+            <label class="row-label" for="scrollback">Scrollback lines</label>
+            <input class="narrow" autocapitalize="off" autocorrect="off" spellcheck="false"
+              id="scrollback"
+              type="number"
+              min="1000"
+              step="1000"
+              bind:value={draft.terminal.scrollback}
+            />
+          </div>
+          <div class="row">
+            <label class="row-label" for="timeout">Connect timeout</label>
+            <input class="narrow" autocapitalize="off" autocorrect="off" spellcheck="false" id="timeout" type="number" min="5" max="120" bind:value={draft.connect_timeout_secs} />
+          </div>
+          <div class="row">
+            <label class="row-label" for="keepalive">Keepalive</label>
+            <input class="narrow" autocapitalize="off" autocorrect="off" spellcheck="false" id="keepalive" type="number" min="0" max="600" bind:value={draft.keepalive_secs} />
+          </div>
+          <label class="row check">
+            <input type="checkbox" bind:checked={draft.compression} />
+            <span class="check-text">Compression</span>
+          </label>
+          <label class="row check">
+            <input type="checkbox" bind:checked={draft.agent_forwarding} />
+            <span class="check-text">Agent forwarding</span>
+          </label>
+          <div class="row top">
+            <label class="row-label" for="notes">Notes</label>
+            <textarea autocapitalize="off" {...{ autocorrect: 'off' }} spellcheck="false" id="notes" rows="3" bind:value={draft.notes} placeholder="Optional"></textarea>
+          </div>
         </div>
-        <input
-          bind:this={fileInput}
-          class="file"
-          type="file"
-          accept=".pem,.key,.ppk,.txt,.openssh"
-          onchange={importKeyFile}
-        />
-        <div class="field">
-          <label for="keyPass">Key passphrase (optional)</label>
-          <input autocapitalize="off" autocorrect="off" spellcheck="false"
-            id="keyPass"
-            type="password"
-            value={draft.auth.type === 'key' ? draft.auth.passphrase ?? '' : ''}
-            oninput={e => {
-              if (draft.auth.type === 'key') draft.auth.passphrase = e.currentTarget.value;
-            }}
-            placeholder="Only if the file is encrypted"
-          />
-          <p class="muted tiny hint">
-            Stored sealed in the vault, so the key works on every device without
-            retyping it.
-          </p>
-        </div>
-      {/if}
-
-      <div class="field fingerprint">
-        <span class="flabel">Host key</span>
-        {#if draft.host_key_fingerprint}
-          <div class="mono fp">{draft.host_key_fingerprint}</div>
-          <button
-            class="btn sm ghost"
-            type="button"
-            onclick={() => (draft.host_key_fingerprint = null)}
-          >
-            Forget fingerprint
-          </button>
-        {:else}
-          <p class="muted note">
-            Empty means trust on first use. The fingerprint is pinned automatically on the
-            first connection.
-          </p>
-        {/if}
-      </div>
-    </section>
-
-    <section class="card">
-      <h3>Terminal and network</h3>
-      <div class="grid-2">
-        <div class="field">
-          <label for="fontSize">Font size</label>
-          <input autocapitalize="off" autocorrect="off" spellcheck="false" id="fontSize" type="number" min="9" max="24" bind:value={draft.terminal.font_size} />
-        </div>
-        <div class="field">
-          <label for="scrollback">Scrollback lines</label>
-          <input autocapitalize="off" autocorrect="off" spellcheck="false"
-            id="scrollback"
-            type="number"
-            min="1000"
-            step="1000"
-            bind:value={draft.terminal.scrollback}
-          />
-        </div>
-      </div>
-      <div class="grid-2">
-        <div class="field">
-          <label for="timeout">Connect timeout (s)</label>
-          <input autocapitalize="off" autocorrect="off" spellcheck="false" id="timeout" type="number" min="5" max="120" bind:value={draft.connect_timeout_secs} />
-        </div>
-        <div class="field">
-          <label for="keepalive">Keepalive (s)</label>
-          <input autocapitalize="off" autocorrect="off" spellcheck="false" id="keepalive" type="number" min="0" max="600" bind:value={draft.keepalive_secs} />
-        </div>
-      </div>
-      <label class="check">
-        <input type="checkbox" bind:checked={draft.compression} />
-        Compression
-      </label>
-      <label class="check">
-        <input type="checkbox" bind:checked={draft.agent_forwarding} />
-        Agent forwarding
-      </label>
-      <div class="field notes">
-        <label for="notes">Notes</label>
-        <textarea autocapitalize="off" {...{ autocorrect: 'off' }} spellcheck="false" id="notes" bind:value={draft.notes} placeholder="Optional"></textarea>
-      </div>
-    </section>
+      </section>
     </div>
   </div>
 
@@ -350,11 +355,11 @@
 {/if}
 
 <style>
-  .hostform-page {
+  .page {
     height: 100%;
     display: flex;
     flex-direction: column;
-    background: var(--panel);
+    background: var(--bg);
     overflow: hidden;
   }
 
@@ -363,104 +368,214 @@
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 16px 26px;
-    border-bottom: 1px solid var(--line);
-    background: var(--panel);
+    padding: 20px 28px 14px;
+    background: var(--bg);
   }
   .titles h1 {
     margin: 0;
-    font-size: 20.5px;
+    font-size: 20px;
     font-weight: 600;
-    letter-spacing: -0.01em;
+    letter-spacing: -0.02em;
   }
   .sub {
     margin: 3px 0 0;
-    font-size: 14px;
+    font-size: 13px;
+    color: var(--text-secondary);
   }
 
   .scroll {
     flex: 1;
     overflow-y: auto;
-    padding: 22px 26px 44px;
+    padding: 4px 28px 48px;
   }
   .column {
     width: 100%;
-    max-width: 42rem;
+    max-width: 680px;
     margin: 0 auto;
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    gap: 22px;
   }
 
-  .card {
-    border: 1px solid var(--line);
-    border-radius: 14px;
-    background: transparent;
-    padding: 17px 20px 15px;
-  }
-  .card h3 {
-    margin: 0 0 14px;
-    padding-bottom: 10px;
-    border-bottom: 1px solid var(--line);
-    font-size: 13.5px;
+  .section-title {
+    margin: 0 0 8px 2px;
+    font-size: 12.5px;
     font-weight: 600;
-    letter-spacing: 0.09em;
-    text-transform: uppercase;
-    color: var(--dim);
+    letter-spacing: -0.01em;
+    color: var(--text-secondary);
     user-select: none;
   }
 
-  .check {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin: 8px 0 10px;
-    font-size: 15.5px;
-    font-weight: 400;
-    color: var(--text);
+  .group {
+    border-radius: 12px;
+    background: var(--bg-elevated);
+    overflow: hidden;
   }
-  .check input {
+
+  .row {
+    display: grid;
+    grid-template-columns: 156px minmax(0, 1fr);
+    align-items: center;
+    gap: 18px;
+    min-height: 42px;
+    padding: 7px 14px;
+    margin: 0;
+  }
+  .row + .row {
+    border-top: 1px solid var(--line);
+  }
+  .row.top {
+    align-items: start;
+    padding-top: 12px;
+    padding-bottom: 12px;
+  }
+
+  .row-label {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 400;
+    letter-spacing: -0.01em;
+    color: var(--text-secondary);
+    min-width: 0;
+  }
+
+  .row input:not([type='checkbox']),
+  .row select,
+  .row textarea {
+    width: 100%;
+    min-width: 0;
+    height: 34px;
+    padding: 0 9px;
+    font-size: 13.5px;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    background-color: var(--bg);
+  }
+  .row textarea {
+    height: auto;
+    min-height: 78px;
+    padding: 8px 10px;
+    line-height: 1.55;
+  }
+  .row input:not([type='checkbox']):focus,
+  .row select:focus,
+  .row textarea:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-dim);
+  }
+
+  .row .narrow {
+    width: 132px;
+    justify-self: end;
+  }
+  .row input.narrow {
+    width: 132px;
     flex: 0 0 auto;
   }
 
-  .flabel {
-    display: block;
-    font-size: 14px;
-    font-weight: 500;
-    color: var(--muted);
-    margin-bottom: 7px;
-  }
-  .fp {
-    font-size: 13.5px;
-    word-break: break-all;
-    background: var(--surface);
-    border: 1px solid var(--line);
-    border-radius: 10px;
-    padding: 10px 12px;
-    margin-bottom: 8px;
-  }
-.key-actions {
+  .pair {
     display: flex;
     gap: 8px;
-    margin-bottom: 12px;
+    min-width: 0;
   }
+  .pair > input {
+    width: auto;
+    flex: 1 1 0;
+    min-width: 0;
+  }
+  .pair > input.port {
+    width: 92px;
+    flex: 0 0 92px;
+    text-align: center;
+  }
+
+  .row.check {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
+    min-height: 44px;
+  }
+  .check-text {
+    font-size: 13px;
+    font-weight: 400;
+    color: var(--text);
+  }
+
+  .row-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .stack {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .hint {
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-tertiary);
+  }
+  .note {
+    margin: 0;
+    align-self: center;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-tertiary);
+  }
+
+  .fp {
+    display: block;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.5;
+    word-break: break-all;
+    color: var(--text-secondary);
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 10px;
+  }
+
   .file {
     display: none;
-  }
-  .hint {
-    margin: 6px 0 0;
-    line-height: 1.5;
-  }
-  .notes {
-    margin-top: 14px;
   }
 
   .error {
     margin: 0;
-    padding: 12px 26px;
-    font-size: 14.5px;
+    padding: 11px 32px;
+    font-size: 13px;
     color: var(--bad);
-    border-top: 1px solid rgba(255, 114, 124, 0.25);
-    background: rgba(255, 114, 124, 0.06);
+    border-top: 1px solid var(--line);
+    background: var(--bg);
+  }
+
+  @media (max-width: 720px) {
+    .page-head {
+      padding: 18px 20px 14px;
+    }
+    .scroll {
+      padding: 4px 20px 44px;
+    }
+    .row {
+      grid-template-columns: 1fr;
+      gap: 6px;
+      align-items: start;
+      padding: 12px 16px;
+    }
+    .row + .row {
+      border-top: 1px solid var(--line);
+    }
+    .row.check {
+      display: flex;
+    }
+    .row .narrow {
+      justify-self: start;
+    }
   }
 </style>

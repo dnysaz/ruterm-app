@@ -82,13 +82,13 @@ async function googleIdentity(env: Env, code: string, codeVerifier: string,
     return `google tokeninfo ${infoRes.status}`;
   }
   const info = (await infoRes.json()) as {
-    sub?: string; email?: string; aud?: string; name?: string;
+    sub?: string; email?: string; aud?: string; name?: string; picture?: string;
   };
   if (info.aud !== env.GOOGLE_CLIENT_ID || !info.sub || !info.email) {
     console.error('google tokeninfo unexpected content', JSON.stringify(info).slice(0, 300));
     return 'google tokeninfo aud/sub/email mismatch';
   }
-  return { sub: info.sub, email: info.email, name: info.name ?? '' };
+  return { sub: info.sub, email: info.email, name: info.name ?? '', picture: info.picture ?? '' };
 }
 
 async function vaultRevision(env: Env, userId: string): Promise<number> {
@@ -117,18 +117,27 @@ async function authGoogle(env: Env, request: Request): Promise<Response> {
   const identity = await googleIdentity(env, input.code, input.code_verifier, input.redirect_uri);
   if (typeof identity === 'string') return err(401, `google_auth_failed: ${identity}`);
 
-  let user = await env.DB.prepare('SELECT id, email FROM users WHERE google_sub = ?')
-    .bind(identity.sub).first<{ id: string; email: string }>();
+  interface UserRow {
+    id: string;
+    email: string;
+    name: string | null;
+    picture: string | null;
+    google_sub: string;
+  }
+  let user = await env.DB.prepare(
+    'SELECT id, email, name, picture, google_sub FROM users WHERE google_sub = ?',
+  ).bind(identity.sub).first<UserRow>();
   if (!user) {
     const id = crypto.randomUUID();
     await env.DB.prepare(
-      'INSERT INTO users (id, google_sub, email, name) VALUES (?, ?, ?, ?)',
-    ).bind(id, identity.sub, identity.email, identity.name).run();
-    user = { id, email: identity.email };
+      'INSERT INTO users (id, google_sub, email, name, picture) VALUES (?, ?, ?, ?, ?)',
+    ).bind(id, identity.sub, identity.email, identity.name, identity.picture).run();
+    user = { id, email: identity.email, name: identity.name, picture: identity.picture, google_sub: identity.sub };
   } else {
     await env.DB.prepare(
-      'UPDATE users SET email = ?, name = ?, updated_at = ? WHERE id = ?',
-    ).bind(identity.email, identity.name, nowIso(), user.id).run();
+      'UPDATE users SET email = ?, name = ?, picture = ?, updated_at = ? WHERE id = ?',
+    ).bind(identity.email, identity.name, identity.picture, nowIso(), user.id).run();
+    user = { ...user, email: identity.email, name: identity.name, picture: identity.picture };
   }
 
   const device = input.device ?? {};
@@ -156,7 +165,7 @@ async function authGoogle(env: Env, request: Request): Promise<Response> {
     refresh_token: refreshToken,
     expires_in: expiresIn,
     device_id: deviceId,
-    user: { email: identity.email, name: identity.name },
+    user: { email: user.email, name: user.name ?? '', picture: user.picture ?? '', sub: user.google_sub },
     vault: { revision: await vaultRevision(env, user.id) },
   });
 }
@@ -189,15 +198,21 @@ async function authRefresh(env: Env, request: Request): Promise<Response> {
   await env.DB.prepare('UPDATE devices SET last_seen_at = ? WHERE id = ?')
     .bind(nowIso(), row.device_id).run();
 
-  const user = await env.DB.prepare('SELECT email, name FROM users WHERE id = ?')
-    .bind(row.user_id).first<{ email: string; name: string }>();
+  const user = await env.DB.prepare(
+    'SELECT email, name, picture, google_sub FROM users WHERE id = ?',
+  ).bind(row.user_id).first<{ email: string; name: string | null; picture: string | null; google_sub: string }>();
   const { token, expiresIn } = await issueAccessToken(env.JWT_SECRET, row.user_id, row.device_id);
   return json({
     access_token: token,
     refresh_token: next,
     expires_in: expiresIn,
     device_id: row.device_id,
-    user: { email: user?.email ?? '', name: user?.name ?? '' },
+    user: {
+      email: user?.email ?? '',
+      name: user?.name ?? '',
+      picture: user?.picture ?? '',
+      sub: user?.google_sub ?? '',
+    },
     vault: { revision: await vaultRevision(env, row.user_id) },
   });
 }
@@ -220,11 +235,12 @@ async function authLogout(env: Env, request: Request): Promise<Response> {
 async function me(env: Env, request: Request): Promise<Response> {
   const auth = await authUser(env, request);
   if (!auth) return err(401, 'unauthorized');
-  const user = await env.DB.prepare('SELECT email, name FROM users WHERE id = ?')
-    .bind(auth.userId).first<{ email: string; name: string }>();
+  const user = await env.DB.prepare(
+    'SELECT email, name, picture, google_sub FROM users WHERE id = ?',
+  ).bind(auth.userId).first<{ email: string; name: string | null; picture: string | null; google_sub: string }>();
   if (!user) return err(404, 'user_not_found');
   return json({
-    user: { email: user.email, name: user.name },
+    user: { email: user.email, name: user.name ?? '', picture: user.picture ?? '', sub: user.google_sub },
     device_id: auth.deviceId,
     vault: { revision: await vaultRevision(env, auth.userId) },
   });

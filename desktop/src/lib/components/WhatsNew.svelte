@@ -106,7 +106,7 @@
         </p>
       {:else}
         {#each entries as entry (entry.file)}
-          <article class="card">
+          <article class="entry">
             <header class="entry-head">
               <span class="date">{prettyDate(entry.date)}</span>
               {#if unreadIds.has(entry.file)}<span class="unread-dot" title="Unread"></span>{/if}
@@ -131,7 +131,7 @@
     height: 100%;
     display: flex;
     flex-direction: column;
-    background: var(--panel);
+    background: var(--bg);
     overflow: hidden;
   }
 
@@ -140,96 +140,86 @@
     display: flex;
     align-items: center;
     gap: 14px;
-    padding: 16px 26px;
-    border-bottom: 1px solid var(--line);
-    background: var(--panel);
+    padding: 20px 28px 14px;
+    background: var(--bg);
   }
   .page-icon {
     display: grid;
     place-items: center;
-    width: 38px;
-    height: 38px;
+    width: 34px;
+    height: 34px;
     border-radius: 10px;
-    border: 1px solid var(--accent-line);
     color: var(--accent);
     background: var(--accent-dim);
     flex: 0 0 auto;
   }
   .titles h1 {
     margin: 0;
-    font-size: 20.5px;
+    font-size: 20px;
     font-weight: 600;
-    letter-spacing: -0.01em;
+    letter-spacing: -0.02em;
   }
   .sub {
     margin: 3px 0 0;
-    font-size: 14px;
+    font-size: 13px;
+    color: var(--text-secondary);
   }
   .source {
-    font-size: 12px;
+    font-size: 11.5px;
     padding: 4px 10px;
     border-radius: 999px;
-    border: 1px solid var(--line);
-    color: var(--dim);
+    background: color-mix(in srgb, var(--text) 8%, transparent);
+    color: var(--text-tertiary);
     user-select: none;
     white-space: nowrap;
   }
   .source.fresh {
-    border-color: var(--accent-line);
-    color: var(--accent-strong);
+    color: var(--accent);
   }
 
   .scroll {
     flex: 1;
     overflow-y: auto;
-    padding: 22px 26px 44px;
+    padding: 4px 28px 48px;
   }
   .column {
     width: 100%;
-    max-width: 42rem;
+    max-width: 680px;
     margin: 0 auto;
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    gap: 36px;
   }
   .empty {
-    padding: 40px 8px;
+    padding: 48px 8px;
     text-align: center;
     line-height: 1.7;
+    color: var(--text-secondary);
   }
 
-  .card {
-    border: 1px solid var(--line);
-    border-radius: 14px;
-    background: transparent;
-    padding: 16px 20px 14px;
-  }
   .entry-head {
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 10px;
     margin-bottom: 10px;
-    padding-bottom: 9px;
-    border-bottom: 1px solid var(--line);
     user-select: none;
   }
   .date {
-    font-size: 12.5px;
+    font-size: 11.5px;
     font-weight: 600;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--accent-strong);
+    letter-spacing: 0.02em;
+    color: var(--accent);
   }
   .unread-dot {
-    width: 8px;
-    height: 8px;
+    width: 7px;
+    height: 7px;
     border-radius: 50%;
     background: var(--accent);
     flex: 0 0 auto;
   }
   .file {
-    font-size: 11.5px;
-    color: var(--dim);
+    font-size: 11px;
+    color: var(--text-tertiary);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -237,28 +227,28 @@
   }
 
   .md {
-    font-size: 15px;
-    line-height: 1.65;
+    font-size: 13.5px;
+    line-height: 1.68;
+    color: var(--text);
     max-width: 66ch;
   }
   .md :global(h1) {
-    margin: 2px 0 10px;
-    font-size: 21px;
-    font-weight: 650;
+    margin: 0 0 8px;
+    font-size: 15px;
+    font-weight: 600;
     letter-spacing: -0.015em;
     line-height: 1.3;
   }
   .md :global(h2) {
-    margin: 16px 0 8px;
-    font-size: 15px;
+    margin: 18px 0 8px;
+    font-size: 13px;
     font-weight: 600;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
-    color: var(--dim);
+    letter-spacing: -0.01em;
+    color: var(--text);
   }
   .md :global(h3) {
-    margin: 14px 0 6px;
-    font-size: 15px;
+    margin: 16px 0 6px;
+    font-size: 13.5px;
     font-weight: 600;
   }
   .md :global(p) {
@@ -270,52 +260,88 @@
   .md :global(ul),
   .md :global(ol) {
     margin: 0 0 10px;
-    padding-left: 1.3em;
+    padding-left: 1.25em;
     display: flex;
     flex-direction: column;
     gap: 6px;
   }
   .md :global(a) {
-    color: var(--accent-strong);
+    color: var(--accent);
     text-decoration: underline;
-    text-underline-offset: 3px;
-    text-decoration-color: var(--accent-line);
+    text-decoration-thickness: 1px;
+    text-underline-offset: 2px;
+  }
+  .md :global(a:hover) {
+    color: var(--accent-hover);
   }
   .md :global(strong) {
     color: var(--text);
   }
+  .md :global(blockquote) {
+    margin: 0 0 12px;
+    padding: 2px 0 2px 14px;
+    border-left: 3px solid var(--line);
+    color: var(--text-secondary);
+  }
+  .md :global(hr) {
+    border: 0;
+    border-top: 1px solid var(--line);
+    margin: 18px 0;
+  }
   .md :global(code) {
     font-family: var(--term);
     font-size: 0.88em;
-    background: var(--surface);
-    border: 1px solid var(--line);
+    background: var(--bg-elevated);
     border-radius: 5px;
     padding: 1px 5px;
   }
   .md :global(pre) {
-    background: #161311;
-    border: 1px solid var(--line-strong);
+    background: var(--bg-elevated);
     border-radius: 12px;
     padding: 12px 14px;
     overflow-x: auto;
-    margin: 0 0 10px;
+    margin: 0 0 12px;
   }
   .md :global(pre code) {
     background: none;
-    border: 0;
     padding: 0;
-    font-size: 13px;
+    font-size: 12.5px;
     line-height: 1.7;
-    color: #e8e2d8;
+    color: var(--text);
   }
   .md :global(img) {
     max-width: 100%;
     border-radius: 10px;
   }
+  .md :global(table) {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+    margin: 0 0 12px;
+  }
+  .md :global(th),
+  .md :global(td) {
+    text-align: left;
+    padding: 6px 12px 6px 0;
+    border-bottom: 1px solid var(--line);
+  }
 
   .foot {
     text-align: center;
+    font-size: 12px;
     line-height: 1.7;
-    padding: 4px 12px 0;
+    color: var(--text-tertiary);
+  }
+
+  @media (max-width: 720px) {
+    .page-head {
+      padding: 18px 20px 14px;
+    }
+    .scroll {
+      padding: 4px 20px 44px;
+    }
+    .source {
+      display: none;
+    }
   }
 </style>

@@ -19,28 +19,29 @@ function read(): number {
   return 1;
 }
 
-export type Theme = 'ember-black' | 'ember-light' | 'pine-black';
+export type Theme = 'dark' | 'light';
 
-export const THEMES: { id: Theme; label: string; hint: string }[] = [
-  { id: 'ember-black', label: 'Ember Black', hint: 'Orange on black' },
-  { id: 'ember-light', label: 'Ember Light', hint: 'Orange on ivory' },
-  { id: 'pine-black', label: 'Pine Black', hint: 'Green on black' },
+export const THEMES: { id: Theme; label: string }[] = [
+  { id: 'dark', label: 'Dark' },
+  { id: 'light', label: 'Light' },
 ];
 
 const THEME_KEY = 'rterm.theme';
-const LEGACY: Record<string, Theme> = { dark: 'ember-black', light: 'ember-light' };
+const LEGACY: Record<string, Theme> = {
+  'ember-black': 'dark',
+  'pine-black': 'dark',
+  'ember-light': 'light',
+};
 
 function readTheme(): Theme {
   try {
     const stored = localStorage.getItem(THEME_KEY);
     if (stored && stored in LEGACY) return LEGACY[stored];
-    if (stored === 'ember-black' || stored === 'ember-light' || stored === 'pine-black') {
-      return stored;
-    }
+    if (stored === 'dark' || stored === 'light') return stored;
   } catch {
     /* ignore */
   }
-  return 'ember-black';
+  return 'dark';
 }
 
 export const ui = $state({ zoom: read(), theme: readTheme() });

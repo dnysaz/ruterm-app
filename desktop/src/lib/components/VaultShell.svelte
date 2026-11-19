@@ -1,7 +1,22 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, newHost, type Host, type SessionStatus } from '$lib/api';
-  import { app, applyVaultPayload, deleteHost, hosts, lock, notify, saveHost, syncNow } from '$lib/state.svelte';
+  import { api, newHost, type AiAgent, type Host, type Note, type SessionStatus } from '$lib/api';
+  import { background, backgroundStyle, frostStyle } from '$lib/background.svelte';
+  import {
+    app,
+    applyVaultPayload,
+    deleteHost,
+    deleteNote,
+    fail,
+    hosts,
+    lock,
+    notes,
+    notify,
+    saveHost,
+    saveNote,
+    syncNow,
+    syncQuiet,
+  } from '$lib/state.svelte';
   import HostAvatar from './HostAvatar.svelte';
   import HostForm from './HostForm.svelte';
   import Icon from './Icon.svelte';
@@ -10,16 +25,39 @@
   import Terminal from './Terminal.svelte';
   import InfoPage from './InfoPage.svelte';
   import JsonEditor from './JsonEditor.svelte';
+  import NoteEditor from './NoteEditor.svelte';
+  import ConfirmDialog from './ConfirmDialog.svelte';
+  import AiAgentIcon from './AiAgentIcon.svelte';
   import WhatsNew from './WhatsNew.svelte';
   import { initNews, newsState } from '$lib/news.svelte';
-  import { THEMES, ui } from '$lib/ui.svelte';
+
+  interface AdhocTarget {
+    username: string;
+    address: string;
+    port: number;
+  }
 
   interface Tab {
     id: string;
     hostId: string;
     title: string;
     status: SessionStatus;
-    kind: 'ssh' | 'local' | 'settings' | 'hostform' | 'info' | 'whatsnew' | 'json';
+    kind:
+      | 'ssh'
+      | 'local'
+      | 'settings'
+      | 'hostform'
+      | 'info'
+      | 'whatsnew'
+      | 'json'
+      | 'note'
+      | 'adhoc'
+      | 'home';
+    adhoc?: AdhocTarget;
+    /** Local-agent tabs: shell starts here instead of $HOME. */
+    cwd?: string;
+    /** Local-agent tabs: command typed into the shell after spawn. */
+    command?: string;
   }
 
   type InfoPageKind = 'about' | 'terms' | 'privacy' | 'contact' | 'github';
@@ -46,6 +84,16 @@
   const PANE_A: 'a' = 'a';
   const PANE_B: 'b' = 'b';
 
+  /** The Home tab is pinned first in pane A — it can be focused, never closed. */
+  const HOME_ID = 'home';
+  const HOME_TAB: Tab = {
+    id: HOME_ID,
+    hostId: '',
+    title: 'Home',
+    status: 'connected',
+    kind: 'home',
+  };
+
   let tabs = $state<Tab[]>([]);
   let panes = $state<Pane[]>([{ id: PANE_A, tabs: [], active: null }]);
   let splitAxis = $state<'row' | 'col'>('row');
@@ -55,7 +103,8 @@
   let formHost = $state<Host | null>(null);
   let formEpoch = $state(0);
   let query = $state('');
-  let filter = $state<'all' | 'favorite'>('all');
+  let filter = $state<'all' | 'favorite' | 'note'>('all');
+  let noteToDelete = $state<Note | null>(null);
   let pickerOpen = $state(false);
   let collapsed = $state(readCollapsed());
   let dragTabId = $state<string | null>(null);
@@ -66,6 +115,7 @@
     const menu = tabMenu;
     return menu ? (tabs.find(t => t.id === menu.tabId) ?? null) : null;
   });
+  let appMenu = $state<{ x: number; y: number } | null>(null);
 
   // ---------------------------------------------------------- persistence
   const TABS_KEY = 'rterm.tabs.v1';
@@ -104,7 +154,10 @@
     return list.map(p => {
       if (p.id !== paneId) return p;
       const next = [...p.tabs];
-      next.splice(index === null ? next.length : Math.max(0, Math.min(index, next.length)), 0, tabId);
+      let at = index === null ? next.length : Math.max(0, Math.min(index, next.length));
+      // The pinned Home tab always keeps the first slot.
+      if (next[0] === HOME_ID && at < 1) at = 1;
+      next.splice(at, 0, tabId);
       return { ...p, tabs: next, active: tabId };
     });
   }
@@ -152,18 +205,45 @@
       if (!Array.isArray(parsed?.tabs)) return empty;
       const safe: Tab[] = parsed.tabs
         .filter((t: unknown): t is Partial<Tab> & { id: string } => {
-          // Page tabs (Settings, host form) are never restored — sessions only.
+          // Page tabs (Settings, host form) are never restored — sessions and
+          // notes only. Note bodies live in the vault; only the tab position is
+          // snapshotted (hostId = note id).
           const kind = (t as Tab | null)?.kind;
-          return !!t && typeof (t as Tab).id === 'string' && (kind === 'local' || kind === 'ssh');
+          if (!t || typeof (t as Tab).id !== 'string') return false;
+          if (kind === 'local' || kind === 'ssh') return true;
+          if (kind === 'note') return typeof (t as Tab).hostId === 'string' && (t as Tab).hostId.length > 0;
+          if (kind === 'adhoc') {
+            const a = (t as Tab).adhoc;
+            return (
+              !!a &&
+              typeof a.username === 'string' && a.username.length > 0 &&
+              typeof a.address === 'string' && a.address.length > 0 &&
+              typeof a.port === 'number' && Number.isInteger(a.port) && a.port >= 1 && a.port <= 65535
+            );
+          }
+          return false;
         })
-        .map((t: Partial<Tab> & { id: string }): Tab => ({
-          id: t.id,
-          hostId: typeof t.hostId === 'string' ? t.hostId : '',
-          title: typeof t.title === 'string' ? t.title : 'Session',
-          // The real status is resolved by session_attach on mount.
-          status: 'connecting',
-          kind: t.kind === 'local' ? 'local' : 'ssh',
-        }));
+        .map((t: Partial<Tab> & { id: string }): Tab => {
+          const adhoc =
+            t.kind === 'adhoc' && t.adhoc
+              ? {
+                  username: String(t.adhoc.username),
+                  address: String(t.adhoc.address),
+                  port: Math.min(65535, Math.max(1, Math.floor(Number(t.adhoc.port) || 22))),
+                }
+              : undefined;
+          return {
+            id: t.id,
+            hostId: typeof t.hostId === 'string' ? t.hostId : '',
+            title: typeof t.title === 'string' ? t.title : adhoc ? `${adhoc.username}@${adhoc.address}` : 'Session',
+            // The real status is resolved by session_attach on mount.
+            status: t.kind === 'note' ? 'connected' : 'connecting',
+            kind: t.kind === 'local' ? 'local' : t.kind === 'adhoc' ? 'adhoc' : t.kind === 'note' ? 'note' : 'ssh',
+            ...(adhoc ? { adhoc } : {}),
+            ...(typeof t.cwd === 'string' && t.kind === 'local' ? { cwd: t.cwd } : {}),
+            ...(typeof t.command === 'string' && t.kind === 'local' ? { command: t.command } : {}),
+          };
+        });
 
       let restored: Pane[] = [];
       if (Array.isArray(parsed?.panes) && parsed.panes.length > 0) {
@@ -227,17 +307,32 @@
 
   function saveTabs() {
     try {
-      const snapshot = tabs.map(t => ({
-        id: t.id,
-        hostId: t.hostId,
-        title: t.title,
-        kind: t.kind,
-      }));
+      const snapshot = tabs
+        // Home is pinned, page tabs are intentionally ephemeral. Adhoc tabs
+        // persist connection details only — never credentials. Note tabs are
+        // safe to restore: their body lives in the vault, never in localStorage.
+        .filter(t => t.kind === 'local' || t.kind === 'ssh' || t.kind === 'adhoc' || t.kind === 'note')
+        .map(t => ({
+          id: t.id,
+          hostId: t.hostId,
+          title: t.title,
+          kind: t.kind,
+          ...(t.kind === 'local' && t.cwd ? { cwd: t.cwd } : {}),
+          ...(t.kind === 'local' && t.command ? { command: t.command } : {}),
+          ...(t.kind === 'adhoc' && t.adhoc ? { adhoc: t.adhoc } : {}),
+        }));
       localStorage.setItem(
         TABS_KEY,
         JSON.stringify({
           tabs: snapshot,
-          panes: panes.map(p => ({ id: p.id, tabs: [...p.tabs], active: p.active })),
+          panes: panes.map(p => ({
+            id: p.id,
+            tabs: p.tabs.filter(id => {
+              const tab = tabs.find(t => t.id === id);
+              return !!tab && (tab.kind === 'ssh' || tab.kind === 'local' || tab.kind === 'adhoc' || tab.kind === 'note');
+            }),
+            active: p.active === HOME_ID ? null : p.active,
+          })),
           splitAxis,
           splitFraction,
           focusedPane: focusedPaneId,
@@ -275,10 +370,58 @@
       .sort((a, b) => Number(b.favorite) - Number(a.favorite) || a.label.localeCompare(b.label)),
   );
 
+  const noteList = $derived(
+    notes()
+      .filter(n => (filter === 'favorite' ? n.favorite : true))
+      .filter(n => {
+        const q = query.trim().toLowerCase();
+        return !q || n.body.toLowerCase().includes(q);
+      })
+      .sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || '')),
+  );
+
   const focusedPane = $derived(panes.find(p => p.id === focusedPaneId) ?? panes[0]);
   const focusedActiveTabId = $derived(focusedPane?.active ?? null);
-  const activeHostId = $derived(tabs.find(t => t.id === focusedActiveTabId)?.hostId ?? null);
+  const activeTab = $derived(tabs.find(t => t.id === focusedActiveTabId) ?? null);
+  const activeHostId = $derived(activeTab?.hostId ?? null);
+  const activeNoteId = $derived(activeTab?.kind === 'note' ? activeTab.hostId : null);
   const tabById = $derived(new Map(tabs.map(t => [t.id, t] as const)));
+  /** The About pill row only exists on the home tab — raise the AI dock above it then. */
+  const homeVisible = $derived(panes.some(p => p.active === HOME_ID));
+  // Recently opened hosts for the session picker (most recent first).
+  const RECENT_HOSTS_KEY = 'rterm.recent.hosts';
+
+  function readRecents(): string[] {
+    try {
+      if (typeof localStorage === 'undefined') return [];
+      const raw = localStorage.getItem(RECENT_HOSTS_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(id => typeof id === 'string').slice(0, 10);
+    } catch {
+      return [];
+    }
+  }
+
+  let recentHostIds = $state<string[]>(readRecents());
+
+  function rememberHost(id: string) {
+    recentHostIds = [id, ...recentHostIds.filter(x => x !== id)].slice(0, 10);
+    try {
+      localStorage.setItem(RECENT_HOSTS_KEY, JSON.stringify(recentHostIds));
+    } catch {
+      /* storage full/private mode — recents are best-effort */
+    }
+  }
+
+  const recentHosts = $derived(
+    recentHostIds
+      .map(id => hosts().find(h => h.id === id))
+      .filter((h): h is Host => !!h && !h.deleted)
+      .slice(0, 5),
+  );
+
   const pickable = $derived(
     hosts()
       .filter(h => !h.deleted)
@@ -287,15 +430,10 @@
           Number(b.favorite) - Number(a.favorite) || a.label.localeCompare(b.label),
       ),
   );
-  const accountEmail = $derived(app.status?.account?.email ?? 'Local mode');
+  const account = $derived(app.status?.account ?? null);
+  const accountName = $derived(account?.name ?? account?.email ?? 'Local mode');
+  const accountInitial = $derived(accountName.slice(0, 1).toUpperCase());
 
-  /** Hosts previewed inside the empty-state terminal (favorites first). */
-  const previewHosts = $derived(
-    [...hosts()]
-      .sort((a, b) => Number(b.favorite) - Number(a.favorite) || a.label.localeCompare(b.label))
-      .slice(0, 4),
-  );
-  const themeLabel = $derived(THEMES.find(t => t.id === ui.theme)?.label ?? 'Ember Black');
 
   /**
    * Every click opens a new session — the same host may run in several tabs at
@@ -303,6 +441,7 @@
    */
   function connect(host: Host) {
     pickerOpen = false;
+    rememberHost(host.id);
 
     const base = host.label || host.address;
     const sameHost = tabs.filter(t => t.hostId === host.id).length;
@@ -350,6 +489,164 @@
     };
     tabs = [...tabs, tab];
     addTabToPane(tab.id, lastFocusedOrFirst());
+  }
+
+  // ---------------------------------------------------------------- notes
+  /// A note's list title is the first few words of its body.
+  function noteTitle(note: Note): string {
+    const first = note.body
+      .split('\n')
+      .map(line => line.trim())
+      .find(Boolean);
+    if (!first) return 'Untitled note';
+    const short = first.split(/\s+/).filter(Boolean).slice(0, 7).join(' ');
+    return short.length > 56 ? `${short.slice(0, 55)}…` : short;
+  }
+
+  function noteTime(note: Note): string {
+    const date = new Date(note.updated_at || note.created_at);
+    if (Number.isNaN(date.getTime())) return '';
+    return date.toLocaleString([], {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  }
+
+  function openNote(note: Note) {
+    pickerOpen = false;
+    const id = `note-${note.id}`;
+    const existing = tabs.find(t => t.id === id);
+    if (existing) {
+      activateTab(id);
+      return;
+    }
+    const tab: Tab = {
+      id,
+      hostId: note.id,
+      title: 'Note',
+      status: 'connected',
+      kind: 'note',
+    };
+    tabs = [...tabs, tab];
+    addTabToPane(tab.id, lastFocusedOrFirst());
+  }
+
+  async function openNewNote() {
+    if (!app.vault) return;
+    const now = new Date().toISOString();
+    const note: Note = {
+      id: crypto.randomUUID(),
+      body: '',
+      favorite: false,
+      created_at: now,
+      updated_at: now,
+      deleted: false,
+    };
+    try {
+      await saveNote(note);
+    } catch (error) {
+      fail(error);
+      return;
+    }
+    filter = 'note';
+    openNote(note);
+  }
+
+  async function onNoteBody(note: Note, body: string) {
+    try {
+      await saveNote({ ...note, body });
+      void syncQuiet();
+    } catch (error) {
+      fail(error);
+    }
+  }
+
+  async function confirmDeleteNote() {
+    const note = noteToDelete;
+    noteToDelete = null;
+    if (!note) return;
+    try {
+      await deleteNote(note.id);
+      closeTab(`note-${note.id}`);
+      void syncQuiet();
+    } catch (error) {
+      fail(error);
+    }
+  }
+
+  // ------------------------------------------------------------ AI dock
+  /// AI-agent CLIs installed on this machine (auto-detected). Clicking one
+  /// opens a local shell in ~/Desktop and starts the agent right away.
+  let aiAgents = $state<AiAgent[]>([]);
+
+  function openAgent(agent: AiAgent) {
+    pickerOpen = false;
+    const tab: Tab = {
+      id: crypto.randomUUID(),
+      hostId: '',
+      title: agent.label,
+      status: 'connecting',
+      kind: 'local',
+      cwd: '~/Desktop',
+      command: agent.command,
+    };
+    tabs = [...tabs, tab];
+    addTabToPane(tab.id, lastFocusedOrFirst());
+  }
+
+  /** True while an agent tab is still starting up — drives the dock pulse. */
+  function isAgentLaunching(agent: AiAgent): boolean {
+    return tabs.some(
+      t => t.kind === 'local' && t.command === agent.command && t.status === 'connecting',
+    );
+  }
+
+  // ------------------------------------------------------------ quick connect
+  /// Home-screen shortcut: type `ssh user@host[:port]` (or just `user@host`)
+  /// and get a session without creating a vault host first.
+  let quickTarget = $state('');
+  let quickError = $state('');
+
+  const QUICK_RE = /^\s*(?:ssh[ \t]+)?([A-Za-z0-9._-]+)@([A-Za-z0-9._-]+)(?::([0-9]{1,5}))?\s*$/;
+
+  const quickParsed = $derived.by(() => {
+    const match = quickTarget.trim().match(QUICK_RE);
+    if (!match) return null;
+    const port = match[3] ? Number(match[3]) : 22;
+    if (port < 1 || port > 65535) return null;
+    return { username: match[1], address: match[2], port };
+  });
+
+  function quickConnect(event?: SubmitEvent) {
+    event?.preventDefault();
+    const match = quickTarget.trim().match(QUICK_RE);
+    if (!match) {
+      quickError = 'Format: ssh username@host:port';
+      return;
+    }
+    const port = match[3] ? Number(match[3]) : 22;
+    if (port < 1 || port > 65535) {
+      quickError = 'Port must be between 1 and 65535';
+      return;
+    }
+    quickError = '';
+    const tab: Tab = {
+      id: crypto.randomUUID(),
+      hostId: '',
+      title: `${match[1]}@${match[2]}`,
+      status: 'connecting',
+      kind: 'adhoc',
+      adhoc: {
+        username: match[1],
+        address: match[2],
+        port,
+      },
+    };
+    tabs = [...tabs, tab];
+    addTabToPane(tab.id, lastFocusedOrFirst());
+    quickTarget = '';
   }
 
   function cycleTab(direction: 1 | -1) {
@@ -404,11 +701,11 @@
   /// Page tabs (Settings, host form) are singletons that live in the tab bar like
   /// any session tab, so the vault behind them is never torn down.
   function isSessionTab(tab: Tab): boolean {
-    return tab.kind === 'ssh' || tab.kind === 'local';
+    return tab.kind === 'ssh' || tab.kind === 'local' || tab.kind === 'adhoc';
   }
 
-  function terminalKind(tab: Tab): 'ssh' | 'local' {
-    return tab.kind === 'local' ? 'local' : 'ssh';
+  function terminalKind(tab: Tab): 'ssh' | 'local' | 'adhoc' {
+    return tab.kind === 'local' ? 'local' : tab.kind === 'adhoc' ? 'adhoc' : 'ssh';
   }
 
   function paneIdOfTab(id: string): 'a' | 'b' | null {
@@ -520,10 +817,62 @@
     addTabToPane(tab.id, lastFocusedOrFirst());
   }
 
+  // ------------------------------------------------------ app menu
+  function openAppMenuAt(x: number, y: number) {
+    const width = 198;
+    const height = 220;
+    appMenu = {
+      x: Math.min(Math.max(8, x), Math.max(8, window.innerWidth - width - 8)),
+      y: Math.min(Math.max(8, y), Math.max(8, window.innerHeight - height - 8)),
+    };
+    tabMenu = null;
+  }
+
+  function toggleAppMenu(button: HTMLElement) {
+    if (appMenu) {
+      appMenu = null;
+      return;
+    }
+    const rect = button.getBoundingClientRect();
+    openAppMenuAt(rect.left, rect.bottom + 8);
+  }
+
+  function closeAppMenu() {
+    appMenu = null;
+  }
+
+  /// Focus the pinned Home tab — nothing is closed or unmounted.
+  function goHome() {
+    closeAppMenu();
+    closeTabMenu();
+    const pane = panes.find(p => p.tabs.includes(HOME_ID)) ?? panes[0];
+    setPaneActive(pane.id, HOME_ID);
+  }
+
+  /// Right-click: real text fields keep the native edit menu; terminal and
+  /// chrome (sidebar, tab bar, home) open the app menu at the pointer; document
+  /// pages stay quiet.
+  function onContextMenu(event: MouseEvent) {
+    const target = event.target as HTMLElement | null;
+    if (target?.closest('.xterm')) {
+      event.preventDefault();
+      openAppMenuAt(event.clientX, event.clientY);
+      return;
+    }
+    if (target?.closest('input, textarea, select, [contenteditable="true"]')) return;
+    event.preventDefault();
+    if (target?.closest('.tab') || target?.closest('.tab-menu')) return;
+    if (target?.closest('.pane')) return;
+    openAppMenuAt(event.clientX, event.clientY);
+  }
+
   // ------------------------------------------------------ tab context menu
   function openTabMenu(event: MouseEvent, tabId: string) {
     event.preventDefault();
     event.stopPropagation();
+    closeAppMenu();
+    // The Home tab is pinned — nothing to offer.
+    if (tabId === HOME_ID) return;
     // Keep the menu inside the window even for right-clicks near an edge.
     const menuWidth = 228;
     const menuHeight = 296;
@@ -598,8 +947,48 @@
     };
   }
 
+  /// Same keyboard/outside-click contract as the tab menu.
+  function appMenuBehavior(node: HTMLElement) {
+    const items = () => [...node.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
+    items()[0]?.focus();
+    const onPointerDown = (event: PointerEvent) => {
+      if (!node.contains(event.target as Node)) closeAppMenu();
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        closeAppMenu();
+        return;
+      }
+      const list = items();
+      const index = list.indexOf(document.activeElement as HTMLButtonElement);
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        list[(index + 1) % list.length]?.focus();
+      } else if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        list[(index - 1 + list.length) % list.length]?.focus();
+      }
+    };
+    const onBlur = () => closeAppMenu();
+    window.addEventListener('pointerdown', onPointerDown, true);
+    window.addEventListener('keydown', onKey, true);
+    window.addEventListener('blur', onBlur);
+    window.addEventListener('resize', onBlur);
+    return {
+      destroy() {
+        window.removeEventListener('pointerdown', onPointerDown, true);
+        window.removeEventListener('keydown', onKey, true);
+        window.removeEventListener('blur', onBlur);
+        window.removeEventListener('resize', onBlur);
+      },
+    };
+  }
+
   // ------------------------------------------------------------ tab drag & drop
   function onTabDragStart(event: DragEvent, tab: Tab) {
+    if (tab.kind === 'home') return; // pinned — not draggable
     dragTabId = tab.id;
     if (event.dataTransfer) {
       event.dataTransfer.effectAllowed = 'move';
@@ -618,7 +1007,7 @@
   /// Elements of the same tab bar that can serve as re-insert landmarks.
   function reorderLandmarks(container: HTMLElement): HTMLElement[] {
     return [...container.querySelectorAll<HTMLElement>('.tab[data-tab-id]')].filter(
-      el => el.dataset.tabId !== dragTabId,
+      el => el.dataset.tabId !== dragTabId && el.dataset.tabId !== HOME_ID,
     );
   }
 
@@ -832,6 +1221,7 @@
   }
 
   function closeTab(id: string) {
+    if (id === HOME_ID) return; // the Home tab is pinned
     removeSnapshot(id);
     tabs = tabs.filter(t => t.id !== id);
     panes = panes.map(p => ({ ...p, tabs: p.tabs.filter(t => t !== id) }));
@@ -846,22 +1236,36 @@
   }
 
   onMount(() => {
+    // Show only the AI agents actually installed on this machine.
+    void api.aiAgentsDetect().then(agents => (aiAgents = agents)).catch(() => (aiAgents = []));
+
     // WebView reload (Cmd/Ctrl+R) must not throw away open sessions.
     const restored = readTabs();
     if (restored.tabs.length) {
       const known = new Set(hosts().map(h => h.id));
-      tabs = restored.tabs.filter(t => t.kind === 'local' || known.has(t.hostId));
+      const liveNotes = new Set(notes().map(n => n.id));
+      tabs = [
+        HOME_TAB,
+        ...restored.tabs.filter(t => {
+          if (t.kind === 'local' || t.kind === 'adhoc') return true;
+          // Note tabs only survive if their note still exists in the vault.
+          if (t.kind === 'note') return liveNotes.has(t.hostId);
+          return known.has(t.hostId);
+        }),
+      ];
       const surviving = new Set(tabs.map(t => t.id));
-      panes = restored.panes.map(p => ({
+      panes = restored.panes.map((p, i) => ({
         ...p,
-        tabs: p.tabs.filter(id => surviving.has(id)),
+        // The pinned Home tab always sits first in the first pane.
+        tabs: i === 0 ? [HOME_ID, ...p.tabs.filter(id => surviving.has(id))] : p.tabs.filter(id => surviving.has(id)),
       }));
       splitAxis = restored.splitAxis;
       splitFraction = restored.splitFraction;
       focusedPaneId = restored.focusedPane;
       applyPanes(panes);
     } else {
-      panes = [{ id: PANE_A, tabs: [], active: null }];
+      tabs = [HOME_TAB];
+      panes = [{ id: PANE_A, tabs: [HOME_ID], active: HOME_ID }];
       focusedPaneId = PANE_A;
     }
     tabsReady = true;
@@ -894,6 +1298,9 @@
 
   function tabAddress(tab: Tab): string {
     if (tab.kind === 'local') return 'local pty';
+    if (tab.kind === 'adhoc' && tab.adhoc) {
+      return `${tab.adhoc.username}@${tab.adhoc.address}:${tab.adhoc.port}`;
+    }
     if (tab.kind !== 'ssh') return '';
     const host = hosts().find(h => h.id === tab.hostId);
     return host ? `${host.username}@${host.address}:${host.port}` : '';
@@ -901,7 +1308,23 @@
 
 </script>
 
-<div class="shell" class:collapsed>
+<svelte:window oncontextmenu={onContextMenu} />
+
+{#snippet addTabButton(paneId: 'a' | 'b')}
+  <button
+    class="add-tab"
+    title="Open a session"
+    aria-label="Open a session"
+    onclick={() => {
+      focusedPaneId = paneId;
+      pickerOpen = !pickerOpen;
+    }}
+  >
+    <Icon name="plus" size={14} />
+  </button>
+{/snippet}
+
+<div class="shell" class:collapsed class:backdrop={background.mode !== 'none'} style={backgroundStyle()}>
   <aside>
     <header>
       {#if collapsed}
@@ -919,27 +1342,21 @@
         <span class="spacer"></span>
         <button
           class="icon-btn"
+          title="Menu"
+          aria-label="Menu"
+          aria-haspopup="menu"
+          aria-expanded={appMenu !== null}
+          onclick={(event) => toggleAppMenu(event.currentTarget)}
+        >
+          <Icon name="ellipsis" size={16} />
+        </button>
+        <button
+          class="icon-btn"
           title="Collapse sidebar"
           aria-label="Collapse sidebar"
           onclick={toggleSidebar}
         >
-          <Icon name="panel-left" size={18} />
-        </button>
-        <button
-          class="icon-btn"
-          title="Local terminal"
-          aria-label="Local terminal"
-          onclick={openLocal}
-        >
-          <Icon name="terminal" size={18} />
-        </button>
-        <button
-          class="icon-btn"
-          title="Settings"
-          aria-label="Settings"
-          onclick={openSettingsTab}
-        >
-          <Icon name="settings" size={18} />
+          <Icon name="panel-left" size={16} />
         </button>
       {/if}
     </header>
@@ -953,17 +1370,79 @@
       <div class="filters">
         <button class:on={filter === 'all'} onclick={() => (filter = 'all')}>All</button>
         <button class:on={filter === 'favorite'} onclick={() => (filter = 'favorite')}>
-          Favorites
+          Favorite
+        </button>
+        <button class:on={filter === 'note'} onclick={() => (filter = 'note')}>
+          Note
         </button>
         <span class="spacer"></span>
-        <button class="icon-btn" title="New host" aria-label="New host" onclick={startBlank}>
+        <button
+          class="icon-btn"
+          title={filter === 'note' ? 'New note' : 'New host'}
+          aria-label={filter === 'note' ? 'New note' : 'New host'}
+          onclick={() => (filter === 'note' ? void openNewNote() : startBlank())}
+        >
           <Icon name="plus" size={18} />
         </button>
       </div>
     {/if}
 
     <div class="list">
-      {#each visible as host (host.id)}
+      {#if filter === 'note'}
+        {#each noteList as note (note.id)}
+          <div
+            class="host note"
+            class:active={activeNoteId === note.id}
+            role="button"
+            tabindex="0"
+            title={note.body.slice(0, 120)}
+            onclick={() => openNote(note)}
+            onkeydown={event => event.key === 'Enter' && openNote(note)}
+          >
+            {#if !collapsed}
+              <span class="meta">
+                <span class="name">{noteTitle(note)}</span>
+                <span class="sub">{noteTime(note)}</span>
+              </span>
+              {#if note.favorite}<span class="star" aria-label="Favorite">★</span>{/if}
+              <button
+                class="more"
+                type="button"
+                title="Delete note"
+                aria-label="Delete note"
+                onclick={event => {
+                  event.stopPropagation();
+                  noteToDelete = note;
+                }}
+              >
+                <Icon name="trash" size={16} />
+              </button>
+            {:else}
+              <span class="note-mark" aria-hidden="true">✎</span>
+            {/if}
+          </div>
+        {:else}
+          {#if !collapsed}
+            <div class="empty">
+              <p class="muted">{query ? 'No notes match your search.' : 'No notes yet.'}</p>
+              <button class="btn sm" onclick={() => void openNewNote()}>New note</button>
+            </div>
+          {/if}
+        {/each}
+
+        {#if collapsed}
+          <button
+            class="rail-add"
+            type="button"
+            title="New note"
+            aria-label="New note"
+            onclick={() => void openNewNote()}
+          >
+            <Icon name="plus" size={18} />
+          </button>
+        {/if}
+      {:else}
+        {#each visible as host (host.id)}
         <div
           class="host"
           class:active={activeHostId === host.id}
@@ -974,7 +1453,7 @@
           onkeydown={event => event.key === 'Enter' && connect(host)}
           ondblclick={() => openHostFormTab(host)}
         >
-          <HostAvatar host={host} size={collapsed ? 36 : 34} />
+          <HostAvatar host={host} size={collapsed ? 32 : 28} />
           {#if !collapsed}
             <span class="meta">
               <span class="name">
@@ -1004,18 +1483,19 @@
             <button class="btn sm" onclick={startBlank}>Add host</button>
           </div>
         {/if}
-      {/each}
+        {/each}
 
-      {#if collapsed}
-        <button
-          class="rail-add"
-          type="button"
-          title="New host"
-          aria-label="New host"
-          onclick={startBlank}
-        >
-          <Icon name="plus" size={18} />
-        </button>
+        {#if collapsed}
+          <button
+            class="rail-add"
+            type="button"
+            title="New host"
+            aria-label="New host"
+            onclick={startBlank}
+          >
+            <Icon name="plus" size={18} />
+          </button>
+        {/if}
       {/if}
     </div>
 
@@ -1050,101 +1530,50 @@
           <Icon name="lock" size={18} />
         </button>
       {:else}
-        <span class="dot" class:signed={app.status?.signed_in}></span>
-        <span class="who" title={accountEmail}>{accountEmail}</span>
-        <span class="spacer"></span>
-        <button
-          class="icon-btn"
-          title="Sync now"
-          aria-label="Sync now"
-          disabled={app.busy || !app.status?.signed_in}
-          onclick={() => void syncNow()}
-        >
-          <Icon name="sync" size={18} />
-        </button>
-        <button class="icon-btn" title="Lock vault" aria-label="Lock vault" onclick={() => void lock()}>
-          <Icon name="lock" size={18} />
-        </button>
+        <div class="side-tools">
+          <button class="side-action" type="button" onclick={openLocal} title="Open a local shell">
+            <Icon name="terminal" size={15} stroke={2.3} />
+            <span>Local terminal</span>
+          </button>
+          <button
+            class="icon-btn"
+            title="Settings"
+            aria-label="Settings"
+            onclick={openSettingsTab}
+          >
+            <Icon name="settings" size={16} stroke={2.1} />
+          </button>
+        </div>
+        <div class="side-account">
+          {#if account}
+            {#if account.picture}
+              <img class="who-avatar" src={account.picture} alt="" referrerpolicy="no-referrer" />
+            {:else}
+              <span class="who-avatar letter" aria-hidden="true">{accountInitial}</span>
+            {/if}
+          {:else}
+            <span class="dot" class:signed={app.status?.signed_in}></span>
+          {/if}
+          <span class="who" title={accountName}>{accountName}</span>
+          <span class="spacer"></span>
+          <button
+            class="icon-btn"
+            title="Sync now"
+            aria-label="Sync now"
+            disabled={app.busy || !app.status?.signed_in}
+            onclick={() => void syncNow()}
+          >
+            <Icon name="sync" size={15} stroke={2.3} />
+          </button>
+          <button class="icon-btn" title="Lock vault" aria-label="Lock vault" onclick={() => void lock()}>
+            <Icon name="lock" size={15} stroke={2.3} />
+          </button>
+        </div>
       {/if}
     </footer>
   </aside>
 
   <main>
-    {#if tabs.length === 0}
-      <div class="empty-main">
-        <div class="hero">
-          <div class="eyebrow"><span class="hero-badge">R</span>RUTERM · SSH CLIENT</div>
-          <h1>No session open.</h1>
-          <p class="lede">
-            Pick a host on the left, click one in the list below, or start something new —
-            every session gets its own tab.
-          </p>
-
-          <div class="term-card">
-            <div class="term-titlebar">
-              <span class="tdot tdot-red"></span>
-              <span class="tdot tdot-amber"></span>
-              <span class="tdot tdot-green"></span>
-              <span class="term-caption">rterm — zsh</span>
-            </div>
-            <div class="term-body">
-              <div class="tline"><span class="prompt">$</span><span class="cmd">rterm status</span></div>
-              <div class="tout">vault sealed · {hosts().length} {hosts().length === 1 ? 'host' : 'hosts'} · sync rev {app.revision} · {themeLabel}</div>
-              <div class="tline"><span class="prompt">$</span><span class="cmd">rterm list</span></div>
-              {#if previewHosts.length === 0}
-                <div class="tout dimline">no hosts yet — create your first with “New host”</div>
-              {:else}
-                {#each previewHosts as host (host.id)}
-                  <button class="thost" type="button" title={`Connect to ${host.label || host.address}`} onclick={() => connect(host)}>
-                    <span class="thost-dot"></span>
-                    <span class="thost-name">{host.label || host.address}</span>
-                    <span class="thost-addr">{host.username}@{host.address}:{host.port}</span>
-                    <span class="thost-go">connect<Icon name="chevron-right" size={14} /></span>
-                  </button>
-                {/each}
-              {/if}
-              <div class="tline"><span class="prompt">$</span><span class="block-cursor" aria-hidden="true"></span></div>
-            </div>
-          </div>
-
-          <div class="hero-actions">
-            <button class="btn primary" onclick={startBlank}>
-              <Icon name="plus" size={18} />
-              New host
-            </button>
-            <button
-              class="btn"
-              disabled={app.busy || !app.status?.signed_in}
-              onclick={() => void syncNow()}
-            >
-              <Icon name="sync" size={17} />
-              Sync now
-            </button>
-            <button class="btn" onclick={openWhatsNewTab} title="Open release notes">
-              <Icon name="spark" size={17} />
-              What's New?
-              {#if newsState.unread > 0}
-                <span class="badge-count" aria-label={`${newsState.unread} unread release notes`}>
-                  {newsState.unread > 9 ? '9+' : newsState.unread}
-                </span>
-              {/if}
-            </button>
-          </div>
-        </div>
-
-        <nav class="empty-links" aria-label="About RuTerm">
-          <button type="button" onclick={() => openInfoTab('about')}>About</button>
-          <span class="sep" aria-hidden="true"></span>
-          <button type="button" onclick={() => openInfoTab('terms')}>Terms</button>
-          <span class="sep" aria-hidden="true"></span>
-          <button type="button" onclick={() => openInfoTab('privacy')}>Privacy</button>
-          <span class="sep" aria-hidden="true"></span>
-          <button type="button" onclick={() => openInfoTab('contact')}>Contact</button>
-          <span class="sep" aria-hidden="true"></span>
-          <button type="button" onclick={() => openInfoTab('github')}>GitHub</button>
-        </nav>
-      </div>
-    {:else}
       <div class="workspace axis-{splitAxis}" class:split={panes.length === 2}>
         {#each panes as pane, i (pane.id)}
           {#if i > 0}
@@ -1188,11 +1617,13 @@
                       role="tab"
                       tabindex="0"
                       aria-selected={pane.active === id}
-                      draggable="true"
+                      draggable={tab.kind !== 'home'}
                       data-tab-id={id}
-                      title={isSessionTab(tab)
-                        ? `${tab.title} — drag to reorder, double-click for another session`
-                        : `${tab.title} — drag to reorder`}
+                      title={tab.kind === 'home'
+                        ? 'Home'
+                        : isSessionTab(tab)
+                          ? `${tab.title} — drag to reorder, double-click for another session`
+                          : `${tab.title} — drag to reorder`}
                       onclick={() => setPaneActive(pane.id, id)}
                       ondblclick={() => duplicateTab(tab)}
                       ondragstart={event => onTabDragStart(event, tab)}
@@ -1200,7 +1631,9 @@
                       oncontextmenu={event => openTabMenu(event, tab.id)}
                       onkeydown={event => event.key === 'Enter' && setPaneActive(pane.id, id)}
                     >
-                      {#if tab.kind === 'local'}
+                      {#if tab.kind === 'home'}
+                        <span class="tabicon page"><Icon name="home" size={13} /></span>
+                      {:else if tab.kind === 'local'}
                         <span class="tabicon local"><Icon name="terminal" size={13} /></span>
                       {:else if tab.kind === 'settings'}
                         <span class="tabicon page"><Icon name="settings" size={13} /></span>
@@ -1210,6 +1643,10 @@
                         <span class="tabicon page"><Icon name={INFO_PAGES[tab.hostId as InfoPageKind]?.icon ?? 'info'} size={13} /></span>
                       {:else if tab.kind === 'whatsnew'}
                         <span class="tabicon page"><Icon name="spark" size={13} /></span>
+                      {:else if tab.kind === 'adhoc'}
+                        <span class="tabicon local"><Icon name="terminal" size={13} /></span>
+                      {:else if tab.kind === 'note'}
+                        <span class="tabicon page"><Icon name="edit" size={13} /></span>
                       {:else}
                         <HostAvatar host={tabHost(tab)} size={16} />
                       {/if}
@@ -1222,33 +1659,25 @@
                         ></span>
                       {/if}
                       <span class="tabname">{tab.title}</span>
-                      <button
-                        class="close"
-                        type="button"
-                        title="Close tab"
-                        aria-label="Close tab"
-                        onclick={event => {
-                          event.stopPropagation();
-                          closeTab(tab.id);
-                        }}
-                      >
-                        <Icon name="close" size={12} />
-                      </button>
+                      {#if tab.kind !== 'home'}
+                        <button
+                          class="close"
+                          type="button"
+                          title="Close tab"
+                          aria-label="Close tab"
+                          onclick={event => {
+                            event.stopPropagation();
+                            closeTab(tab.id);
+                          }}
+                        >
+                          <Icon name="close" size={12} />
+                        </button>
+                      {/if}
                     </div>
                   {/if}
                 {/each}
 
-                <button
-                  class="add-tab"
-                  title="Open a session"
-                  aria-label="Open a session"
-                  onclick={() => {
-                    focusedPaneId = pane.id;
-                    pickerOpen = !pickerOpen;
-                  }}
-                >
-                  <Icon name="plus" size={14} />
-                </button>
+                {@render addTabButton(pane.id)}
               </div>
             </div>
 
@@ -1257,7 +1686,76 @@
                 {@const tab = tabById.get(id)}
                 {#if tab}
                   <div class="pane" class:hidden={pane.active !== id}>
-                    {#if tab.kind === 'settings'}
+                    {#if tab.kind === 'home'}
+                      <div class="empty-main home-panel">
+        <div class="hero" class:frosted={background.mode === 'image'} style={frostStyle()}>
+          <div class="eyebrow"><span class="hero-badge">R</span>RUTERM · SSH CLIENT</div>
+          <h1>Connect in one line.</h1>
+          <p class="lede">
+            Type <code class="mono qc-code">ssh user@host:port</code> and hit Connect — no host setup
+            needed. Saved hosts live in the sidebar.
+          </p>
+
+          <form class="quick-connect" onsubmit={quickConnect}>
+            <label class="qc-label" for="quick-target">Quick connect</label>
+            <div class="qc-row">
+              <span class="qc-prefix mono" aria-hidden="true">ssh</span>
+              <input
+                id="quick-target"
+                class="qc-input mono"
+                bind:value={quickTarget}
+                placeholder="user@10.0.0.5:22"
+                autocapitalize="off"
+                autocomplete="off"
+                autocorrect="off"
+                spellcheck="false"
+              />
+              <button class="btn primary qc-button" type="submit">
+                Connect
+                <Icon name="chevron-right" size={16} />
+              </button>
+            </div>
+            <div class="qc-foot">
+              {#if quickError}
+                <p class="qc-error" role="alert">{quickError}</p>
+              {:else if quickParsed}
+                <p class="qc-parsed tiny mono">→ {quickParsed.username}@{quickParsed.address}:{quickParsed.port} · opens a new tab</p>
+              {:else}
+                <p class="qc-hint tiny muted">Opens directly in a new tab — the terminal will ask for a password if your SSH agent can’t sign in.</p>
+              {/if}
+            </div>
+          </form>
+
+          <div class="hero-actions">
+            <button class="btn primary" onclick={startBlank}>
+              <Icon name="plus" size={18} />
+              New host
+            </button>
+            <button class="btn" onclick={openLocal} title="Open a shell on this device">
+              <Icon name="terminal" size={17} />
+              Local terminal
+            </button>
+            <button class="btn" onclick={openWhatsNewTab} title="Open release notes">
+              <Icon name="spark" size={17} />
+              What's New?
+              {#if newsState.unread > 0}
+                <span class="badge-count" aria-label={`${newsState.unread} unread release notes`}>
+                  {newsState.unread > 9 ? '9+' : newsState.unread}
+                </span>
+              {/if}
+            </button>
+          </div>
+        </div>
+
+        <nav class="empty-links" aria-label="About RuTerm">
+          <button type="button" onclick={() => openInfoTab('about')}>About</button>
+          <button type="button" onclick={() => openInfoTab('terms')}>Terms</button>
+          <button type="button" onclick={() => openInfoTab('privacy')}>Privacy</button>
+          <button type="button" onclick={() => openInfoTab('contact')}>Contact</button>
+          <button type="button" onclick={() => openInfoTab('github')}>GitHub</button>
+        </nav>
+                      </div>
+                    {:else if tab.kind === 'settings'}
                       <Settings
                         onclose={() => closeTab(tab.id)}
                         onopeninfo={openInfoTab}
@@ -1278,6 +1776,24 @@
                       />
                     {:else if tab.kind === 'whatsnew'}
                       <WhatsNew onclose={() => closeTab(tab.id)} />
+                    {:else if tab.kind === 'note'}
+                      {#key tab.hostId}
+                        <NoteEditor
+                          note={notes().find(n => n.id === tab.hostId) ?? {
+                            id: tab.hostId,
+                            body: '',
+                            favorite: false,
+                            created_at: new Date().toISOString(),
+                            updated_at: new Date().toISOString(),
+                            deleted: false,
+                          }}
+                          onsave={body => {
+                            const existing = notes().find(n => n.id === tab.hostId);
+                            if (existing) void onNoteBody(existing, body);
+                          }}
+                          onclose={() => closeTab(tab.id)}
+                        />
+                      {/key}
                     {:else if tab.kind === 'hostform'}
                       {#key formEpoch}
                         {#if formHost}
@@ -1296,6 +1812,9 @@
                         title={tab.title}
                         address={tabAddress(tab)}
                         kind={terminalKind(tab)}
+                        adhoc={tab.adhoc}
+                        cwd={tab.cwd}
+                        command={tab.command}
                         onfingerprint={fingerprint => void onFingerprint(tab.hostId, fingerprint)}
                         onstatus={status => setStatus(tab.id, status)}
                       />
@@ -1343,7 +1862,6 @@
           </div>
         {/if}
       </div>
-    {/if}
 
     {#if pickerOpen}
       <div
@@ -1353,8 +1871,49 @@
       ></div>
       <div class="picker glass">
         <p class="picker-head">Open a session</p>
+
+        <div class="picker-quick">
+          <button class="picker-row action" type="button" onclick={openLocal}>
+            <span class="action-icon terminal"><Icon name="terminal" size={15} /></span>
+            <span class="meta">
+              <span class="name">Local terminal</span>
+              <span class="sub">Open a shell on this device</span>
+            </span>
+          </button>
+          <button
+            class="picker-row action"
+            type="button"
+            onclick={() => {
+              pickerOpen = false;
+              void openNewNote();
+            }}
+          >
+            <span class="action-icon note"><Icon name="edit" size={15} /></span>
+            <span class="meta">
+              <span class="name">New note</span>
+              <span class="sub">Write something to remember</span>
+            </span>
+          </button>
+          <button
+            class="picker-row action"
+            type="button"
+            onclick={() => {
+              pickerOpen = false;
+              startBlank();
+            }}
+          >
+            <span class="action-icon plus"><Icon name="plus" size={15} /></span>
+            <span class="meta">
+              <span class="name">New host</span>
+              <span class="sub">Add a server to the vault</span>
+            </span>
+          </button>
+        </div>
+
+        <div class="picker-sep"></div>
+        <p class="picker-sub">Recent hosts</p>
         <div class="picker-list">
-          {#each pickable as host (host.id)}
+          {#each recentHosts as host (host.id)}
             <button class="picker-row" type="button" onclick={() => connect(host)}>
               <HostAvatar host={host} size={26} />
               <span class="meta">
@@ -1366,25 +1925,21 @@
               {/if}
             </button>
           {:else}
-            <p class="muted tiny picker-empty">No hosts yet.</p>
+            {#each pickable.slice(0, 5) as host (host.id)}
+              <button class="picker-row" type="button" onclick={() => connect(host)}>
+                <HostAvatar host={host} size={26} />
+                <span class="meta">
+                  <span class="name">{host.label || host.address}</span>
+                  <span class="sub mono">{host.username}@{host.address}:{host.port}</span>
+                </span>
+                {#if openCount(host.id) > 0}
+                  <span class="badge">{openCount(host.id)}×</span>
+                {/if}
+              </button>
+            {:else}
+              <p class="muted tiny picker-empty">No hosts yet — add one with “New host”.</p>
+            {/each}
           {/each}
-        </div>
-        <div class="picker-foot">
-          <button
-            class="btn sm ghost"
-            type="button"
-            onclick={() => {
-              pickerOpen = false;
-              startBlank();
-            }}
-          >
-            <Icon name="plus" size={13} />
-            New host
-          </button>
-          <button class="btn sm ghost" type="button" onclick={openLocal}>
-            <Icon name="terminal" size={13} />
-            Local terminal
-          </button>
         </div>
       </div>
     {/if}
@@ -1423,6 +1978,12 @@
             Duplicate Session
           </button>
           {/if}
+          {#if menuTab.kind === 'note'}
+            <button type="button" role="menuitem" class="danger" title="Delete this note" onclick={() => { closeTabMenu(); noteToDelete = menuTab.hostId ? notes().find(n => n.id === menuTab.hostId) ?? null : null; }}>
+              <Icon name="trash" size={15} />
+              Delete note
+            </button>
+          {/if}
           <button type="button" role="menuitem" class="danger" title="Close this session" onclick={() => { closeTabMenu(); closeTab(menuTab.id); }}>
             <Icon name="close" size={15} />
             Close Tab
@@ -1430,39 +1991,139 @@
         </div>
     {/if}
   </main>
+
+  {#if appMenu}
+    <div
+      class="tab-menu app-menu"
+      role="menu"
+      aria-label="RuTerm menu"
+      style:left="{appMenu.x}px"
+      style:top="{appMenu.y}px"
+      use:appMenuBehavior
+    >
+      <button
+        type="button"
+        role="menuitem"
+        onclick={() => {
+          closeAppMenu();
+          openHostFormTab(null);
+        }}
+      >
+        <Icon name="plus" size={15} />
+        New host
+      </button>
+      <button
+        type="button"
+        role="menuitem"
+        onclick={() => {
+          closeAppMenu();
+          openSettingsTab();
+        }}
+      >
+        <Icon name="settings" size={15} />
+        Settings
+      </button>
+      <div class="tab-menu-sep" role="separator"></div>
+      <button type="button" role="menuitem" onclick={goHome}>
+        <Icon name="home" size={15} />
+        Home
+      </button>
+      <button
+        type="button"
+        role="menuitem"
+        onclick={() => {
+          closeAppMenu();
+          void lock();
+        }}
+      >
+        <Icon name="lock" size={15} />
+        Lock vault
+      </button>
+    </div>
+  {/if}
+
+  {#if aiAgents.length > 0}
+    <div class="ai-dock" class:raised={homeVisible} role="toolbar" aria-label="Launch AI agents">
+      {#each aiAgents as agent (agent.id)}
+        <button
+          class="ai-dock-btn"
+          class:launching={isAgentLaunching(agent)}
+          type="button"
+          title={isAgentLaunching(agent) ? `Launching ${agent.label}…` : `${agent.label} — opens in ~/Desktop`}
+          aria-label="Open {agent.label} in ~/Desktop"
+          aria-busy={isAgentLaunching(agent)}
+          onclick={() => openAgent(agent)}
+        >
+          <AiAgentIcon id={agent.id} size={24} />
+        </button>
+      {/each}
+    </div>
+  {/if}
+
+  {#if noteToDelete}
+    <ConfirmDialog
+      title="Delete this note?"
+      confirmLabel="Delete note"
+      oncancel={() => (noteToDelete = null)}
+      onconfirm={() => void confirmDeleteNote()}
+    >
+      <p>The note <strong>{noteTitle(noteToDelete)}</strong> will be removed from your vault — on this device and everywhere it syncs.</p>
+    </ConfirmDialog>
+  {/if}
 </div>
 
 <style>
   .shell {
+    position: relative;
     height: 100%;
     display: grid;
-    grid-template-columns: 296px minmax(0, 1fr);
+    grid-template-columns: 280px minmax(0, 1fr);
     overflow: hidden;
     transition: grid-template-columns 0.18s ease;
   }
   .shell.collapsed {
-    grid-template-columns: 68px minmax(0, 1fr);
+    grid-template-columns: 64px minmax(0, 1fr);
+  }
+  /* With a backdrop picked in Settings, one photo/pattern spans the whole
+     shell so it continues behind the translucent sidebar. */
+  .shell.backdrop {
+    background-color: var(--panel);
+  }
+  .shell.backdrop main {
+    background: transparent;
+  }
+  .shell.backdrop .pane-wrap {
+    background: transparent;
+  }
+  .shell.backdrop .panes {
+    background: transparent;
+  }
+  .shell.backdrop .empty-main {
+    background: transparent;
+  }
+  .shell.backdrop aside {
+    background: color-mix(in srgb, var(--panel) 62%, transparent);
+    backdrop-filter: blur(26px) saturate(135%);
+    -webkit-backdrop-filter: blur(26px) saturate(135%);
   }
 
   aside {
     display: flex;
     flex-direction: column;
     min-height: 0;
-    /* Runs under the overlay title bar so the panel reads as one surface. */
     padding-top: 30px;
     border: 0;
     border-right: 1px solid var(--line);
-    background: var(--aside);
+    background: var(--panel);
     backdrop-filter: blur(42px) saturate(130%);
     -webkit-backdrop-filter: blur(42px) saturate(130%);
-    box-shadow: inset -1px 0 0 var(--line);
   }
 
   aside header {
     display: flex;
     align-items: center;
-    gap: 2px;
-    padding: 18px 12px 12px 16px;
+    gap: 4px;
+    padding: 16px 10px 8px 14px;
   }
   .collapsed aside header {
     justify-content: center;
@@ -1477,7 +2138,7 @@
     place-items: center;
     padding: 0;
     border-radius: 50%;
-    border: 1px solid var(--accent-line);
+    border: 1px solid var(--accent-dim);
     background: var(--accent-dim);
     color: var(--accent);
     font-family: var(--term);
@@ -1495,13 +2156,13 @@
     transform: translateY(-1px);
   }
   .r-letter {
-    font-size: 16.5px;
+    font-size: 14px;
     font-weight: 800;
     line-height: 1;
   }
   .r-caret {
     width: 0.52em;
-    font-size: 16.5px;
+    font-size: 14px;
     height: 2px;
     min-width: 7px;
     border-radius: 1px;
@@ -1515,14 +2176,17 @@
   }
 
   .wordmark {
-    font-family: var(--term);
-    font-size: 19.5px;
-    font-weight: 700;
-    letter-spacing: -0.02em;
+    font-family: var(--sans);
+    font-size: 15px;
+    font-weight: 650;
+    letter-spacing: -0.015em;
     color: var(--text);
+    user-select: none;
   }
   .cursor {
     color: var(--accent);
+    font-family: var(--term);
+    font-weight: 700;
     margin-left: 1px;
     animation: caret 1.15s step-end infinite;
   }
@@ -1545,29 +2209,28 @@
 
   .search {
     position: relative;
-    padding: 0 12px 10px;
+    padding: 0 10px 8px;
   }
   .search-icon {
     position: absolute;
-    left: 24px;
+    left: 22px;
     top: 50%;
     transform: translateY(-60%);
-    color: var(--dim);
+    color: var(--text-tertiary);
     pointer-events: none;
     display: flex;
   }
   .search input {
-    height: 40px;
-    padding-left: 38px;
-    font-size: 16.5px;
-    background: var(--surface);
+    height: 36px;
+    padding-left: 34px;
+    font-size: 14px;
   }
 
   .filters {
     display: flex;
     align-items: center;
     gap: 4px;
-    padding: 0 12px 10px;
+    padding: 0 10px 10px;
   }
   .filters button:not(.icon-btn) {
     height: 28px;
@@ -1575,25 +2238,25 @@
     border: 0;
     border-radius: 7px;
     background: transparent;
-    color: var(--muted);
-    font-size: 14.5px;
+    color: var(--text-secondary);
+    font-size: 13px;
     font-weight: 550;
     cursor: pointer;
   }
   .filters button:not(.icon-btn):hover {
     color: var(--text);
-    background: var(--hover);
+    background: var(--panel-hover);
   }
   .filters button.on {
     color: var(--text);
-    background: var(--hover-strong);
+    background: var(--panel-hover);
   }
 
   .list {
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    padding: 2px 8px 12px;
+    padding: 2px 8px 10px;
   }
   .collapsed .list {
     padding: 2px 8px 12px;
@@ -1611,11 +2274,11 @@
     border-color: transparent;
   }
   .collapsed .host:hover {
-    background: var(--hover);
+    background: var(--panel-hover);
   }
   .collapsed .host.active {
     background: var(--accent-dim);
-    border-color: var(--accent-line);
+    border-color: var(--accent-dim);
   }
   .rail-add {
     display: grid;
@@ -1624,19 +2287,20 @@
     height: 38px;
     margin-top: 4px;
     flex: 0 0 auto;
-    border: 1px dashed var(--line-strong);
+    border: 1px dashed var(--line);
     border-radius: 10px;
     background: transparent;
-    color: var(--dim);
+    color: var(--text-tertiary);
     cursor: pointer;
   }
   .rail-add:hover {
     color: var(--text);
-    border-color: var(--line-strong);
-    background: var(--hover);
+    border-color: var(--line);
+    background: var(--panel-hover);
   }
   .collapsed footer {
     flex-direction: column;
+    align-items: center;
     gap: 4px;
     padding: 10px 0;
   }
@@ -1644,8 +2308,8 @@
   .host {
     display: flex;
     align-items: center;
-    gap: 12px;
-    padding: 10px 10px;
+    gap: 10px;
+    padding: 8px 9px;
     margin-bottom: 1px;
     border-radius: 10px;
     border: 1px solid transparent;
@@ -1653,11 +2317,25 @@
     position: relative;
   }
   .host:hover {
-    background: var(--hover);
+    background: var(--panel-hover);
   }
   .host.active {
     background: var(--accent-dim);
-    border-color: var(--accent-line);
+    border-color: var(--accent-dim);
+  }
+  .host.active::before {
+    content: '';
+    position: absolute;
+    left: -1px;
+    top: 50%;
+    width: 3px;
+    height: 16px;
+    border-radius: 2px;
+    background: var(--accent);
+    transform: translateY(-50%);
+  }
+  .collapsed .host.active::before {
+    display: none;
   }
 
 
@@ -1669,22 +2347,23 @@
     flex: 1;
   }
   .name {
-    font-size: 18px;
+    font-size: 14px;
     font-weight: 600;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
     letter-spacing: -0.005em;
+    color: var(--text);
   }
   .star {
     color: var(--warn);
-    font-size: 13.5px;
+    font-size: 11.5px;
     margin-right: 5px;
   }
   .sub {
-    font-size: 15px;
+    font-size: 12px;
     font-weight: 500;
-    color: var(--muted);
+    color: var(--text-secondary);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1698,7 +2377,7 @@
     border: 0;
     border-radius: 6px;
     background: transparent;
-    color: var(--dim);
+    color: var(--text-tertiary);
     opacity: 0;
     cursor: pointer;
   }
@@ -1708,7 +2387,7 @@
   }
   .more:hover {
     color: var(--text);
-    background: var(--hover-strong);
+    background: var(--panel-hover);
   }
 
   .empty {
@@ -1716,31 +2395,84 @@
     text-align: center;
   }
   .empty p {
-    margin: 0 0 14px;
-    font-size: 15px;
+    margin: 0 0 12px;
+    font-size: 13px;
   }
 
   aside footer {
     display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 2px;
+    padding: 8px 10px 10px;
+    border-top: 1px solid var(--line);
+  }
+  .side-tools {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+  }
+  .side-action {
+    display: flex;
     align-items: center;
     gap: 8px;
-    padding: 10px 12px;
-    border-top: 1px solid var(--line);
+    flex: 1;
+    min-width: 0;
+    height: 28px;
+    padding: 0 8px;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--text);
+    font-size: 12.5px;
+    font-weight: 600;
+    letter-spacing: -0.008em;
+    text-align: left;
+    cursor: pointer;
+  }
+  .side-action:hover {
+    color: var(--text);
+    background: var(--panel-hover);
+  }
+  .side-account {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 6px 0 8px;
   }
   .dot {
     width: 7px;
     height: 7px;
     flex: 0 0 auto;
     border-radius: 50%;
-    background: var(--dim);
+    background: var(--text-tertiary);
   }
   .dot.signed {
     background: var(--ok);
   }
+  .who-avatar {
+    width: 22px;
+    height: 22px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    object-fit: cover;
+    display: block;
+    border: 1px solid var(--line);
+  }
+  .who-avatar.letter {
+    display: grid;
+    place-items: center;
+    background: var(--panel-hover);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    color: var(--text);
+  }
   .who {
-    font-size: 13.5px;
-    font-weight: 500;
-    color: var(--muted);
+    font-size: 12px;
+    font-weight: 650;
+    letter-spacing: -0.008em;
+    color: var(--text);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1752,7 +2484,6 @@
     flex-direction: column;
     min-width: 0;
     min-height: 0;
-    padding-top: 30px;
     background: var(--panel);
     overflow: hidden;
   }
@@ -1764,9 +2495,13 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    padding: 30px 44px 74px;
+    padding: 30px 44px 44px;
     overflow-y: auto;
     background: var(--panel);
+  }
+  /* Home tab lives inside a pane instead of owning the whole main area. */
+  .empty-main.home-panel {
+    height: 100%;
   }
   .hero {
     display: flex;
@@ -1777,15 +2512,30 @@
     max-width: 700px;
     text-align: center;
   }
+  /* Frosted card behind the text/form: the photo stays sharp everywhere else. */
+  .hero.frosted {
+    max-width: 640px;
+    padding: 34px 40px 30px;
+    border-radius: 22px;
+    border: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+    background: color-mix(in srgb, var(--panel) var(--frost-alpha, 45%), transparent);
+    backdrop-filter: blur(var(--frost-blur, 10px)) saturate(150%);
+    -webkit-backdrop-filter: blur(var(--frost-blur, 10px)) saturate(150%);
+  }
+  @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+    .hero.frosted {
+      background: color-mix(in srgb, var(--panel) 92%, transparent);
+    }
+  }
   .eyebrow {
     display: flex;
     align-items: center;
     gap: 12px;
-    font-size: 13px;
+    font-size: 11px;
     font-weight: 600;
     letter-spacing: 0.16em;
     text-transform: uppercase;
-    color: var(--dim);
+    color: var(--text-tertiary);
     user-select: none;
   }
   .hero-badge {
@@ -1794,176 +2544,176 @@
     width: 26px;
     height: 26px;
     border-radius: 7px;
-    border: 1px solid var(--accent-line);
+    border: 1px solid var(--accent-dim);
     background: var(--accent-dim);
     color: var(--accent);
     font-family: var(--term);
-    font-size: 15px;
+    font-size: 12px;
     font-weight: 700;
     letter-spacing: 0;
   }
   .empty-main h1 {
     margin: 0;
-    font-size: 35px;
+    font-size: 26px;
     font-weight: 650;
     letter-spacing: -0.035em;
   }
   .lede {
     margin: 0;
     max-width: 50ch;
-    color: var(--muted);
-    font-size: 16.5px;
+    color: var(--text-secondary);
+    font-size: 13.5px;
     line-height: 1.6;
   }
 
-  /* ---- mock terminal card: always dark, brand-consistent on every theme ---- */
-  .term-card {
+  /* ---- quick connect card on the home screen ---- */
+  .quick-connect {
     width: 100%;
-    margin-top: 4px;
-    overflow: hidden;
+    margin-top: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 18px;
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    background: var(--bg);
     text-align: left;
-    border-radius: 14px;
-    border: 1px solid var(--line-strong);
-    background: #161311;
-    box-shadow:
-      0 30px 70px rgba(0, 0, 0, 0.38),
-      inset 0 1px 0 rgba(255, 255, 255, 0.05);
   }
-  .term-titlebar {
+  .qc-label {
+    margin: 0;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--text-tertiary);
+    user-select: none;
+  }
+  .qc-row {
     display: flex;
     align-items: center;
-    gap: 7px;
-    padding: 11px 14px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
-    background: rgba(255, 255, 255, 0.04);
+    gap: 8px;
   }
-  .tdot {
-    width: 11px;
-    height: 11px;
-    border-radius: 50%;
-  }
-  .tdot-red {
-    background: #d96a4e;
-  }
-  .tdot-amber {
-    background: #d9b04e;
-  }
-  .tdot-green {
-    background: #7cc277;
-  }
-  .term-caption {
-    margin-left: 8px;
-    font-family: var(--term);
-    font-size: 13px;
-    letter-spacing: 0.03em;
-    color: #8d857a;
-    user-select: none;
-  }
-  .term-body {
-    padding: 16px 18px 18px;
-    font-family: var(--term);
-    font-size: 14.5px;
-    line-height: 1.75;
-    color: #ddd5c9;
-    min-height: 172px;
-  }
-  .tline {
-    display: flex;
-    gap: 11px;
-    align-items: baseline;
-  }
-  .prompt {
-    color: #ff6b1f;
-    font-weight: 700;
-    user-select: none;
-  }
-  .cmd {
-    color: #f4efe6;
-  }
-  .tout {
-    padding-left: 22px;
-    font-size: 13.5px;
-    color: #9a9287;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .dimline {
-    color: #6f6759;
-    font-style: italic;
-  }
-  .thost {
-    display: flex;
-    align-items: baseline;
-    gap: 12px;
-    width: calc(100% - 12px);
-    margin-left: 12px;
-    padding: 4px 10px;
-    border: 1px solid transparent;
-    border-radius: 8px;
-    background: transparent;
-    text-align: left;
-    font-family: var(--term);
-    font-size: 14.5px;
-    color: inherit;
-    cursor: pointer;
-  }
-  .thost:hover {
-    background: rgba(255, 255, 255, 0.06);
-    border-color: rgba(255, 255, 255, 0.1);
-  }
-  .thost-dot {
-    flex: 0 0 auto;
-    width: 7px;
-    height: 7px;
-    align-self: center;
-    border-radius: 50%;
-    background: #7cc277;
-    opacity: 0.85;
-  }
-  .thost-name {
-    flex: 0 0 auto;
-    font-weight: 500;
-    color: #f4efe6;
-  }
-  .thost-addr {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 13px;
-    color: #8d857a;
-  }
-  .thost-go {
-    flex: 0 0 auto;
-    margin-left: auto;
+  .qc-prefix {
     display: inline-flex;
     align-items: center;
-    gap: 2px;
+    justify-content: center;
+    width: 42px;
+    height: 44px;
+    flex: 0 0 auto;
+    border-radius: 10px;
+    border: 1px solid var(--line);
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
     font-size: 12.5px;
-    letter-spacing: 0.04em;
-    color: #ff6b1f;
-    opacity: 0;
-    transition: opacity 0.15s ease;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    user-select: none;
   }
-  .thost:hover .thost-go {
-    opacity: 1;
+  .qc-input {
+    flex: 1;
+    height: 44px;
+    min-width: 0;
+    padding: 0 12px;
+    border-radius: 10px;
+    font-size: 13px;
   }
-  .block-cursor {
-    display: inline-block;
-    width: 9px;
-    height: 17px;
-    background: #ff6b1f;
-    transform: translateY(3px);
-    animation: caret 1.1s steps(1) infinite;
+  .qc-input::placeholder {
+    color: var(--text-tertiary);
+    font-size: 12.5px;
   }
-  @keyframes caret {
+  .qc-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 44px;
+    padding: 0 16px;
+    flex: 0 0 auto;
+    border-radius: 10px;
+    font-size: 13px;
+  }
+  .qc-code {
+    padding: 1px 6px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--bg-elevated);
+    font-size: 0.9em;
+  }
+  .qc-error {
+    margin: 0;
+    font-size: 12px;
+    color: var(--bad);
+  }
+  .qc-parsed {
+    margin: 0;
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+  }
+  .qc-hint {
+    margin: 0;
+  }
+  .qc-foot {
+    min-height: 18px;
+  }
+
+  /* ------------------------------------------------- AI dock, bottom-right */
+  .ai-dock {
+    position: absolute;
+    right: 16px;
+    bottom: 16px;
+    z-index: 29;
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    padding: 6px;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: var(--bg-elevated);
+    transition: bottom 0.18s ease;
+  }
+  /* Clear of the About pill row, which only renders on the home tab. */
+  .ai-dock.raised {
+    bottom: 64px;
+  }
+  .ai-dock-btn {
+    display: grid;
+    place-items: center;
+    width: 38px;
+    height: 38px;
+    border: 0;
+    border-radius: 10px;
+    background: transparent;
+    cursor: pointer;
+    transition: background 0.12s ease;
+  }
+  .ai-dock-btn:hover {
+    background: var(--panel-hover);
+  }
+  .ai-dock-btn:active {
+    background: var(--panel);
+  }
+  .ai-dock-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .ai-dock-btn.launching {
+    background: var(--panel-hover);
+  }
+  .ai-dock-btn.launching :global(.ai-icon) {
+    animation: aiLaunchPulse 1.15s ease-in-out infinite;
+  }
+  @keyframes aiLaunchPulse {
+    0%,
+    100% {
+      opacity: 0.45;
+      transform: scale(0.9);
+    }
     50% {
-      opacity: 0;
+      opacity: 1;
+      transform: scale(1.05);
     }
   }
   @media (prefers-reduced-motion: reduce) {
-    .block-cursor {
+    .ai-dock-btn.launching :global(.ai-icon) {
       animation: none;
     }
   }
@@ -1983,7 +2733,7 @@
     border-radius: 999px;
     background: var(--bad);
     color: #fff;
-    font-size: 12px;
+    font-size: 10.5px;
     font-weight: 700;
     line-height: 1;
     user-select: none;
@@ -1993,39 +2743,37 @@
   .empty-links {
     position: absolute;
     bottom: 0;
-    left: 0;
     right: 0;
     display: flex;
     align-items: center;
-    justify-content: center;
-    gap: 16px;
-    padding: 13px 16px calc(13px - 1px);
-    border-top: 1px solid var(--line);
-    background: var(--panel);
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 14px 18px;
+    background: transparent;
   }
   .empty-links button {
-    padding: 4px 2px;
-    border: 0;
-    background: none;
-    color: var(--dim);
+    padding: 6px 14px;
+    border: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--panel) 55%, transparent);
+    backdrop-filter: blur(16px) saturate(140%);
+    -webkit-backdrop-filter: blur(16px) saturate(140%);
+    color: var(--text);
     font: inherit;
-    font-size: 13px;
+    font-size: 11.5px;
+    font-weight: 500;
     letter-spacing: 0.02em;
     cursor: pointer;
-    transition: color 0.14s ease;
+    text-decoration: none;
+    transition: color 0.14s ease, border-color 0.14s ease, background 0.14s ease;
   }
   .empty-links button:hover {
-    color: var(--text);
-    text-decoration: underline;
-    text-decoration-color: var(--accent-line);
-    text-underline-offset: 4px;
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 45%, transparent);
   }
-  .empty-links .sep {
-    width: 3px;
-    height: 3px;
-    border-radius: 50%;
-    background: var(--dim);
-    opacity: 0.65;
+  .empty-links button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
 
   .tabbar {
@@ -2033,23 +2781,34 @@
     z-index: 25;
     display: flex;
     align-items: flex-end;
-    height: 40px;
-    padding: 0 10px;
+    height: 68px;
+    padding: 30px 6px 0;
     flex: 0 0 auto;
-    border-bottom: 1px solid var(--line);
-    background: var(--strip);
+    background: var(--tabbar);
+  }
+  .tabbar::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 1px;
+    background: var(--line);
+    z-index: 0;
   }
 
   .tabs {
+    position: relative;
+    z-index: 1;
     display: flex;
     align-items: flex-end;
-    gap: 2px;
+    gap: 6px;
     height: 100%;
     min-width: 0;
     flex: 1;
     overflow-x: auto;
     scrollbar-width: none;
-    padding-top: 6px;
+    padding: 0 6px;
   }
   .tabs::-webkit-scrollbar {
     display: none;
@@ -2118,13 +2877,14 @@
   .tab.drop-before { box-shadow: -2px 0 0 0 var(--accent); }
   .tabs.drop-end::after {
     content: '';
-    align-self: center;
+    align-self: flex-end;
     flex: 0 0 auto;
     width: 2px;
-    height: 20px;
+    height: 26px;
+    margin-bottom: 4px;
     border-radius: 1px;
     background: var(--accent);
-    margin-left: 2px;
+    margin-left: 1px;
   }
 
   /* ---------- tab context menu ---------- */
@@ -2133,10 +2893,9 @@
     z-index: 60;
     min-width: 216px;
     padding: 6px;
-    background: var(--sheet);
-    border: 1px solid var(--line-strong);
+    background: var(--panel);
+    border: 1px solid var(--line);
     border-radius: 12px;
-    box-shadow: var(--shadow-strong);
     backdrop-filter: blur(16px) saturate(1.15);
     -webkit-backdrop-filter: blur(16px) saturate(1.15);
   }
@@ -2146,7 +2905,7 @@
     font-weight: 650;
     letter-spacing: 0.09em;
     text-transform: uppercase;
-    color: var(--muted);
+    color: var(--text-secondary);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -2163,17 +2922,17 @@
     background: transparent;
     color: var(--text);
     font: inherit;
-    font-size: 14.5px;
+    font-size: 13.5px;
     text-align: left;
     cursor: pointer;
   }
   .tab-menu [role='menuitem']:hover,
   .tab-menu [role='menuitem']:focus-visible {
-    background: var(--surface-hover);
+    background: var(--panel-hover);
     outline: none;
   }
   .tab-menu [role='menuitem'] :global(svg) {
-    color: var(--muted);
+    color: var(--text-secondary);
     flex: 0 0 auto;
   }
   .tab-menu-sep {
@@ -2192,6 +2951,12 @@
     color: var(--bad);
   }
 
+  /* ---------- app menu ---------- */
+  .tab-menu.app-menu {
+    min-width: 198px;
+    z-index: 70;
+  }
+
   .drop-overlay {
     position: absolute;
     z-index: 18;
@@ -2208,7 +2973,7 @@
   .zone {
     display: grid;
     place-items: center;
-    border: 1.5px dashed var(--accent-line);
+    border: 1.5px dashed var(--accent-dim);
     border-radius: 14px;
     background: color-mix(in srgb, var(--accent) 5%, transparent);
     transition:
@@ -2230,9 +2995,9 @@
     pointer-events: none;
   }
   .zone-mid span {
-    font-size: 14px;
-    color: var(--muted);
-    background: var(--overlay);
+    font-size: 12.5px;
+    color: var(--text-secondary);
+    background: var(--panel);
     border: 1px solid var(--line);
     border-radius: 999px;
     padding: 8px 16px;
@@ -2243,35 +3008,36 @@
     display: inline-flex;
     align-items: center;
     gap: 8px;
-    font-size: 12.5px;
+    font-size: 11px;
     letter-spacing: 0.12em;
     text-transform: uppercase;
     color: var(--accent);
     background: color-mix(in srgb, var(--accent) 10%, rgba(0, 0, 0, 0.35));
-    border: 1px solid var(--accent-line);
+    border: 1px solid var(--accent-dim);
     border-radius: 999px;
     padding: 7px 14px;
   }
 
 
 
-  /* Folder tabs: square body, rounded shoulders, joined to the pane below. */
+  /* Folder tabs: rounded shoulders that flare into the tab strip, joined to
+     the pane below so the active tab reads as the front of a folder. */
   .tab {
     display: flex;
     align-items: center;
     gap: 8px;
-    max-width: 235px;
-    height: 30px;
-    padding: 0 4px 0 11px;
-    border: 1px solid transparent;
-    border-bottom: 0;
-    border-radius: 9px 9px 0 0;
-    color: var(--muted);
-    font-size: 15px;
+    max-width: 240px;
+    height: 36px;
+    padding: 0 6px 0 12px;
+    border: 0;
+    border-radius: 11px 11px 0 0;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 13px;
     cursor: pointer;
     white-space: nowrap;
     flex: 0 0 auto;
-    margin-bottom: -1px;
+    margin-bottom: 0;
     position: relative;
     transition:
       background 0.14s ease,
@@ -2279,23 +3045,28 @@
   }
   .tab:hover {
     color: var(--text);
-    background: var(--hover);
+    background: var(--panel-hover);
   }
   .tab.active {
     color: var(--text);
     background: var(--panel);
-    border-color: var(--line-strong);
-    border-bottom-color: var(--panel);
-    box-shadow: 0 -1px 0 var(--line) inset;
   }
+  .tab.active::before,
   .tab.active::after {
     content: '';
     position: absolute;
-    left: 9px;
-    right: 9px;
-    bottom: -1px;
-    height: 1px;
-    background: var(--panel);
+    bottom: 0;
+    width: 6px;
+    height: 6px;
+    pointer-events: none;
+    background: radial-gradient(circle at 0 0, transparent 0 5px, var(--panel) 5.5px);
+  }
+  .tab.active::before {
+    right: 100%;
+  }
+  .tab.active::after {
+    left: 100%;
+    transform: scaleX(-1);
   }
 
   .tabicon.local {
@@ -2305,7 +3076,7 @@
     width: 16px;
     height: 16px;
     border-radius: 5px;
-    color: var(--muted);
+    color: var(--text-secondary);
   }
   .tab.active .tabicon.local {
     color: var(--accent);
@@ -2317,7 +3088,7 @@
     width: 16px;
     height: 16px;
     border-radius: 5px;
-    color: var(--muted);
+    color: var(--text-secondary);
   }
   .tab.active .tabicon.page {
     color: var(--accent);
@@ -2337,7 +3108,7 @@
     background: var(--bad);
   }
   .tabdot.idle {
-    background: var(--dim);
+    background: var(--text-tertiary);
   }
   .tabname {
     overflow: hidden;
@@ -2354,7 +3125,7 @@
     border: 0;
     border-radius: 5px;
     background: transparent;
-    color: var(--dim);
+    color: var(--text-tertiary);
     opacity: 0;
     cursor: pointer;
   }
@@ -2364,25 +3135,25 @@
   }
   .close:hover {
     color: var(--text);
-    background: var(--hover-strong);
+    background: var(--panel-hover);
   }
 
   .add-tab {
     display: grid;
     place-items: center;
-    width: 26px;
-    height: 26px;
-    margin: 0 0 3px 4px;
+    width: 28px;
+    height: 28px;
+    margin: 0 0 4px 3px;
     flex: 0 0 auto;
     border: 0;
     border-radius: 7px;
     background: transparent;
-    color: var(--dim);
+    color: var(--text-tertiary);
     cursor: pointer;
   }
   .add-tab:hover {
     color: var(--text);
-    background: var(--hover-strong);
+    background: var(--panel-hover);
   }
 
   .picker-backdrop {
@@ -2398,15 +3169,15 @@
     width: 306px;
     border-radius: 13px;
     padding: 6px;
-    background: var(--overlay);
-    box-shadow: var(--shadow-strong);
+    background: var(--panel);
+    border: 1px solid var(--line);
   }
   .picker-head {
     margin: 4px 8px 6px;
-    font-size: 13px;
+    font-size: 11.5px;
     letter-spacing: 0.09em;
     text-transform: uppercase;
-    color: var(--dim);
+    color: var(--text-tertiary);
   }
   .picker-list {
     max-height: 300px;
@@ -2426,29 +3197,53 @@
     cursor: pointer;
   }
   .picker-row:hover {
-    background: var(--hover-strong);
+    background: var(--panel-hover);
   }
   .picker-empty {
     margin: 8px;
   }
   .badge {
-    font-size: 12px;
+    font-size: 10.5px;
     letter-spacing: 0.06em;
     text-transform: uppercase;
-    color: var(--dim);
+    color: var(--text-tertiary);
     border: 1px solid var(--line);
     border-radius: 5px;
     padding: 1px 5px;
     flex: 0 0 auto;
   }
-  .picker-foot {
-    border-top: 1px solid var(--line);
-    margin-top: 4px;
-    padding-top: 6px;
+  .picker-quick {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
   }
-  .picker-foot .btn {
-    width: 100%;
-    justify-content: flex-start;
+  .action-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--line);
+    color: var(--text-secondary);
+    flex: 0 0 auto;
+  }
+  .picker-row.action:hover .action-icon {
+    color: var(--text);
+    border-color: var(--line-hover);
+  }
+  .picker-sep {
+    height: 1px;
+    background: var(--line);
+    margin: 6px 2px;
+  }
+  .picker-sub {
+    margin: 6px 8px 4px;
+    font-size: 11px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--text-tertiary);
   }
 
   .panes {

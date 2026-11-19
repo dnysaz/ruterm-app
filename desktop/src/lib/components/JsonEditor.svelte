@@ -256,7 +256,7 @@
     height: 100%;
     display: flex;
     flex-direction: column;
-    background: var(--panel);
+    background: var(--bg);
     overflow: hidden;
   }
 
@@ -265,19 +265,18 @@
     display: flex;
     align-items: center;
     gap: 16px;
-    padding: 16px 26px;
-    border-bottom: 1px solid var(--line);
-    background: var(--panel);
+    padding: 20px 28px 14px;
+    background: var(--bg);
   }
   .titles h1 {
     margin: 0;
-    font-size: 20.5px;
+    font-size: 20px;
     font-weight: 600;
     letter-spacing: -0.01em;
   }
   .sub {
     margin: 3px 0 0;
-    font-size: 14px;
+    font-size: 13px;
   }
 
   .toolbar {
@@ -285,7 +284,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 10px 26px;
+    padding: 8px 28px;
     border-bottom: 1px solid var(--line);
   }
   .file-tabs {
@@ -295,28 +294,28 @@
     padding: 3px;
     border: 1px solid var(--line);
     border-radius: 10px;
-    background: var(--surface);
+    background: var(--bg-elevated);
   }
   .file-tab {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    height: 26px;
-    padding: 0 10px;
+    height: 24px;
+    padding: 0 9px;
     border: 0;
-    border-radius: 7px;
+    border-radius: 6px;
     background: transparent;
-    color: var(--muted);
+    color: var(--text-secondary);
     font-family: var(--mono);
-    font-size: 13px;
+    font-size: 12.5px;
     cursor: pointer;
   }
   .file-tab:hover {
     color: var(--text);
-    background: var(--surface-hover);
+    background: var(--panel-hover);
   }
   .file-tab.on {
-    background: var(--hover-strong);
+    background: var(--panel-hover);
     color: var(--text);
   }
   .dot {
@@ -330,39 +329,39 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 12.5px;
-    color: var(--dim);
+    font-size: 12px;
+    color: var(--text-tertiary);
     user-select: none;
   }
 
   .banner {
     flex: 0 0 auto;
     margin: 0;
-    padding: 8px 26px;
+    padding: 7px 28px;
     border-bottom: 1px solid var(--line);
-    font-size: 13px;
+    font-size: 12.5px;
     line-height: 1.5;
   }
   .banner.info {
-    color: var(--muted);
+    color: var(--text-secondary);
   }
   .banner.bad {
     color: var(--bad);
     background: rgba(238, 139, 139, 0.07);
   }
   .banner.good {
-    color: var(--dim);
+    color: var(--text-tertiary);
   }
 
   .editor {
     flex: 1 1 auto;
     display: flex;
     min-height: 0;
-    padding: 14px 26px 22px;
+    padding: 12px 28px 20px;
   }
   .loading {
     margin: auto;
-    font-size: 14px;
+    font-size: 13px;
   }
   .code {
     flex: 1 1 auto;
@@ -370,13 +369,13 @@
     min-height: 0;
     height: 100%;
     margin: 0;
-    padding: 14px 16px;
+    padding: 12px 14px;
     border: 1px solid var(--line);
-    border-radius: 12px;
-    background: var(--surface);
+    border-radius: 10px;
+    background: var(--bg-elevated);
     color: var(--text);
     font-family: var(--mono);
-    font-size: 13.5px;
+    font-size: 13px;
     line-height: 1.6;
     tab-size: 2;
     white-space: pre;
@@ -385,7 +384,7 @@
   }
   .code:focus {
     outline: none;
-    border-color: var(--line-strong);
-    background: var(--surface-focus);
+    border-color: var(--line);
+    background: var(--panel-hover);
   }
 </style>

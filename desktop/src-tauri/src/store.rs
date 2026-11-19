@@ -91,6 +91,13 @@ pub struct AppSettings {
     /// offer "unlock with saved key" instead of prompting on every launch.
     #[serde(default)]
     pub key_saved: bool,
+    /// Revision of the vault as of the last successful sync. The UI shows
+    /// "synced" only when the local vault revision matches this.
+    #[serde(default)]
+    pub synced_revision: i64,
+    /// RFC 3339 timestamp of the last successful sync, if any.
+    #[serde(default)]
+    pub last_synced_at: Option<String>,
 }
 
 pub fn default_client_id() -> String {
@@ -107,6 +114,8 @@ impl Default for AppSettings {
             device_id: uuid::Uuid::new_v4().to_string(),
             google_linked: false,
             key_saved: false,
+            synced_revision: 0,
+            last_synced_at: None,
         }
     }
 }

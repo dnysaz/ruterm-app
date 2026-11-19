@@ -46,6 +46,10 @@ pub struct AppStatus {
     pub revision: i64,
     pub vault_path: String,
     pub key_saved: bool,
+    /// Revision as of the last successful sync (persisted in settings.json).
+    pub synced_revision: i64,
+    /// RFC 3339 timestamp of the last successful sync, or null if never.
+    pub last_synced_at: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -67,6 +71,8 @@ pub async fn app_status(state: tauri::State<'_, AppState>) -> Result<AppStatus, 
         revision: *state.revision.read().await,
         vault_path: state.paths.vault.display().to_string(),
         key_saved: settings.key_saved,
+        synced_revision: settings.synced_revision,
+        last_synced_at: settings.last_synced_at.clone(),
     })
 }
 
@@ -86,10 +92,10 @@ pub async fn auth_sign_in(state: tauri::State<'_, AppState>) -> Result<GoogleAcc
         .map_err(|e| e.to_string())?;
 
     let account = GoogleAccount {
-        sub: String::new(), // bridge users are keyed by Google sub server-side; not needed in UI
+        sub: session.user.sub.clone().unwrap_or_default(),
         email: session.user.email.clone(),
         name: Some(session.user.name).filter(|n| !n.is_empty()),
-        picture: None,
+        picture: session.user.picture.clone().filter(|p| !p.is_empty()),
     };
 
     if keyring_set(KEY_SYNC, &session.refresh_token) {
@@ -138,14 +144,25 @@ pub async fn auth_restore(state: tauri::State<'_, AppState>) -> Result<Option<Go
         }
     };
     keyring_set(KEY_SYNC, &session.refresh_token);
-    let account: GoogleAccount = keyring_get("account")
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_else(|| GoogleAccount {
-            sub: String::new(),
+    // Bridge older than the picture/sub rollout returns neither — merge with
+    // the cached account so the photo doesn't vanish across restarts.
+    let cached: Option<GoogleAccount> = keyring_get("account")
+        .and_then(|raw| serde_json::from_str(&raw).ok());
+    let account: GoogleAccount = {
+        let fresh_name = Some(session.user.name.clone()).filter(|n| !n.is_empty());
+        let fresh_picture = session.user.picture.clone().filter(|p| !p.is_empty());
+        let fresh_sub = session.user.sub.clone().unwrap_or_default();
+        GoogleAccount {
+            sub: if fresh_sub.is_empty() {
+                cached.as_ref().map(|c| c.sub.clone()).unwrap_or_default()
+            } else {
+                fresh_sub
+            },
             email: session.user.email.clone(),
-            name: Some(session.user.name).filter(|n| !n.is_empty()),
-            picture: None,
-        });
+            name: fresh_name.or_else(|| cached.as_ref().and_then(|c| c.name.clone())),
+            picture: fresh_picture.or_else(|| cached.as_ref().and_then(|c| c.picture.clone())),
+        }
+    };
     let _ = keyring_set("account", &serde_json::to_string(&account).unwrap_or_default());
     *state.session.write().await = Some(Session {
         access_token: session.access_token,
@@ -286,6 +303,7 @@ pub async fn vault_adopt_remote(
     *state.kdf.write().await = Some(kdf);
     *state.vault.write().await = Some(vault.clone());
     *state.revision.write().await = file.revision;
+    mark_synced(&state, file.revision).await;
     Ok(VaultPayload {
         vault,
         revision: file.revision,
@@ -356,6 +374,14 @@ pub async fn vault_get(state: tauri::State<'_, AppState>) -> Result<Option<Vault
         vault,
         revision: *state.revision.read().await,
     }))
+}
+
+/// Remember that the local vault is in sync with the bridge at `revision`.
+async fn mark_synced(state: &AppState, revision: i64) {
+    let mut settings = state.settings_rw.write().await;
+    settings.synced_revision = revision;
+    settings.last_synced_at = Some(Utc::now().to_rfc3339());
+    let _ = store::write_settings(&state.paths.settings, &settings);
 }
 
 /// Seals `vault` into the on-disk file and keeps in-memory state in sync.
@@ -617,6 +643,7 @@ pub async fn vault_sync(state: tauri::State<'_, AppState>) -> Result<VaultPayloa
 
     *state.vault.write().await = Some(merged.clone());
     *state.revision.write().await = outcome.revision;
+    mark_synced(&state, outcome.revision).await;
     Ok(VaultPayload {
         vault: merged,
         revision: outcome.revision,
@@ -654,6 +681,19 @@ pub async fn ssh_open(
     }
 
     let target = SshTarget::from_host(&host, identity.as_ref());
+    open_shell_session(app, state.inner(), target, session_id, cols, rows).await
+}
+
+/// Hands an SSH target to the session machinery: registers the handle and the
+/// output ring buffer, then streams `ssh://<session_id>` in a background task.
+async fn open_shell_session(
+    app: tauri::AppHandle,
+    state: &AppState,
+    target: SshTarget,
+    session_id: String,
+    cols: u32,
+    rows: u32,
+) -> Result<(), String> {
     let session = ssh::open_shell(
         target,
         TermSize {
@@ -725,6 +765,51 @@ pub async fn ssh_open(
     });
 
     Ok(())
+}
+
+/// Quick-connect from the home screen: no vault host required. Auth is the
+/// user's SSH agent, or a one-shot password that is never written to the vault.
+#[tauri::command]
+pub async fn ssh_open_adhoc(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    username: String,
+    address: String,
+    port: u16,
+    auth: String,
+    password: Option<String>,
+    cols: u32,
+    rows: u32,
+) -> Result<(), String> {
+    let username = username.trim().to_string();
+    let address = address.trim().to_string();
+    if username.is_empty() || address.is_empty() {
+        return Err("Type ssh user@host:port".into());
+    }
+    if port == 0 {
+        return Err("Port must be between 1 and 65535".into());
+    }
+    let auth = match auth.as_str() {
+        "agent" => AuthMethod::Agent,
+        "password" => AuthMethod::Password {
+            password: password.unwrap_or_default(),
+        },
+        _ => return Err("Unknown auth method".into()),
+    };
+    let target = SshTarget {
+        host: address,
+        port,
+        username,
+        auth,
+        identity: None,
+        timeout: Duration::from_secs(15),
+        keepalive_secs: 30,
+        term: "xterm-256color".into(),
+        host_key_policy: rterm_core::ssh::HostKeyPolicy::TrustOnFirstUse,
+        env: Vec::new(),
+    };
+    open_shell_session(app, state.inner(), target, session_id, cols, rows).await
 }
 
 #[tauri::command]
@@ -847,7 +932,94 @@ pub async fn local_open(
     rows: u32,
     cwd: Option<String>,
 ) -> Result<(), String> {
-    crate::local::open(app, &state.local, session_id, cols, rows, cwd)
+    crate::local::open(app, &state.local, session_id, cols, rows, expand_cwd(cwd))
+}
+
+/// Expands a leading `~/` (or bare `~`) to the user's home directory. Falls
+/// back to home when the given directory does not exist — the PTY spawn
+/// would fail otherwise.
+fn expand_cwd(cwd: Option<String>) -> Option<String> {
+    let home = std::env::var("HOME").ok();
+    let dir = cwd?.trim().to_string();
+    if dir.is_empty() {
+        return home;
+    }
+    let expanded = if dir == "~" {
+        home.clone()?
+    } else if let Some(rest) = dir.strip_prefix("~/") {
+        format!("{}/{rest}", home.clone()?)
+    } else {
+        dir
+    };
+    if std::path::Path::new(&expanded).is_dir() {
+        Some(expanded)
+    } else {
+        home
+    }
+}
+
+/// AI coding-agent CLIs RuTerm can launch in a local terminal. Detection is
+/// automatic: only the tools actually on the user's PATH are returned.
+#[derive(Serialize)]
+pub struct AiAgent {
+    pub id: String,
+    pub label: String,
+    /// Binary name used to spawn the agent (resolved by the login shell).
+    pub command: String,
+    /// Absolute path the login shell resolves it to.
+    pub path: String,
+}
+
+const AI_AGENTS: &[(&str, &str, &str)] = &[
+    ("opencode", "OpenCode", "opencode"),
+    ("freebuff", "Freebuff", "freebuff"),
+    ("kilo", "Kilo Code", "kilo"),
+    ("claude", "Claude", "claude"),
+    ("kiro", "Kiro", "kiro-cli"),
+];
+
+/// Detects AI-agent CLIs on the user's machine with a *single* interactive
+/// login shell probe — spinning up one shell per candidate costs ~15s each.
+/// Interactive (-i) so `.zshrc` style PATH extensions are honoured; the
+/// `cmd=` line prefixes make the answer robust against startup-file noise.
+#[tauri::command]
+pub async fn ai_agents_detect() -> Result<Vec<AiAgent>, String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let script = AI_AGENTS
+        .iter()
+        .map(|&(_, _, cmd)| {
+            format!("printf '%s=' '{cmd}'; command -v '{cmd}' 2>/dev/null || true; printf '\\n'")
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let shell_for_probe = shell.clone();
+    let output = tauri::async_runtime::spawn_blocking(move || {
+        std::process::Command::new(&shell_for_probe)
+            .args(["-lic", &script])
+            .output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut found = Vec::with_capacity(AI_AGENTS.len());
+    for &(id, label, command) in AI_AGENTS {
+        let prefix = format!("{command}=");
+        let path = stdout.lines().find_map(|line| {
+            let path = line.strip_prefix(&prefix)?.trim();
+            path.starts_with('/').then(|| path.to_string())
+        });
+        if let Some(path) = path {
+            found.push(AiAgent {
+                id: id.into(),
+                label: label.into(),
+                command: command.into(),
+                path,
+            });
+        }
+    }
+    Ok(found)
 }
 
 #[tauri::command]

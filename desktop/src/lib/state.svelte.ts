@@ -6,6 +6,7 @@ import {
   type AppStatus,
   type Host,
   type Identity,
+  type Note,
   type Vault,
   type VaultPayload,
 } from './api';
@@ -208,7 +209,8 @@ export async function syncNow() {
     const payload = await api.vaultSync();
     app.vault = payload.vault;
     app.revision = payload.revision;
-    notify(`Synced (revision ${payload.revision})`);
+    app.status = await api.appStatus().catch(() => app.status);
+    notify('Vault synced');
   } catch (error) {
     fail(error);
   } finally {
@@ -240,8 +242,48 @@ export async function addIdentity(identity: Identity) {
   });
 }
 
+export async function saveNote(note: Note) {
+  if (!app.vault) return;
+  const updated = { ...note, updated_at: new Date().toISOString() };
+  app.vault = await saveVault({
+    ...app.vault,
+    notes: [...(app.vault.notes ?? []).filter(n => n.id !== note.id), updated],
+  });
+}
+
+export async function deleteNote(id: string) {
+  if (!app.vault) return;
+  const notes = (app.vault.notes ?? []).map(n =>
+    n.id === id ? { ...n, deleted: true, updated_at: new Date().toISOString() } : n,
+  );
+  app.vault = await saveVault({ ...app.vault, notes });
+  notify('Note deleted');
+}
+
+/// Push the freshly saved vault to D1 for signed-in accounts, without toasts.
+/// Failures are ignored: the encrypted local copy is already on disk.
+let syncQueue: Promise<void> = Promise.resolve();
+
+export function syncQuiet(): Promise<void> {
+  if (!app.status?.signed_in) return Promise.resolve();
+  syncQueue = syncQueue.then(async () => {
+    try {
+      const payload = await api.vaultSync();
+      applyVaultPayload(payload);
+      app.status = await api.appStatus().catch(() => app.status);
+    } catch {
+      /* offline — local vault remains authoritative until the next sync */
+    }
+  });
+  return syncQueue;
+}
+
 export function hosts(): Host[] {
   return (app.vault?.hosts ?? []).filter(h => !h.deleted);
+}
+
+export function notes(): Note[] {
+  return (app.vault?.notes ?? []).filter(n => !n.deleted);
 }
 
 export function identities(): Identity[] {

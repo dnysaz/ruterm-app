@@ -35,8 +35,8 @@
     display: grid;
     place-items: center;
     font-weight: 650;
-    color: var(--avatar-fg);
-    background: var(--avatar-bg);
+    color: var(--text);
+    background: var(--panel-hover);
     border: 1px solid var(--line);
   }
 </style>

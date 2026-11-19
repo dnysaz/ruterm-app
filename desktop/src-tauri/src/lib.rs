@@ -14,6 +14,7 @@ use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
@@ -51,6 +52,7 @@ pub fn run() {
             commands::json_write,
             commands::json_download,
             commands::ssh_open,
+            commands::ssh_open_adhoc,
             commands::ssh_write,
             commands::ssh_resize,
             commands::ssh_close,
@@ -62,6 +64,7 @@ pub fn run() {
             commands::local_write,
             commands::local_resize,
             commands::local_close,
+            commands::ai_agents_detect,
         ])
         .run(tauri::generate_context!())
         .expect("error while running rterm");

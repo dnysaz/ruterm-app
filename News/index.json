@@ -1,7 +1,43 @@
 {
   "version": 1,
-  "generated_at": "2026-11-18T09:08:11.381Z",
+  "generated_at": "2026-11-19T08:11:30.297Z",
   "entries": [
+    {
+      "file": "2026-11-19-sync.md",
+      "date": "2026-11-19",
+      "title": "Sync that tells you the truth",
+      "summary": "Your vault's sync status is now honest and visible:"
+    },
+    {
+      "file": "2026-11-19-session-restore.md",
+      "date": "2026-11-19",
+      "title": "Cmd+R is a no-op — and the app picks up where you left off",
+      "summary": "Reload (⌘R) no longer tears down your sessions. Your layout — tab order,"
+    },
+    {
+      "file": "2026-11-19-quick-connect.md",
+      "date": "2026-11-19",
+      "title": "Type `ssh you@host:port`, hit Enter — and meet the AI dock",
+      "summary": "Two small things that make RuTerm feel faster every day:"
+    },
+    {
+      "file": "2026-11-19-notes.md",
+      "date": "2026-11-19",
+      "title": "Notes, synced with everything else",
+      "summary": "RuTerm now has free-form Markdown notes, stored in the same sealed vault as"
+    },
+    {
+      "file": "2026-11-19-macos-native.md",
+      "date": "2026-11-19",
+      "title": "A native macOS look — flat, quiet, two themes",
+      "summary": "The whole interface got a redesign: two themes (Dark and Light) in place of"
+    },
+    {
+      "file": "2026-11-19-backgrounds.md",
+      "date": "2026-11-19",
+      "title": "Wallpaper, your way — photos, patterns, and your own image",
+      "summary": "Settings → Background now lets you set the backdrop for the whole app:"
+    },
     {
       "file": "2026-11-18-whats-new.md",
       "date": "2026-11-18",

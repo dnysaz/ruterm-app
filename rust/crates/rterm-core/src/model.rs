@@ -104,6 +104,23 @@ pub struct Snippet {
     pub deleted: bool,
 }
 
+/// A free-form note. The title shown in lists is derived from the first words
+/// of `body`, so a note stores only its text.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Note {
+    pub id: Id,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub favorite: bool,
+    #[serde(default)]
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub deleted: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct TerminalPrefs {
     /// TERM value, e.g. `xterm-256color`.
@@ -291,6 +308,8 @@ pub struct Vault {
     #[serde(default)]
     pub snippets: Vec<Snippet>,
     #[serde(default)]
+    pub notes: Vec<Note>,
+    #[serde(default)]
     pub port_forwards: Vec<PortForward>,
     #[serde(default)]
     pub settings: VaultSettings,
@@ -310,6 +329,7 @@ impl Default for Vault {
             groups: Vec::new(),
             identities: Vec::new(),
             snippets: Vec::new(),
+            notes: Vec::new(),
             port_forwards: Vec::new(),
             settings: VaultSettings::default(),
             updated_at: None,
@@ -338,6 +358,7 @@ impl Vault {
         merge_vec(&mut self.groups, remote.groups.clone());
         merge_vec(&mut self.identities, remote.identities.clone());
         merge_vec(&mut self.snippets, remote.snippets.clone());
+        merge_vec(&mut self.notes, remote.notes.clone());
         merge_vec(&mut self.port_forwards, remote.port_forwards.clone());
 
         let remote_settings_at = remote.settings.updated_at;
@@ -364,6 +385,7 @@ impl Vault {
         self.groups.retain(|g| !g.deleted || g.updated_at > cutoff);
         self.identities.retain(|i| !i.deleted || i.updated_at > cutoff);
         self.snippets.retain(|s| !s.deleted || s.updated_at > cutoff);
+        self.notes.retain(|n| !n.deleted || n.updated_at > cutoff);
         self.port_forwards.retain(|p| !p.deleted || p.updated_at > cutoff);
     }
 
@@ -403,6 +425,7 @@ sync_item!(Host);
 sync_item!(Group);
 sync_item!(Identity);
 sync_item!(Snippet);
+sync_item!(Note);
 sync_item!(PortForward);
 
 fn merge_vec<T: SyncItem + Clone>(local: &mut Vec<T>, remote: Vec<T>) {

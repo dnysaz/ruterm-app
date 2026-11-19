@@ -154,18 +154,20 @@
   .panel {
     width: min(430px, 100%);
     padding: 32px;
-    border-radius: 18px;
-    box-shadow: var(--shadow-strong);
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--glass-border);
+    background: var(--panel);
   }
   h1 {
-    margin: 0 0 10px;
-    font-size: 27.5px;
+    margin: 0 0 8px;
+    font-size: 18px;
+    font-weight: 600;
   }
   .hint {
-    margin: 0 0 24px;
-    font-size: 15.5px;
+    margin: 0 0 22px;
+    font-size: 13.5px;
     line-height: 1.65;
-    color: var(--muted);
+    color: var(--text-secondary);
   }
   .full {
     width: 100%;
@@ -173,7 +175,7 @@
   }
   .error {
     margin: 0 0 12px;
-    font-size: 14.5px;
+    font-size: 13px;
     color: var(--bad);
   }
   .foot {
@@ -187,16 +189,18 @@
     border: 0;
     padding: 0;
     color: var(--accent);
-    font-size: 14.5px;
+    font-size: 13px;
     line-height: 1.5;
     cursor: pointer;
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 2px;
   }
   .link:hover {
-    color: var(--accent-strong);
-    text-decoration: underline;
+    color: var(--accent-hover);
   }
   .tiny {
-    font-size: 14px;
+    font-size: 12px;
   }
   .keychain {
     width: 100%;
@@ -207,8 +211,8 @@
     align-items: center;
     gap: 10px;
     margin: 14px 0 16px;
-    font-size: 13.5px;
-    color: var(--dim);
+    font-size: 12px;
+    color: var(--text-tertiary);
   }
   .or::before,
   .or::after {

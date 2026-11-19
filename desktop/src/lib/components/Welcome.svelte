@@ -81,7 +81,7 @@
   }
   .kicker {
     font-family: var(--term);
-    font-size: 15px;
+    font-size: 13.5px;
     font-weight: 700;
     letter-spacing: 0.02em;
     color: var(--accent);
@@ -101,18 +101,18 @@
     }
   }
   h1 {
-    margin: 0 0 18px;
-    font-size: clamp(34px, 4vw, 46px);
-    line-height: 1.08;
+    margin: 0 0 16px;
+    font-size: clamp(26px, 3vw, 32px);
+    line-height: 1.12;
     font-weight: 600;
     letter-spacing: -0.035em;
   }
   .lede {
     margin: 0;
-    max-width: 46ch;
-    font-size: 18px;
+    max-width: 50ch;
+    font-size: 14px;
     line-height: 1.7;
-    color: var(--muted);
+    color: var(--text-secondary);
   }
   .facts {
     display: grid;
@@ -123,31 +123,33 @@
     border-top: 1px solid var(--line);
   }
   .facts dt {
-    font-size: 13px;
+    font-size: 11px;
     letter-spacing: 0.1em;
     text-transform: uppercase;
-    color: var(--dim);
+    color: var(--text-tertiary);
     margin-bottom: 6px;
   }
   .facts dd {
     margin: 0;
-    font-size: 15px;
+    font-size: 12.5px;
     line-height: 1.5;
     color: var(--text);
   }
   .panel {
-    border-radius: 18px;
+    border-radius: var(--radius-lg);
     padding: 28px;
-    box-shadow: var(--shadow-strong);
+    border: 1px solid var(--glass-border);
+    background: var(--panel);
   }
   h2 {
     margin: 0 0 8px;
-    font-size: 21.5px;
+    font-size: 16px;
   }
   .body {
-    margin: 0 0 22px;
-    font-size: 15.5px;
+    margin: 0 0 20px;
+    font-size: 13.5px;
     line-height: 1.6;
+    color: var(--text-secondary);
   }
   .full {
     width: 100%;
@@ -158,9 +160,9 @@
   }
   .fine {
     margin: 0;
-    font-size: 14px;
+    font-size: 12px;
     line-height: 1.6;
-    color: var(--dim);
+    color: var(--text-tertiary);
   }
   .account {
     display: flex;
@@ -174,17 +176,17 @@
     display: grid;
     place-items: center;
     border-radius: 50%;
-    background: var(--avatar-bg);
-    border: 1px solid var(--line-strong);
-    font-size: 16.5px;
+    background: var(--panel-hover);
+    border: 1px solid var(--line-hover);
+    font-size: 14px;
     font-weight: 600;
   }
   .email {
-    font-size: 15.5px;
+    font-size: 13.5px;
     font-weight: 550;
   }
   .small {
-    font-size: 14px;
+    font-size: 12px;
   }
 
   @media (max-width: 880px) {

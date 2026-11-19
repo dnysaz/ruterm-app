@@ -7,6 +7,30 @@
     <meta name="theme-color" content="#131110" />
     <title>RuTerm</title>
     <script>
+      // Kill the macOS/webview context menu everywhere except real text fields,
+      // where the native copy/paste menu is still useful. The app draws its own
+      // menu for the terminal and chrome (sidebar, tab bar, home).
+      document.addEventListener(
+        'contextmenu',
+        (event) => {
+          const target = event.target;
+          if (target && target.closest && target.closest('.xterm')) {
+            event.preventDefault();
+            return;
+          }
+          if (
+            target &&
+            target.closest &&
+            target.closest('input, textarea, select, [contenteditable="true"]')
+          ) {
+            return;
+          }
+          event.preventDefault();
+        },
+        { capture: true }
+      );
+    </script>
+    <script>
       try {
         var t = localStorage.getItem('rterm.theme');
         var legacy = { dark: 'ember-black', light: 'ember-light' };

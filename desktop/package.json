@@ -1,7 +1,7 @@
 {
   "name": "ruterm",
   "version": "0.1.0",
-  "description": "RuTerm \u2014 open-source SSH workspace for the desktop: local JSON vault, sealed secrets, zero-knowledge sync",
+  "description": "RuTerm — open-source SSH workspace for the desktop: local JSON vault, sealed secrets, zero-knowledge sync",
   "type": "module",
   "scripts": {
     "dev": "vite dev",
@@ -17,6 +17,7 @@
   "license": "MIT",
   "dependencies": {
     "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-opener": "^2.7.3",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-ligatures": "^0.10.0",
     "@xterm/addon-serialize": "^0.14.0",

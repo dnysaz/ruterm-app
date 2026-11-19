@@ -79,17 +79,17 @@
     display: grid;
     place-items: center;
     border-radius: 13px;
-    border: 1px solid var(--accent-line);
+    border: 1px solid var(--accent-dim);
     background: var(--accent-dim);
     color: var(--accent);
     font-family: var(--mono);
-    font-size: 23.5px;
+    font-size: 20px;
     font-weight: 600;
     margin-bottom: 10px;
   }
   .name {
     font-family: var(--term);
-    font-size: 18.5px;
+    font-size: 15px;
     font-weight: 700;
     letter-spacing: -0.01em;
   }
