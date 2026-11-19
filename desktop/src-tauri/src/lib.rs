@@ -15,6 +15,7 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
@@ -65,6 +66,20 @@ pub fn run() {
             commands::local_resize,
             commands::local_close,
             commands::ai_agents_detect,
+            commands::sftp_open_host,
+            commands::sftp_open_adhoc,
+            commands::sftp_list,
+            commands::sftp_mkdir,
+            commands::sftp_rename,
+            commands::sftp_remove,
+            commands::sftp_upload,
+            commands::sftp_upload_bytes,
+            commands::sftp_download,
+            commands::sftp_close,
+            commands::sftp_read_file,
+            commands::sftp_read_image,
+            commands::sftp_write_file,
+            commands::sftp_create_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running rterm");

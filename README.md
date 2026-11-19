@@ -33,6 +33,22 @@ A Termius-class workflow, built in the open.
 - Tab right-click menu: split, duplicate, close — plus page tabs for Settings
   and the host editor.
 
+### Files (SFTP)
+
+- Built-in file manager over the same SSH muscle as the terminal — no separate
+  tool, no extra ports. Open it from the sidebar host row (folder icon), from
+  the Home screen's recent hosts, or from a live session's right-click tab
+  menu → **Files (SFTP)**.
+- Browse any directory (breadcrumb path bar, directories first, size, modified
+  time, `rwxr-xr-x` permissions), create folders, rename and delete — deletion
+  understands directory trees and always asks first.
+- **Upload** via a native picker (multi-select) or by dropping files straight
+  from Finder onto the list. **Download** with a native Save dialog. No
+  settings, no sync of the remote listing: the panel is a live view.
+- Saved hosts use the vault credentials you already have. Quick-connect targets
+  use your SSH agent — passwords are never stored, so password-only
+  quick-connect SFTP is not offered.
+
 ### The vault
 
 - One document — `vault.json` — holds hosts, groups, identities, snippets,
@@ -246,6 +262,7 @@ One document, on disk and on the bridge (field-level ciphertext inside):
 | Rust core — model, crypto, ssh, bridge, oauth | working, tested |
 | Tauri command layer | working on macOS |
 | Svelte 5 UI — unlock, host list/form, terminal, tabs, split panes, settings, notes | working |
+| SFTP file manager (browse, mkdir, rename, delete, upload/download, drag & drop from Finder) | working |
 | Session restore across reload & restart (tabs, panes, scrollback, quick-connect, notes) | working |
 | Backgrounds (bundled photos/patterns, custom upload, Frost & Terminal) | working |
 | Scrollback restore (local, never synced) | working |

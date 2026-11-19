@@ -155,6 +155,45 @@ export interface SessionAttach {
   bytes: number;
 }
 
+// -------------------------------------------------------------------- sftp
+export interface SftpEntry {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  is_symlink: boolean;
+  /** `null` when the server omits it. */
+  size: number | null;
+  /** Seconds since the epoch, as reported by the server. */
+  mtime: number | null;
+  /** e.g. `drwxr-xr-x`; `null` when the server omits it. */
+  permissions: string | null;
+}
+
+export interface SftpDir {
+  /** Canonical absolute path the listing was taken from. */
+  path: string;
+  entries: SftpEntry[];
+}
+
+export interface SftpOpenInfo {
+  home: string;
+  user: string;
+  address: string;
+  port: number;
+}
+
+export interface SftpFilePayload {
+  /** UTF-8 text; `null` when the file is binary. */
+  content: string | null;
+  size: number;
+}
+
+export interface SftpImagePayload {
+  /** Base64 of the raw file bytes. */
+  data: string;
+  size: number;
+}
+
 export const api = {
   appStatus: () => invoke<AppStatus>('app_status'),
   appVersion: () => invoke<string>('app_version'),
@@ -212,6 +251,38 @@ export const api = {
 
   /// One-shot probe: detect the remote OS and persist it on the host.
   hostProbeOs: (hostId: string) => invoke<VaultPayload>('host_probe_os', { hostId }),
+
+  sftpOpenHost: (sftpId: string, hostId: string) =>
+    invoke<SftpOpenInfo>('sftp_open_host', { sftpId, hostId }),
+  /// Quick-connect SFTP. Agent auth only — passwords are never kept around.
+  sftpOpenAdhoc: (sftpId: string, username: string, address: string, port: number) =>
+    invoke<SftpOpenInfo>('sftp_open_adhoc', { sftpId, username, address, port }),
+  sftpList: (sftpId: string, path: string) => invoke<SftpDir>('sftp_list', { sftpId, path }),
+  sftpMkdir: (sftpId: string, path: string) => invoke<void>('sftp_mkdir', { sftpId, path }),
+  sftpRename: (sftpId: string, from: string, to: string) =>
+    invoke<void>('sftp_rename', { sftpId, from, to }),
+  sftpRemove: (sftpId: string, path: string, isDir: boolean) =>
+    invoke<void>('sftp_remove', { sftpId, path, isDir }),
+  /// Uploads a local file (real path) into `remoteDir`; resolves to the final remote path.
+  sftpUpload: (sftpId: string, localPath: string, remoteDir: string) =>
+    invoke<string>('sftp_upload', { sftpId, localPath, remoteDir }),
+  /// Upload from dropped File bytes (no path available in the webview).
+  sftpUploadBytes: (sftpId: string, remotePath: string, bytesB64: string) =>
+    invoke<void>('sftp_upload_bytes', { sftpId, remotePath, bytesB64 }),
+  sftpDownload: (sftpId: string, remotePath: string, localPath: string) =>
+    invoke<void>('sftp_download', { sftpId, remotePath, localPath }),
+  /// Opens a new editor tab on a remote file (2 MB cap).
+  sftpReadFile: (sftpId: string, path: string) =>
+    invoke<SftpFilePayload>('sftp_read_file', { sftpId, path }),
+  /// Reads a remote image for the in-app preview (12 MB cap).
+  sftpReadImage: (sftpId: string, path: string) =>
+    invoke<SftpImagePayload>('sftp_read_image', { sftpId, path }),
+  sftpWriteFile: (sftpId: string, path: string, content: string) =>
+    invoke<void>('sftp_write_file', { sftpId, path, content }),
+  /// Creates an empty remote file; fails if it already exists.
+  sftpCreateFile: (sftpId: string, path: string) =>
+    invoke<void>('sftp_create_file', { sftpId, path }),
+  sftpClose: (sftpId: string) => invoke<void>('sftp_close', { sftpId }),
 
   /// Replays an existing session after a webview reload.
   sessionAttach: (sessionId: string) =>

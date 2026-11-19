@@ -21,7 +21,7 @@
           if (
             target &&
             target.closest &&
-            target.closest('input, textarea, select, [contenteditable="true"]')
+            target.closest('input, textarea, select, [contenteditable="true"], .monaco-editor')
           ) {
             return;
           }

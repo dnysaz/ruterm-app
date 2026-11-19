@@ -3,6 +3,7 @@
 use rterm_core::crypto::{KdfParams, SecretKey};
 use rterm_core::model::Vault;
 use rterm_core::oauth::GoogleAccount;
+use rterm_core::sftp::SftpSession;
 use rterm_core::ssh::SshHandle;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -65,6 +66,9 @@ pub struct AppState {
     pub session: RwLock<Option<Session>>,
     pub ssh: Mutex<HashMap<String, SshHandle>>,
     pub local: crate::local::LocalSessions,
+    /// Live SFTP sessions, keyed by SFTP tab id. Tokio mutex: every SFTP
+    /// command awaits the session, so the guard is held across await points.
+    pub sftp: tokio::sync::Mutex<HashMap<String, SftpSession>>,
     /// Output buffers for every session, keyed by session id (tab id).
     pub output: Mutex<HashMap<String, StreamEntry>>,
 }
@@ -82,6 +86,7 @@ impl AppState {
             session: RwLock::new(None),
             ssh: Mutex::new(HashMap::new()),
             local: Mutex::new(HashMap::new()),
+            sftp: tokio::sync::Mutex::new(HashMap::new()),
             output: Mutex::new(HashMap::new()),
         }
     }

@@ -6,6 +6,7 @@ use rterm_core::bridge::{BridgeClient, DeviceInfo};
 use rterm_core::crypto::{derive_key, KdfParams};
 use rterm_core::model::{AuthMethod, Identity, IdentityKind, Vault};
 use rterm_core::oauth::{self, GoogleAccount};
+use rterm_core::sftp;
 use rterm_core::ssh::{self, SshEvent, SshTarget, TermSize};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -1106,6 +1107,305 @@ pub async fn ui_set_zoom(window: tauri::WebviewWindow, scale: f64) -> Result<(),
     window
         .set_zoom(scale.clamp(0.5, 2.5))
         .map_err(|e| e.to_string())
+}
+
+// -------------------------------------------------------------------- sftp
+//
+// One `SftpSession` (a dedicated SSH connection with the `sftp` subsystem)
+// per SFTP tab. The UI keys tabs by id; commands look the session up here.
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpOpenInfo {
+    /// Canonical home directory — the panel starts here.
+    pub home: String,
+    /// Login name used for the connection (for the panel subtitle).
+    pub user: String,
+    /// Address (host or adhoc target) the session is connected to.
+    pub address: String,
+    pub port: u16,
+}
+
+async fn sftp_target_for_host(
+    state: &AppState,
+    host_id: &str,
+) -> Result<(SshTarget, String, String, u16), String> {
+    let vault = state.unlocked_vault().await?;
+    let id: Uuid = host_id
+        .parse()
+        .map_err(|_| "Invalid host id".to_string())?;
+    let host = vault.host(&id).cloned().ok_or("Host not found")?;
+    let identity = match &host.auth {
+        AuthMethod::Key { identity_id, .. } => vault.identity(identity_id).cloned(),
+        _ => None,
+    };
+    if matches!(host.auth, AuthMethod::Key { .. }) && identity.is_none() {
+        return Err("Identity not found for this host".into());
+    }
+    let target = SshTarget::from_host(&host, identity.as_ref());
+    Ok((target, host.username, host.address, host.port))
+}
+
+async fn open_sftp_in_state(
+    state: &AppState,
+    sftp_id: String,
+    target: SshTarget,
+    user: String,
+    address: String,
+    port: u16,
+) -> Result<SftpOpenInfo, String> {
+    let id = sftp_id.trim().to_string();
+    if id.is_empty() {
+        return Err("empty sftp id".into());
+    }
+    let session = sftp::open_sftp(&target).await.map_err(|e| e.to_string())?;
+    let home = sftp::home_dir(&session).await;
+    let mut map = state.sftp.lock().await;
+    map.insert(id, session);
+    Ok(SftpOpenInfo {
+        home,
+        user,
+        address,
+        port,
+    })
+}
+
+/// Opens an SFTP session against a saved vault host (any auth method — the
+/// vault holds the credentials).
+#[tauri::command]
+pub async fn sftp_open_host(
+    state: tauri::State<'_, AppState>,
+    sftp_id: String,
+    host_id: String,
+) -> Result<SftpOpenInfo, String> {
+    let (target, user, address, port) = sftp_target_for_host(state.inner(), &host_id).await?;
+    open_sftp_in_state(state.inner(), sftp_id, target, user, address, port).await
+}
+
+/// Quick-connect SFTP: agent auth only — passwords are never kept in memory,
+/// and the vault has nothing stored for adhoc targets.
+#[tauri::command]
+pub async fn sftp_open_adhoc(
+    state: tauri::State<'_, AppState>,
+    sftp_id: String,
+    username: String,
+    address: String,
+    port: u16,
+) -> Result<SftpOpenInfo, String> {
+    let username = username.trim().to_string();
+    let address = address.trim().to_string();
+    if username.is_empty() || address.is_empty() {
+        return Err("Type ssh user@host:port".into());
+    }
+    if port == 0 {
+        return Err("Port must be between 1 and 65535".into());
+    }
+    let target = SshTarget {
+        host: address.clone(),
+        port,
+        username: username.clone(),
+        auth: AuthMethod::Agent,
+        identity: None,
+        timeout: Duration::from_secs(15),
+        keepalive_secs: 30,
+        term: "xterm-256color".into(),
+        host_key_policy: rterm_core::ssh::HostKeyPolicy::TrustOnFirstUse,
+        env: Vec::new(),
+    };
+    open_sftp_in_state(state.inner(), sftp_id, target, username, address, port).await
+}
+
+/// Lists one directory. Returns the canonical path it was resolved to.
+#[tauri::command]
+pub async fn sftp_list(
+    state: tauri::State<'_, AppState>,
+    sftp_id: String,
+    path: String,
+) -> Result<sftp::SftpDir, String> {
+    let map = state.sftp.lock().await;
+    let session = map.get(sftp_id.trim()).ok_or("SFTP session is not open")?;
+    sftp::list_dir(session, path.trim())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Creates one folder (the full path, including the new folder's name).
+#[tauri::command]
+pub async fn sftp_mkdir(
+    state: tauri::State<'_, AppState>,
+    sftp_id: String,
+    path: String,
+) -> Result<(), String> {
+    let map = state.sftp.lock().await;
+    let session = map.get(sftp_id.trim()).ok_or("SFTP session is not open")?;
+    sftp::create_dir(session, path.trim())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn sftp_rename(
+    state: tauri::State<'_, AppState>,
+    sftp_id: String,
+    from: String,
+    to: String,
+) -> Result<(), String> {
+    let map = state.sftp.lock().await;
+    let session = map.get(sftp_id.trim()).ok_or("SFTP session is not open")?;
+    sftp::rename(session, from.trim(), to.trim())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Deletes a file, symlink, or a directory tree (the UI confirms first).
+#[tauri::command]
+pub async fn sftp_remove(
+    state: tauri::State<'_, AppState>,
+    sftp_id: String,
+    path: String,
+    is_dir: bool,
+) -> Result<(), String> {
+    let map = state.sftp.lock().await;
+    let session = map.get(sftp_id.trim()).ok_or("SFTP session is not open")?;
+    sftp::remove_path(session, path.trim(), is_dir)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Uploads one local file (picked via a native dialog, so we get a real
+/// path) into `remote_dir`, keeping the local file name.
+#[tauri::command]
+pub async fn sftp_upload(
+    state: tauri::State<'_, AppState>,
+    sftp_id: String,
+    local_path: String,
+    remote_dir: String,
+) -> Result<String, String> {
+    let local = PathBuf::from(local_path.trim());
+    let name = local
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .ok_or("The selected file has no name")?;
+    let remote = if remote_dir.trim_end_matches('/').ends_with('/') || remote_dir.trim() == "/" {
+        format!("/{name}")
+    } else {
+        format!("{}/{name}", remote_dir.trim_end_matches('/'))
+    };
+    let map = state.sftp.lock().await;
+    let session = map.get(sftp_id.trim()).ok_or("SFTP session is not open")?;
+    sftp::upload(session, &local, &remote)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(remote)
+}
+
+/// Upload from HTML5 drag & drop, where the webview only exposes the file
+/// bytes (no path). Writes to `remote_path` (full path).
+#[tauri::command]
+pub async fn sftp_upload_bytes(
+    state: tauri::State<'_, AppState>,
+    sftp_id: String,
+    remote_path: String,
+    bytes_b64: String,
+) -> Result<(), String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(bytes_b64.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let map = state.sftp.lock().await;
+    let session = map.get(sftp_id.trim()).ok_or("SFTP session is not open")?;
+    sftp::upload_bytes(session, remote_path.trim(), &bytes)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Downloads one remote file to a local path chosen in a native save dialog
+/// (or the default `~/Downloads` suggestion).
+#[tauri::command]
+pub async fn sftp_download(
+    state: tauri::State<'_, AppState>,
+    sftp_id: String,
+    remote_path: String,
+    local_path: String,
+) -> Result<(), String> {
+    let local = PathBuf::from(local_path.trim());
+    let map = state.sftp.lock().await;
+    let session = map.get(sftp_id.trim()).ok_or("SFTP session is not open")?;
+    sftp::download(session, remote_path.trim(), &local)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Reads one remote text file for the in-app viewer/editor (2 MB cap;
+/// binary files come back with `content: null`).
+#[tauri::command]
+pub async fn sftp_read_file(
+    state: tauri::State<'_, AppState>,
+    sftp_id: String,
+    path: String,
+) -> Result<sftp::SftpFilePayload, String> {
+    let map = state.sftp.lock().await;
+    let session = map.get(sftp_id.trim()).ok_or("SFTP session is not open")?;
+    sftp::read_file(session, path.trim())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Reads one remote image for the in-app preview (12 MB cap), returned as
+/// base64 so the UI can build a `data:` URL without a second round trip.
+#[tauri::command]
+pub async fn sftp_read_image(
+    state: tauri::State<'_, AppState>,
+    sftp_id: String,
+    path: String,
+) -> Result<sftp::SftpImagePayload, String> {
+    let map = state.sftp.lock().await;
+    let session = map.get(sftp_id.trim()).ok_or("SFTP session is not open")?;
+    sftp::read_image(session, path.trim())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Writes one remote text file back (temp file + rename, permissions
+/// preserved). Never truncates the original on failure.
+#[tauri::command]
+pub async fn sftp_write_file(
+    state: tauri::State<'_, AppState>,
+    sftp_id: String,
+    path: String,
+    content: String,
+) -> Result<(), String> {
+    let map = state.sftp.lock().await;
+    let session = map.get(sftp_id.trim()).ok_or("SFTP session is not open")?;
+    sftp::write_file(session, path.trim(), content.as_bytes())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Creates a new, empty remote file. Fails if it already exists.
+#[tauri::command]
+pub async fn sftp_create_file(
+    state: tauri::State<'_, AppState>,
+    sftp_id: String,
+    path: String,
+) -> Result<(), String> {
+    let map = state.sftp.lock().await;
+    let session = map.get(sftp_id.trim()).ok_or("SFTP session is not open")?;
+    sftp::create_file(session, path.trim())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn sftp_close(
+    state: tauri::State<'_, AppState>,
+    sftp_id: String,
+) -> Result<(), String> {
+    let mut map = state.sftp.lock().await;
+    if let Some(session) = map.remove(sftp_id.trim()) {
+        let _ = session.close().await;
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]

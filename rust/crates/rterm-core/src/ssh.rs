@@ -232,7 +232,61 @@ struct Observed {
     banner: Option<String>,
 }
 
-struct Handler {
+pub(crate) struct Authed {
+    pub session: client::Handle<Handler>,
+    pub fingerprint: String,
+    pub banner: Option<String>,
+}
+
+/// Connects, authenticates, and enforces the pinned host key policy.
+/// Shared by the terminal (`open_shell`) and SFTP sessions.
+pub(crate) async fn connect_and_authenticate(target: &SshTarget) -> Result<Authed, SshError> {
+    let fingerprint_slot = Arc::new(Mutex::new(Observed::default()));
+    let handler = Handler {
+        policy: target.host_key_policy.clone(),
+        observed: fingerprint_slot.clone(),
+    };
+
+    let config = Arc::new(client::Config {
+        inactivity_timeout: None,
+        keepalive_interval: Some(Duration::from_secs(target.keepalive_secs.max(5))),
+        keepalive_max: 3,
+        nodelay: true,
+        ..Default::default()
+    });
+
+    let addr = (target.host.as_str(), target.port);
+    let mut session = tokio::time::timeout(target.timeout, client::connect(config, addr, handler))
+        .await
+        .map_err(|_| SshError::Timeout)??;
+
+    authenticate(&mut session, target).await?;
+
+    let (fingerprint, banner) = {
+        let observed = fingerprint_slot.lock().expect("observed lock");
+        (
+            observed.fingerprint.clone().unwrap_or_default(),
+            observed.banner.clone(),
+        )
+    };
+
+    if let HostKeyPolicy::Pinned { fingerprint: expected } = &target.host_key_policy {
+        if expected != &fingerprint && !fingerprint.is_empty() {
+            return Err(SshError::HostKeyMismatch {
+                expected: expected.clone(),
+                actual: fingerprint,
+            });
+        }
+    }
+
+    Ok(Authed {
+        session,
+        fingerprint,
+        banner,
+    })
+}
+
+pub(crate) struct Handler {
     policy: HostKeyPolicy,
     observed: Arc<Mutex<Observed>>,
 }
@@ -472,43 +526,11 @@ async fn authenticate(
 
 /// Connects, authenticates, opens a PTY and a shell, then spawns the pump task.
 pub async fn open_shell(target: SshTarget, size: TermSize) -> Result<SshSession, SshError> {
-    let fingerprint_slot = Arc::new(Mutex::new(Observed::default()));
-    let handler = Handler {
-        policy: target.host_key_policy.clone(),
-        observed: fingerprint_slot.clone(),
-    };
-
-    let config = Arc::new(client::Config {
-        inactivity_timeout: None,
-        keepalive_interval: Some(Duration::from_secs(target.keepalive_secs.max(5))),
-        keepalive_max: 3,
-        nodelay: true,
-        ..Default::default()
-    });
-
-    let addr = (target.host.as_str(), target.port);
-    let mut session = tokio::time::timeout(target.timeout, client::connect(config, addr, handler))
-        .await
-        .map_err(|_| SshError::Timeout)??;
-
-    authenticate(&mut session, &target).await?;
-
-    let (fingerprint, banner) = {
-        let observed = fingerprint_slot.lock().expect("observed lock");
-        (
-            observed.fingerprint.clone().unwrap_or_default(),
-            observed.banner.clone(),
-        )
-    };
-
-    if let HostKeyPolicy::Pinned { fingerprint: expected } = &target.host_key_policy {
-        if expected != &fingerprint && !fingerprint.is_empty() {
-            return Err(SshError::HostKeyMismatch {
-                expected: expected.clone(),
-                actual: fingerprint,
-            });
-        }
-    }
+    let Authed {
+        session,
+        fingerprint,
+        banner,
+    } = connect_and_authenticate(&target).await?;
 
     let channel = session.channel_open_session().await?;
     for (name, value) in &target.env {

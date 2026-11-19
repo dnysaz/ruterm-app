@@ -20,6 +20,8 @@
   import HostAvatar from './HostAvatar.svelte';
   import HostForm from './HostForm.svelte';
   import Icon from './Icon.svelte';
+  import SftpPanel from './SftpPanel.svelte';
+  import SftpFileView from './SftpFileView.svelte';
   import { removeSnapshot } from '$lib/scrollback';
   import Settings from './Settings.svelte';
   import Terminal from './Terminal.svelte';
@@ -52,8 +54,14 @@
       | 'json'
       | 'note'
       | 'adhoc'
+      | 'sftp'
+      | 'sftpfile'
       | 'home';
     adhoc?: AdhocTarget;
+    /** SFTP file-viewer tabs: the parent SFTP session's backend key. */
+    sftpId?: string;
+    /** SFTP file-viewer tabs: absolute remote path of the file. */
+    filePath?: string;
     /** Local-agent tabs: shell starts here instead of $HOME. */
     cwd?: string;
     /** Local-agent tabs: command typed into the shell after spawn. */
@@ -454,6 +462,73 @@
       title,
       status: 'connecting',
       kind: 'ssh',
+    };
+    tabs = [...tabs, tab];
+    addTabToPane(tab.id, lastFocusedOrFirst());
+  }
+
+  /** Opens an SFTP file-manager tab for a saved host. */
+  function openSftpHost(host: Host) {
+    pickerOpen = false;
+    const base = host.label || host.address;
+    const count = tabs.filter(t => t.kind === 'sftp' && t.hostId === host.id).length;
+    const tab: Tab = {
+      id: crypto.randomUUID(),
+      hostId: host.id,
+      title: count > 0 ? `Files — ${base} ${count + 1}` : `Files — ${base}`,
+      status: 'connecting',
+      kind: 'sftp',
+    };
+    tabs = [...tabs, tab];
+    addTabToPane(tab.id, lastFocusedOrFirst());
+  }
+
+  /** Quick-connect SFTP (agent auth only). */
+  function openSftpAdhoc(target: AdhocTarget) {
+    pickerOpen = false;
+    const base = `${target.username}@${target.address}:${target.port}`;
+    const count = tabs.filter(
+      t => t.kind === 'sftp' && t.adhoc?.address === target.address && t.adhoc.username === target.username,
+    ).length;
+    const tab: Tab = {
+      id: crypto.randomUUID(),
+      hostId: '',
+      title: count > 0 ? `Files — ${base} ${count + 1}` : `Files — ${base}`,
+      status: 'connecting',
+      kind: 'sftp',
+      adhoc: target,
+    };
+    tabs = [...tabs, tab];
+    addTabToPane(tab.id, lastFocusedOrFirst());
+  }
+
+  function openSftpFromTab(tab: Tab) {
+    if (tab.kind === 'adhoc' && tab.adhoc) {
+      openSftpAdhoc(tab.adhoc);
+      return;
+    }
+    const host = hosts().find(h => h.id === tab.hostId);
+    if (host) openSftpHost(host);
+  }
+
+  /** Opens a remote file (read-only viewer; edit on demand) in a new tab. */
+  function openSftpFile(parent: Tab, entry: { name: string; path: string }) {
+    const filePath = entry.path;
+    const existing = tabs.find(t => t.kind === 'sftpfile' && t.filePath === filePath);
+    if (existing) {
+      activateTab(existing.id);
+      return;
+    }
+    const tab: Tab = {
+      id: crypto.randomUUID(),
+      hostId: '',
+      title: entry.name,
+      status: 'connected',
+      kind: 'sftpfile',
+      // The backend SFTP session is keyed by the parent tab's id; sharing it
+      // means no second auth and one connection, like VS Code's editor.
+      sftpId: parent.id,
+      filePath,
     };
     tabs = [...tabs, tab];
     addTabToPane(tab.id, lastFocusedOrFirst());
@@ -1222,9 +1297,17 @@
 
   function closeTab(id: string) {
     if (id === HOME_ID) return; // the Home tab is pinned
-    removeSnapshot(id);
-    tabs = tabs.filter(t => t.id !== id);
-    panes = panes.map(p => ({ ...p, tabs: p.tabs.filter(t => t !== id) }));
+    // File-viewer tabs share the parent SFTP tab's backend session; when the
+    // parent closes, the session is dropped, so the children must go too.
+    const doomed = new Set<string>([id]);
+    if (tabs.find(t => t.id === id)?.kind === 'sftp') {
+      for (const t of tabs) {
+        if (t.kind === 'sftpfile' && t.sftpId === id) doomed.add(t.id);
+      }
+    }
+    for (const tabId of doomed) removeSnapshot(tabId);
+    tabs = tabs.filter(t => !doomed.has(t.id));
+    panes = panes.map(p => ({ ...p, tabs: p.tabs.filter(t => !doomed.has(t)) }));
     applyPanes(panes);
   }
 
@@ -1463,6 +1546,18 @@
               <span class="sub mono">{host.username}@{host.address}:{host.port}</span>
             </span>
             <button
+              class="more sftp"
+              type="button"
+              title="Files (SFTP)"
+              aria-label="Browse files on {host.label || host.address} over SFTP"
+              onclick={event => {
+                event.stopPropagation();
+                openSftpHost(host);
+              }}
+            >
+              <Icon name="folder" size={16} />
+            </button>
+            <button
               class="more"
               type="button"
               title="Edit host"
@@ -1645,6 +1740,10 @@
                         <span class="tabicon page"><Icon name="spark" size={13} /></span>
                       {:else if tab.kind === 'adhoc'}
                         <span class="tabicon local"><Icon name="terminal" size={13} /></span>
+                      {:else if tab.kind === 'sftp'}
+                        <span class="tabicon page"><Icon name="folder" size={13} /></span>
+                      {:else if tab.kind === 'sftpfile'}
+                        <span class="tabicon page"><Icon name="file-text" size={13} /></span>
                       {:else if tab.kind === 'note'}
                         <span class="tabicon page"><Icon name="edit" size={13} /></span>
                       {:else}
@@ -1794,6 +1893,16 @@
                           onclose={() => closeTab(tab.id)}
                         />
                       {/key}
+                    {:else if tab.kind === 'sftp'}
+                      <SftpPanel
+                        sftpId={tab.id}
+                        hostId={tab.hostId}
+                        adhoc={tab.adhoc}
+                        onstatus={status => setStatus(tab.id, status)}
+                        onopenfile={entry => openSftpFile(tab, entry)}
+                      />
+                    {:else if tab.kind === 'sftpfile'}
+                      <SftpFileView sftpId={tab.sftpId ?? ''} path={tab.filePath ?? ''} />
                     {:else if tab.kind === 'hostform'}
                       {#key formEpoch}
                         {#if formHost}
@@ -1914,7 +2023,13 @@
         <p class="picker-sub">Recent hosts</p>
         <div class="picker-list">
           {#each recentHosts as host (host.id)}
-            <button class="picker-row" type="button" onclick={() => connect(host)}>
+            <div
+              class="picker-row"
+              role="button"
+              tabindex="0"
+              onclick={() => connect(host)}
+              onkeydown={event => event.key === 'Enter' && connect(host)}
+            >
               <HostAvatar host={host} size={26} />
               <span class="meta">
                 <span class="name">{host.label || host.address}</span>
@@ -1923,10 +2038,28 @@
               {#if openCount(host.id) > 0}
                 <span class="badge">{openCount(host.id)}×</span>
               {/if}
-            </button>
+              <button
+                class="icon-btn picker-sftp"
+                type="button"
+                title="Files (SFTP)"
+                aria-label="Browse files on {host.label || host.address} over SFTP"
+                onclick={event => {
+                  event.stopPropagation();
+                  openSftpHost(host);
+                }}
+              >
+                <Icon name="folder" size={16} />
+              </button>
+            </div>
           {:else}
             {#each pickable.slice(0, 5) as host (host.id)}
-              <button class="picker-row" type="button" onclick={() => connect(host)}>
+              <div
+                class="picker-row"
+                role="button"
+                tabindex="0"
+                onclick={() => connect(host)}
+                onkeydown={event => event.key === 'Enter' && connect(host)}
+              >
                 <HostAvatar host={host} size={26} />
                 <span class="meta">
                   <span class="name">{host.label || host.address}</span>
@@ -1935,7 +2068,19 @@
                 {#if openCount(host.id) > 0}
                   <span class="badge">{openCount(host.id)}×</span>
                 {/if}
-              </button>
+                <button
+                  class="icon-btn picker-sftp"
+                  type="button"
+                  title="Files (SFTP)"
+                  aria-label="Browse files on {host.label || host.address} over SFTP"
+                  onclick={event => {
+                    event.stopPropagation();
+                    openSftpHost(host);
+                  }}
+                >
+                  <Icon name="folder" size={16} />
+                </button>
+              </div>
             {:else}
               <p class="muted tiny picker-empty">No hosts yet — add one with “New host”.</p>
             {/each}
@@ -1976,6 +2121,12 @@
           <button type="button" role="menuitem" title="Open another session for the same host" onclick={() => { closeTabMenu(); duplicateTab(menuTab); }}>
             <Icon name="copy" size={15} />
             Duplicate Session
+          </button>
+          {/if}
+          {#if menuTab.kind === 'ssh' || menuTab.kind === 'adhoc'}
+          <button type="button" role="menuitem" title="Browse files on this host over SFTP" onclick={() => { closeTabMenu(); openSftpFromTab(menuTab); }}>
+            <Icon name="folder" size={15} />
+            Files (SFTP)
           </button>
           {/if}
           {#if menuTab.kind === 'note'}
@@ -3198,6 +3349,19 @@
   }
   .picker-row:hover {
     background: var(--panel-hover);
+  }
+  .picker-sftp {
+    margin-left: auto;
+    flex: 0 0 auto;
+    width: 30px;
+    height: 30px;
+    border-radius: 7px;
+    opacity: 0;
+    transition: opacity 0.12s ease;
+  }
+  .picker-row:hover .picker-sftp,
+  .picker-row:focus-within .picker-sftp {
+    opacity: 1;
   }
   .picker-empty {
     margin: 8px;

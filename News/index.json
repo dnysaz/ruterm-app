@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generated_at": "2026-11-19T08:11:30.297Z",
+  "generated_at": "2026-11-19T09:56:36.851Z",
   "entries": [
     {
       "file": "2026-11-19-sync.md",
@@ -31,6 +31,12 @@
       "date": "2026-11-19",
       "title": "A native macOS look — flat, quiet, two themes",
       "summary": "The whole interface got a redesign: two themes (Dark and Light) in place of"
+    },
+    {
+      "file": "2026-11-19-editor-and-files.md",
+      "date": "2026-11-19",
+      "title": "A real code editor, image previews, and files that hide",
+      "summary": "The SFTP panel grew up: files open in Monaco, images open as images, and the"
     },
     {
       "file": "2026-11-19-backgrounds.md",

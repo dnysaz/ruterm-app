@@ -26,6 +26,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native-sync-persistent"] }
 portable-pty = "0.9.0"
 tauri-plugin-opener = "2.7.3"
+tauri-plugin-dialog = "2"
 
 # See https://tauri.app/concept/size/ for the release profile rationale.
 [profile.release]
