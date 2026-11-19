@@ -45,6 +45,20 @@ A Termius-class workflow, built in the open.
 - **Upload** via a native picker (multi-select) or by dropping files straight
   from Finder onto the list. **Download** with a native Save dialog. No
   settings, no sync of the remote listing: the panel is a live view.
+- **Open files in a real editor.** Text files load in Monaco (the VS Code
+  engine) with syntax highlighting for HTML, CSS, JS/TS, PHP, Python, Go, Rust,
+  JSON, YAML, SQL, shell and more — plus minimap, multi-cursor (Option-click or
+  ⌘D), bracket-pair guides, find & replace and folding. The editor follows the
+  app's Dark/Light theme and is loaded lazily, so startup is unaffected.
+- **Image preview.** PNG, JPEG, GIF, WebP, AVIF, BMP, ICO and SVG open as an
+  image in the tab (up to 12 MB) instead of the old binary placeholder.
+- **Hidden files, hidden by default.** An eye toggle in the toolbar reveals
+  dotfiles; the status bar shows how many are hidden, and a folder with only
+  hidden items offers a one-click reveal.
+- **Saves that survive picky servers.** Writes go through a temp file and an
+  atomic rename; when a server refuses to rename over an existing file, the
+  panel falls back to overwriting in place (preserving permission bits) instead
+  of failing.
 - Saved hosts use the vault credentials you already have. Quick-connect targets
   use your SSH agent — passwords are never stored, so password-only
   quick-connect SFTP is not offered.
@@ -263,6 +277,7 @@ One document, on disk and on the bridge (field-level ciphertext inside):
 | Tauri command layer | working on macOS |
 | Svelte 5 UI — unlock, host list/form, terminal, tabs, split panes, settings, notes | working |
 | SFTP file manager (browse, mkdir, rename, delete, upload/download, drag & drop from Finder) | working |
+| SFTP editor — Monaco highlighting, image preview, hidden-file toggle | working |
 | Session restore across reload & restart (tabs, panes, scrollback, quick-connect, notes) | working |
 | Backgrounds (bundled photos/patterns, custom upload, Frost & Terminal) | working |
 | Scrollback restore (local, never synced) | working |
