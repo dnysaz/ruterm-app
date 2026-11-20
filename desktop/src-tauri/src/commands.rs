@@ -576,6 +576,49 @@ pub async fn vault_create(
     Ok(sealed_payload(&vault, file.revision))
 }
 
+/// Last-resort recovery: discard the unreadable local vault and start over.
+/// The confirmation string is checked here too, not only in the UI.
+#[tauri::command]
+pub async fn vault_reset(
+    state: tauri::State<'_, AppState>,
+    passphrase: String,
+    confirmation: String,
+) -> Result<VaultPayload, String> {
+    if confirmation != "RESET" {
+        return Err("Type RESET to confirm the vault reset".into());
+    }
+    if passphrase.chars().count() < 8 {
+        return Err("Use at least 8 characters".into());
+    }
+    if state.key.read().await.is_some() {
+        return Err("Lock the vault before resetting it".into());
+    }
+
+    let kdf = KdfParams::new_default();
+    let key = derive_key(&passphrase, &kdf).map_err(|e| e.to_string())?;
+    let canary = secrets::seal_canary(&key, CANARY).map_err(|e| e.to_string())?;
+    let vault = Vault::default();
+    let mut file = VaultFile::new(&state.settings.device_id, Some(kdf.clone()), canary);
+    file.vault = secrets::seal_vault(&vault, &key, &secrets::kdf_epoch(Some(&kdf)))
+        .map_err(|e| e.to_string())?;
+    store::write_atomic(&state.paths.vault, &file)?;
+
+    // A stale saved key would keep pointing at the discarded vault.
+    keyring_delete(KEY_VAULT);
+    let mut settings = state.settings_rw.write().await;
+    settings.key_saved = false;
+    settings.synced_revision = 0;
+    settings.last_synced_at = None;
+    store::write_settings(&state.paths.settings, &settings)?;
+    drop(settings);
+
+    *state.key.write().await = Some(key);
+    *state.kdf.write().await = Some(kdf);
+    *state.vault.write().await = Some(vault.clone());
+    *state.revision.write().await = file.revision;
+    Ok(sealed_payload(&vault, file.revision))
+}
+
 #[tauri::command]
 pub async fn vault_unlock(
     state: tauri::State<'_, AppState>,
@@ -618,15 +661,20 @@ pub async fn vault_adopt_remote(
         return Err("Wrong passphrase".into());
     }
     let epoch = secrets::kdf_epoch(Some(&kdf));
-    let vault = secrets::open_vault(&doc.vault, &key, &epoch).map_err(|e| e.to_string())?;
+    let (vault, _) =
+        secrets::open_vault_with_context(&doc.vault, &key, &epoch).map_err(|e| e.to_string())?;
     // R-13: a remote vault is untrusted input too — apply the same structural
     // checks before it touches disk or memory.
     validate_vault(&vault)?;
 
-    let mut file = VaultFile::new(&state.settings.device_id, Some(kdf.clone()), doc.canary);
+    // Re-seal with the current field-bound AAD. An old bridge copy may still
+    // hold pre-hardening ciphertext; this migrates it on adoption.
+    let canary = secrets::seal_canary(&key, CANARY).map_err(|e| e.to_string())?;
+    let sealed_vault = secrets::seal_vault(&vault, &key, &epoch).map_err(|e| e.to_string())?;
+    let mut file = VaultFile::new(&state.settings.device_id, Some(kdf.clone()), canary);
     file.revision = revision;
     file.updated_at = Utc::now();
-    file.vault = doc.vault;
+    file.vault = sealed_vault;
     store::write_atomic(&state.paths.vault, &file)?;
 
     *state.key.write().await = Some(key);
@@ -675,7 +723,18 @@ async fn unlock_with_key(
         return Err("Wrong passphrase".into());
     }
     let epoch = secrets::kdf_epoch(file.kdf.as_ref());
-    let vault = secrets::open_vault(&file.vault, &key, &epoch).map_err(|e| e.to_string())?;
+    let (vault, legacy_vault) =
+        secrets::open_vault_with_context(&file.vault, &key, &epoch).map_err(|e| e.to_string())?;
+
+    // Vaults written before the AAD hardening kept the same `enc:v1:` prefix.
+    // The passphrase was never wrong — the AEAD context was. Re-seal the local
+    // copy once so future opens use the strict, field-bound context.
+    if legacy_vault || secrets::canary_is_legacy(&key, &file.canary, CANARY) {
+        let mut migrated = file.clone();
+        migrated.canary = secrets::seal_canary(&key, CANARY).map_err(|e| e.to_string())?;
+        migrated.vault = secrets::seal_vault(&vault, &key, &epoch).map_err(|e| e.to_string())?;
+        store::write_atomic(&state.paths.vault, &migrated)?;
+    }
 
     *state.key.write().await = Some(key);
     *state.kdf.write().await = file.kdf.clone();
@@ -1011,7 +1070,7 @@ pub async fn vault_sync(state: tauri::State<'_, AppState>) -> Result<VaultPayloa
         )
         .await
         .map_err(|e| e.to_string())?;
-    let merged = secrets::open_vault(&outcome.vault, &key, &epoch).map_err(|e| {
+    let (merged, _) = secrets::open_vault_with_context(&outcome.vault, &key, &epoch).map_err(|e| {
         format!(
             "the synced vault cannot be opened with this passphrase ({e}). \
              Every device must use the same vault passphrase."
@@ -1022,7 +1081,12 @@ pub async fn vault_sync(state: tauri::State<'_, AppState>) -> Result<VaultPayloa
 
     file.revision = outcome.revision;
     file.updated_at = Utc::now();
-    file.vault = outcome.vault;
+    // Persist the merged copy under the current AAD, even when the remote copy
+    // came from a pre-hardening build.
+    file.vault = secrets::seal_vault(&merged, &key, &epoch).map_err(|e| e.to_string())?;
+    if secrets::canary_is_legacy(&key, &file.canary, CANARY) {
+        file.canary = secrets::seal_canary(&key, CANARY).map_err(|e| e.to_string())?;
+    }
     if file.kdf.is_none() {
         file.kdf = outcome.kdf;
     }

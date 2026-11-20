@@ -158,6 +158,47 @@ export async function signOut() {
   }
 }
 
+/** Sign out, then reopen Google's account chooser for a different identity. */
+export async function changeAccount() {
+  app.busy = true;
+  app.error = '';
+  try {
+    await api.authSignOut();
+    await api.vaultLock().catch(() => {});
+    clearAllSnapshots();
+    app.vault = null;
+    app.status = await api.appStatus();
+    app.screen = 'welcome';
+    const account = await api.authSignIn();
+    app.status = await api.appStatus();
+    app.screen = app.status.has_vault ? 'unlock' : 'setup';
+    notify(`Signed in as ${account.email}`);
+  } catch (error) {
+    fail(error);
+  } finally {
+    app.busy = false;
+  }
+}
+
+/** Destructive recovery when the vault genuinely cannot be opened. */
+export async function resetVault(passphrase: string, confirmation: string) {
+  app.busy = true;
+  app.error = '';
+  try {
+    const payload = await api.vaultReset(passphrase, confirmation);
+    app.vault = payload.vault;
+    app.revision = payload.revision;
+    app.canAutoUnlock = false;
+    app.status = await api.appStatus();
+    app.screen = 'vault';
+    notify('Vault reset — start by adding your hosts again');
+  } catch (error) {
+    fail(error);
+  } finally {
+    app.busy = false;
+  }
+}
+
 export async function createVault(passphrase: string) {
   app.busy = true;
   app.error = '';

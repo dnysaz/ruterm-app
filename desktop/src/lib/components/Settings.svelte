@@ -1,10 +1,11 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, errorText } from '#lib/api';
-  import { app, fail, lock, notify, setRememberKey, signIn, signOut, syncNow } from '#lib/state.svelte';
-  import { applyTheme, ui, type Theme } from '#lib/ui.svelte';
+  import { app, changeAccount, fail, lock, notify, setRememberKey, signIn, signOut, syncNow } from '#lib/state.svelte';
+  import { applyTheme, setHomeQuickConnect, ui, type Theme } from '#lib/ui.svelte';
   import { isRestoreEnabled, setRestoreEnabled } from '#lib/scrollback';
   import Icon from './Icon.svelte';
+  import GoogleIcon from './GoogleIcon.svelte';
   import BackgroundSettings from './BackgroundSettings.svelte';
   import { newsState } from '#lib/news.svelte';
 
@@ -104,7 +105,10 @@
                 <div class="strong">{account.name ?? account.email}</div>
                 <small>{account.email}</small>
               </div>
-              <button class="btn sm" onclick={() => void signOut()}>Sign out</button>
+              <div class="account-actions">
+                <button class="btn sm" onclick={() => void changeAccount()}>Change account</button>
+                <button class="btn sm" onclick={() => void signOut()}>Sign out</button>
+              </div>
             </div>
             {#if account.sub}
               <div class="row kv">
@@ -118,7 +122,10 @@
                 <div class="strong">Not signed in</div>
                 <small>Sign in once to start syncing this vault between your devices.</small>
               </div>
-              <button class="btn sm primary" onclick={() => void signIn()}>Sign in with Google</button>
+              <button class="btn sm primary google" onclick={() => void signIn()}>
+                <GoogleIcon size={16} />
+                Continue with Google
+              </button>
             </div>
           {/if}
 
@@ -189,6 +196,19 @@
               checked={ui.theme === 'dark'}
               onchange={event => applyTheme(event.currentTarget.checked ? 'dark' : 'light')}
               aria-label="Dark theme"
+            />
+          </label>
+          <label class="row switch-row">
+            <div class="cell">
+              <div class="strong">Quick connect on home screen</div>
+              <small>Hide it to show a large clock with the RuTerm wordmark instead.</small>
+            </div>
+            <input
+              type="checkbox"
+              class="switch"
+              checked={ui.homeQuickConnect}
+              onchange={event => setHomeQuickConnect(event.currentTarget.checked)}
+              aria-label="Quick connect on home screen"
             />
           </label>
         </div>
@@ -440,6 +460,16 @@
     display: block;
     object-fit: cover;
     border-radius: 50%;
+  }
+  .account-actions {
+    display: flex;
+    gap: 6px;
+    flex: 0 0 auto;
+  }
+  .google {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
   }
   .sync-badge {
     flex: 0 0 auto;

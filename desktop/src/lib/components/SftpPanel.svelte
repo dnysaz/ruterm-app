@@ -335,6 +335,14 @@
   });
 
   // ------------------------------------------------------------- format
+  /** Short extension badge for file rows; folders use a yellow icon instead. */
+  function fileExt(name: string): string {
+    const base = name.slice(name.lastIndexOf('/') + 1);
+    const dot = base.lastIndexOf('.');
+    if (dot <= 0) return 'FILE';
+    return base.slice(dot + 1).slice(0, 4).toUpperCase() || 'FILE';
+  }
+
   function fmtSize(size: number | null, isDir: boolean): string {
     if (isDir) return '—';
     if (size === null || size === undefined) return '—';
@@ -511,7 +519,13 @@
             title={entry.path}
           >
             <span class="col-name">
-              <Icon name={entry.is_dir ? 'folder' : 'file'} size={17} stroke={1.8} />
+              {#if entry.is_dir}
+                <span class="entry-icon folder" aria-hidden="true">
+                  <Icon name="folder" size={24} stroke={1.8} fill="#ffd60a" />
+                </span>
+              {:else}
+                <span class="entry-icon ext mono" aria-hidden="true">{fileExt(entry.name)}</span>
+              {/if}
               <span class="name">{entry.name}</span>
               {#if entry.is_symlink}<span class="symlink tiny">→</span>{/if}
             </span>
@@ -806,6 +820,29 @@
   }
   .row:not(.dir) .col-name {
     color: var(--text-tertiary);
+  }
+  .entry-icon {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+  }
+  .entry-icon.folder {
+    color: #ffd60a;
+  }
+  .entry-icon.ext {
+    width: 28px;
+    height: 24px;
+    border: 1px solid rgba(10, 132, 255, 0.45);
+    border-radius: 6px;
+    background: var(--accent-dim);
+    color: var(--accent);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    line-height: 1;
   }
   .col-name .name {
     color: var(--text);

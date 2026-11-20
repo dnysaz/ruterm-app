@@ -42,7 +42,8 @@
     name,
     size = 16,
     stroke = 1.7,
-  }: { name: Name; size?: number; stroke?: number } = $props();
+    fill = 'none',
+  }: { name: Name; size?: number; stroke?: number; fill?: string } = $props();
 
   const paths: Record<string, string> = {
     sync: 'M3 12a9 9 0 0 1 15-6.7L21 8M21 12a9 9 0 0 1-15 6.7L3 16M21 3v5h-5M3 21v-5h5',
@@ -89,7 +90,7 @@
   width={size}
   height={size}
   viewBox="0 0 24 24"
-  fill="none"
+  {fill}
   stroke="currentColor"
   stroke-width={stroke}
   stroke-linecap="round"

@@ -168,7 +168,7 @@ pub async fn authorize_loopback(
          code_challenge={}&\
          code_challenge_method=S256&\
          access_type=offline&\
-         prompt=consent&\
+         prompt=select_account%20consent&\
          include_granted_scopes=true&\
          state={}",
         urlencode(client_id),

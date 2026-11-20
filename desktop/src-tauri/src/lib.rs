@@ -69,6 +69,7 @@ pub fn run() {
             commands::auth_restore,
             commands::auth_sign_out,
             commands::vault_create,
+            commands::vault_reset,
             commands::vault_unlock,
             commands::vault_adopt_remote,
             commands::vault_try_auto_unlock,

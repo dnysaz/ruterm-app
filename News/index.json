@@ -1,7 +1,13 @@
 {
   "version": 1,
-  "generated_at": "2026-11-20T06:43:15.891Z",
+  "generated_at": "2026-11-20T07:57:56.416Z",
   "entries": [
+    {
+      "file": "2026-11-20-vault-recovery-and-workspace.md",
+      "date": "2026-11-20",
+      "title": "Your old key still works — and a calmer home screen",
+      "summary": "Older vaults now open with the correct encryption context, so your existing key is accepted again and re-sealed automatically."
+    },
     {
       "file": "2026-11-20-sftp-streaming.md",
       "date": "2026-11-20",

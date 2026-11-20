@@ -31,6 +31,50 @@ pub fn canary_aad() -> Vec<u8> {
     b"rterm-canary-v1\x1fglobal".to_vec()
 }
 
+/// Vaults written before the F-29/F-40 hardening used an empty AEAD context.
+/// The wire format stayed `enc:v1:`, so we must accept both contexts on read
+/// and re-seal on the next write. New writes never use this.
+const LEGACY_AAD: &[u8] = b"";
+
+fn parse_sealed(value: &str) -> Result<SealedVault, CryptoError> {
+    let rest = value.strip_prefix(PREFIX).ok_or(CryptoError::Decrypt)?;
+    let (nonce, ciphertext) = rest.split_once(':').ok_or(CryptoError::Decrypt)?;
+    if ciphertext.contains(':') {
+        return Err(CryptoError::Decrypt);
+    }
+    Ok(SealedVault {
+        v: 1,
+        kdf: None,
+        nonce_b64: nonce.to_string(),
+        ciphertext_b64: ciphertext.to_string(),
+    })
+}
+
+/// Open a sealed value, accepting the legacy empty-AAD ciphertext as a
+/// fallback. Returns `true` in the second element when the legacy context was
+/// needed, so callers can migrate the stored copy.
+fn open_str_with_mode(
+    key: &SecretKey,
+    value: &str,
+    aad: &[u8],
+) -> Result<(String, bool), CryptoError> {
+    if value.is_empty() {
+        return Ok((String::new(), false));
+    }
+    let sealed = parse_sealed(value)?;
+    match open_bytes(&sealed, key, aad) {
+        Ok(bytes) => String::from_utf8(bytes)
+            .map(|text| (text, false))
+            .map_err(|_| CryptoError::Decrypt),
+        Err(current_err) => match open_bytes(&sealed, key, LEGACY_AAD) {
+            Ok(bytes) => String::from_utf8(bytes)
+                .map(|text| (text, true))
+                .map_err(|_| CryptoError::Decrypt),
+            Err(_) => Err(current_err),
+        },
+    }
+}
+
 /// Seals the known canary string with the vault key.
 pub fn seal_canary(key: &SecretKey, value: &str) -> Result<String, CryptoError> {
     seal_str(key, value, &canary_aad())
@@ -71,8 +115,8 @@ pub fn seal_str(
     ))
 }
 
-/// Opens a sealed secret. Plaintext values are rejected (except the empty
-/// string, which means "no secret configured").
+/// Opens a sealed secret using the current context only. Plaintext values are
+/// rejected (except the empty string, which means "no secret configured").
 pub fn open_str(
     key: &SecretKey,
     value: &str,
@@ -81,28 +125,33 @@ pub fn open_str(
     if value.is_empty() {
         return Ok(String::new());
     }
-    let rest = value.strip_prefix(PREFIX).ok_or(CryptoError::Decrypt)?;
-    let (nonce, ciphertext) = rest.split_once(':').ok_or(CryptoError::Decrypt)?;
-    if ciphertext.contains(':') {
-        return Err(CryptoError::Decrypt);
-    }
-    let sealed = SealedVault {
-        v: 1,
-        kdf: None,
-        nonce_b64: nonce.to_string(),
-        ciphertext_b64: ciphertext.to_string(),
-    };
+    let sealed = parse_sealed(value)?;
     let bytes = open_bytes(&sealed, key, aad)?;
     String::from_utf8(bytes).map_err(|_| CryptoError::Decrypt)
 }
 
-/// Strict canary verification: rejects plaintext, wrong key and wrong context,
-/// and compares the plaintext in constant time.
-pub fn verify_canary(key: &SecretKey, sealed: &str, expected: &str) -> bool {
-    match open_str(key, sealed, &canary_aad()) {
-        Ok(value) => constant_time_eq(expected, &value),
-        Err(_) => false,
+/// Verify the canary under either the current or the legacy AAD.
+/// `Some(true)` = current context, `Some(false)` = legacy context,
+/// `None` = wrong key / plaintext / corrupt value.
+fn canary_context(key: &SecretKey, sealed: &str, expected: &str) -> Option<bool> {
+    let (value, legacy) = open_str_with_mode(key, sealed, &canary_aad()).ok()?;
+    if constant_time_eq(expected, &value) {
+        Some(!legacy)
+    } else {
+        None
     }
+}
+
+/// Accepts both current and pre-hardening canaries so a correct passphrase is
+/// never reported as "Wrong passphrase" just because of the AAD change.
+pub fn verify_canary(key: &SecretKey, sealed: &str, expected: &str) -> bool {
+    canary_context(key, sealed, expected).is_some()
+}
+
+/// True when the canary on disk still uses the legacy empty AAD and should be
+/// re-sealed during the next unlock.
+pub fn canary_is_legacy(key: &SecretKey, sealed: &str, expected: &str) -> bool {
+    matches!(canary_context(key, sealed, expected), Some(false))
 }
 
 /// Replaces every credential in a plaintext vault with its sealed form.
@@ -149,25 +198,60 @@ pub fn seal_vault(vault: &Vault, key: &SecretKey, epoch: &str) -> Result<Vault, 
     Ok(out)
 }
 
-/// Inverse of [`seal_vault`]: plaintext secrets back in memory.
-pub fn open_vault(vault: &Vault, key: &SecretKey, epoch: &str) -> Result<Vault, CryptoError> {
+fn open_field(
+    key: &SecretKey,
+    value: &str,
+    aad: &[u8],
+    allow_legacy: bool,
+    used_legacy: &mut bool,
+) -> Result<String, CryptoError> {
+    if allow_legacy {
+        let (text, legacy) = open_str_with_mode(key, value, aad)?;
+        *used_legacy |= legacy;
+        Ok(text)
+    } else {
+        open_str(key, value, aad)
+    }
+}
+
+fn open_vault_inner(
+    vault: &Vault,
+    key: &SecretKey,
+    epoch: &str,
+    allow_legacy: bool,
+) -> Result<(Vault, bool), CryptoError> {
     let mut out = vault.clone();
+    let mut used_legacy = false;
     for host in &mut out.hosts {
         let entity = host.id.to_string();
         host.auth = match &host.auth {
             AuthMethod::Password { password } => AuthMethod::Password {
-                password: open_str(key, password, &field_aad(epoch, &entity, "password"))?,
+                password: open_field(
+                    key,
+                    password,
+                    &field_aad(epoch, &entity, "password"),
+                    allow_legacy,
+                    &mut used_legacy,
+                )?,
             },
             AuthMethod::KeyboardInteractive { password } => AuthMethod::KeyboardInteractive {
-                password: open_str(key, password, &field_aad(epoch, &entity, "password"))?,
+                password: open_field(
+                    key,
+                    password,
+                    &field_aad(epoch, &entity, "password"),
+                    allow_legacy,
+                    &mut used_legacy,
+                )?,
             },
             AuthMethod::Key { identity_id, passphrase } => AuthMethod::Key {
                 identity_id: *identity_id,
                 passphrase: match passphrase {
-                    Some(value) => Some(open_str(
+                    Some(value) => Some(open_field(
                         key,
                         value,
                         &field_aad(epoch, &entity, "passphrase"),
+                        allow_legacy,
+                    &mut used_legacy,
                     )?),
                     None => None,
                 },
@@ -177,20 +261,39 @@ pub fn open_vault(vault: &Vault, key: &SecretKey, epoch: &str) -> Result<Vault, 
     }
     for identity in &mut out.identities {
         let entity = identity.id.to_string();
-        identity.private_key = open_str(
+        identity.private_key = open_field(
             key,
             &identity.private_key,
             &field_aad(epoch, &entity, "private_key"),
+            allow_legacy,
+                    &mut used_legacy,
         )?;
         if let Some(passphrase) = &identity.passphrase {
-            identity.passphrase = Some(open_str(
+            identity.passphrase = Some(open_field(
                 key,
                 passphrase,
                 &field_aad(epoch, &entity, "passphrase"),
+                allow_legacy,
+                    &mut used_legacy,
             )?);
         }
     }
-    Ok(out)
+    Ok((out, used_legacy))
+}
+
+/// Inverse of [`seal_vault`] with a compatibility fallback. The boolean
+/// reports whether at least one field needed the legacy empty AAD.
+pub fn open_vault_with_context(
+    vault: &Vault,
+    key: &SecretKey,
+    epoch: &str,
+) -> Result<(Vault, bool), CryptoError> {
+    open_vault_inner(vault, key, epoch, true)
+}
+
+/// Strict current-context open, for callers that only need the plaintext.
+pub fn open_vault(vault: &Vault, key: &SecretKey, epoch: &str) -> Result<Vault, CryptoError> {
+    open_vault_inner(vault, key, epoch, false).map(|(vault, _)| vault)
 }
 
 #[cfg(test)]
@@ -265,5 +368,51 @@ mod tests {
         let mut sealed = seal_vault(&sample(), &key, "epoch-1").unwrap();
         sealed.hosts[0].auth = AuthMethod::Password { password: "plain".into() };
         assert!(open_vault(&sealed, &key, "epoch-1").is_err());
+    }
+
+    fn legacy_seal(key: &SecretKey, value: &str) -> String {
+        let sealed = seal_bytes(value.as_bytes(), key, None, LEGACY_AAD).unwrap();
+        format!("{PREFIX}{}:{}", sealed.nonce_b64, sealed.ciphertext_b64)
+    }
+
+    fn legacy_sealed_vault(key: &SecretKey) -> Vault {
+        let mut vault = sample();
+        vault.hosts[0].auth = AuthMethod::Password {
+            password: legacy_seal(key, "s3cret"),
+        };
+        vault.identities[0].private_key = legacy_seal(key, "PRIVATE");
+        vault.identities[0].passphrase = Some(legacy_seal(key, "pass"));
+        vault
+    }
+
+    #[test]
+    fn legacy_empty_aad_vault_still_opens_and_is_reported_for_migration() {
+        let key = SecretKey::generate();
+        let canary = legacy_seal(&key, "rterm-canary-v1");
+        let sealed = legacy_sealed_vault(&key);
+
+        assert!(verify_canary(&key, &canary, "rterm-canary-v1"));
+        assert!(canary_is_legacy(&key, &canary, "rterm-canary-v1"));
+
+        // Strict context must still reject the old ciphertext.
+        assert!(open_vault(&sealed, &key, "epoch-1").is_err());
+
+        let (opened, legacy) = open_vault_with_context(&sealed, &key, "epoch-1").unwrap();
+        assert!(legacy);
+        assert!(matches!(
+            &opened.hosts[0].auth,
+            AuthMethod::Password { password } if password == "s3cret"
+        ));
+        assert_eq!(opened.identities[0].private_key, "PRIVATE");
+        assert_eq!(opened.identities[0].passphrase.as_deref(), Some("pass"));
+
+        // Re-sealing the opened plaintext uses the current context.
+        let migrated = seal_vault(&opened, &key, "epoch-1").unwrap();
+        let (_, still_legacy) = open_vault_with_context(&migrated, &key, "epoch-1").unwrap();
+        assert!(!still_legacy);
+
+        let wrong = SecretKey::generate();
+        assert!(!verify_canary(&wrong, &canary, "rterm-canary-v1"));
+        assert!(open_vault_with_context(&sealed, &wrong, "epoch-1").is_err());
     }
 }

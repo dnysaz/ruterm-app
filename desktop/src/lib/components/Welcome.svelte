@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { app, signIn } from '#lib/state.svelte';
+  import { app, changeAccount, signIn } from '#lib/state.svelte';
+  import GoogleIcon from './GoogleIcon.svelte';
 
   function continueLocal() {
     app.screen = app.status?.has_vault ? 'unlock' : 'setup';
@@ -37,21 +38,32 @@
     <section class="panel glass">
       {#if account}
         <div class="account">
-          <span class="avatar">{account.email.slice(0, 1).toUpperCase()}</span>
+          {#if account.picture}
+            <img class="avatar avatar-img" src={account.picture} alt="" referrerpolicy="no-referrer" />
+          {:else}
+            <span class="avatar">{account.email.slice(0, 1).toUpperCase()}</span>
+          {/if}
           <div>
             <div class="email">{account.email}</div>
             <div class="muted small">Google account connected</div>
           </div>
         </div>
         <button class="btn primary lg full" onclick={continueLocal}>Continue</button>
+        <div class="account-line">
+          Not {account.email}?
+          <button class="link" type="button" disabled={app.busy} onclick={() => void changeAccount()}>
+            Change account
+          </button>
+        </div>
       {:else}
         <h2>Get started</h2>
         <p class="muted body">
           Sign in to sync your vault across devices, or work locally and add an
           account later.
         </p>
-        <button class="btn primary lg full" disabled={app.busy} onclick={() => void signIn()}>
-          {app.busy ? 'Waiting for browser…' : 'Sign in with Google'}
+        <button class="btn primary lg full google" disabled={app.busy} onclick={() => void signIn()}>
+          <GoogleIcon size={18} />
+          {app.busy ? 'Waiting for browser…' : 'Continue with Google'}
         </button>
         <button class="btn lg full" onclick={continueLocal}>Continue without an account</button>
       {/if}
@@ -187,6 +199,45 @@
   }
   .small {
     font-size: 12px;
+  }
+  .avatar-img {
+    object-fit: cover;
+  }
+  .google {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    background: #fff;
+    border-color: rgba(10, 132, 255, 0.55);
+    color: #1f1f1f;
+  }
+  .google:hover:not(:disabled) {
+    background: #f8f9fa;
+  }
+  .account-line {
+    margin-top: 12px;
+    text-align: center;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-tertiary);
+  }
+  .link {
+    background: none;
+    border: 0;
+    padding: 0;
+    color: var(--accent);
+    font-size: 12px;
+    cursor: pointer;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .link:hover {
+    color: var(--accent-hover);
+  }
+  .link:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
 
   @media (max-width: 880px) {

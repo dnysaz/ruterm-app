@@ -3,11 +3,15 @@
   import {
     adoptRemote,
     app,
+    changeAccount,
     createVault,
+    resetVault,
+    setRememberKey,
     signIn,
     unlock,
     unlockWithSavedKey,
   } from '#lib/state.svelte';
+  import GoogleIcon from './GoogleIcon.svelte';
 
   const isSetup = $derived(!app.status?.has_vault);
   const signedIn = $derived(app.status?.signed_in === true);
@@ -17,6 +21,11 @@
   let passphrase = $state('');
   let confirm = $state('');
   let localError = $state('');
+  let showRecovery = $state(false);
+  let resetPassphrase = $state('');
+  let resetConfirm = $state('');
+  let resetToken = $state('');
+  let resetError = $state('');
 
   const title = $derived(
     adopting ? 'Retrieve from the sync bridge' : isSetup ? 'Create your vault' : 'Unlock your vault',
@@ -52,6 +61,27 @@
     passphrase = '';
     confirm = '';
     localError = '';
+  }
+
+  async function confirmReset() {
+    resetError = '';
+    if (resetPassphrase.length < 8) {
+      resetError = 'Use at least 8 characters.';
+      return;
+    }
+    if (resetPassphrase !== resetConfirm) {
+      resetError = 'The passphrases do not match.';
+      return;
+    }
+    if (resetToken !== 'RESET') {
+      resetError = 'Type RESET exactly to confirm.';
+      return;
+    }
+    await resetVault(resetPassphrase, resetToken);
+    resetPassphrase = '';
+    resetConfirm = '';
+    resetToken = '';
+    showRecovery = false;
   }
 </script>
 
@@ -105,6 +135,61 @@
       <p class="error">{localError}</p>
     {/if}
 
+    {#if !isSetup && !adopting}
+      <div class="recovery">
+        <button class="link" type="button" onclick={() => (showRecovery = !showRecovery)}>
+          {showRecovery ? 'Hide recovery options' : "Can't unlock your vault?"}
+        </button>
+        {#if showRecovery}
+          <div class="recovery-box">
+            <p class="muted tiny">
+              Your key may still be correct — older vaults are now read and
+              re-sealed automatically. If a saved key is stale, forget it first.
+              Resetting is the last resort: it deletes every host, identity and
+              note on this device.
+            </p>
+            {#if app.canAutoUnlock}
+              <button
+                class="btn sm full"
+                type="button"
+                disabled={app.busy}
+                onclick={() => void setRememberKey(false)}
+              >
+                Forget saved key
+              </button>
+            {/if}
+            <div class="field">
+              <label for="reset-pass">New passphrase</label>
+              <input id="reset-pass" type="password" autocomplete="new-password" bind:value={resetPassphrase} />
+            </div>
+            <div class="field">
+              <label for="reset-confirm">Repeat new passphrase</label>
+              <input id="reset-confirm" type="password" autocomplete="new-password" bind:value={resetConfirm} />
+            </div>
+            <div class="field">
+              <label for="reset-token">Type RESET to erase the old vault</label>
+              <input id="reset-token" type="text" autocomplete="off" bind:value={resetToken} placeholder="RESET" />
+            </div>
+            {#if resetError}
+              <p class="error">{resetError}</p>
+            {/if}
+            <button
+              class="btn danger sm full"
+              type="button"
+              disabled={app.busy}
+              onclick={() => void confirmReset()}
+            >
+              Erase data and create a new vault
+            </button>
+            <p class="muted tiny">
+              If Google sync is on, sign out first — otherwise the old synced
+              vault can come back on the next sync.
+            </p>
+          </div>
+        {/if}
+      </div>
+    {/if}
+
     <button class="btn primary lg full" type="submit" disabled={app.busy}>
       {#if app.busy}
         Working…
@@ -134,10 +219,16 @@
           Already have a vault on the bridge? Retrieve it
         </button>
       {:else if signedIn}
-        <span class="muted tiny">{accountEmail}</span>
+        <div class="account-line">
+          Not {accountEmail}?
+          <button class="link" type="button" disabled={app.busy} onclick={() => void changeAccount()}>
+            Change account
+          </button>
+        </div>
       {:else}
-        <button class="link" type="button" onclick={() => void signIn()}>
-          Sign in with Google to sync
+        <button class="link google-link" type="button" disabled={app.busy} onclick={() => void signIn()}>
+          <GoogleIcon size={16} />
+          Continue with Google to sync
         </button>
       {/if}
     </div>
@@ -220,5 +311,41 @@
     flex: 1;
     height: 1px;
     background: var(--line);
+  }
+  .recovery {
+    margin: 16px 0 4px;
+    text-align: center;
+  }
+  .recovery-box {
+    margin-top: 12px;
+    padding: 14px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+    text-align: left;
+  }
+  .recovery-box p {
+    margin: 0 0 12px;
+    line-height: 1.6;
+  }
+  .recovery-box .field {
+    margin-bottom: 10px;
+  }
+  .recovery-box .field label {
+    font-size: 12px;
+  }
+  .recovery-box .field input {
+    width: 100%;
+    box-sizing: border-box;
+  }
+  .account-line {
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-tertiary);
+  }
+  .google-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
   }
 </style>

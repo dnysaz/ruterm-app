@@ -241,6 +241,9 @@ export const api = {
   authSignOut: () => invoke<void>('auth_sign_out'),
 
   vaultCreate: (passphrase: string) => invoke<VaultPayload>('vault_create', { passphrase }),
+  /** Destructive last resort: replaces the local vault with an empty one. */
+  vaultReset: (passphrase: string, confirmation: string) =>
+    invoke<VaultPayload>('vault_reset', { passphrase, confirmation }),
   vaultUnlock: (passphrase: string) => invoke<VaultPayload>('vault_unlock', { passphrase }),
   vaultAdoptRemote: (passphrase: string) =>
     invoke<VaultPayload>('vault_adopt_remote', { passphrase }),

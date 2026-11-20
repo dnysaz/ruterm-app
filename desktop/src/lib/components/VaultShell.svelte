@@ -1,10 +1,21 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import { api, newHost, type AiAgent, type Host, type Note, type SessionStatus } from '#lib/api';
+  import { onDestroy, onMount } from 'svelte';
+  import {
+    api,
+    newHost,
+    type AiAgent,
+    type Host,
+    type Note,
+    type SessionStatus,
+    type SftpEntry,
+  } from '#lib/api';
   import { background, backgroundStyle, frostStyle } from '#lib/background.svelte';
+  import { imageMimeForPath } from '#lib/images';
+  import { ui } from '#lib/ui.svelte';
   import {
     app,
     applyVaultPayload,
+    changeAccount,
     deleteHost,
     deleteNote,
     fail,
@@ -22,6 +33,7 @@
   import Icon from './Icon.svelte';
   import SftpPanel from './SftpPanel.svelte';
   import SftpFileView from './SftpFileView.svelte';
+  import ImagePreview from './ImagePreview.svelte';
   import { removeSnapshot } from '#lib/scrollback';
   import Settings from './Settings.svelte';
   import Terminal from './Terminal.svelte';
@@ -126,6 +138,8 @@
     return menu ? (tabs.find(t => t.id === menu.tabId) ?? null) : null;
   });
   let appMenu = $state<{ x: number; y: number } | null>(null);
+  /** Image files open in a side preview instead of another tab. */
+  let imagePreview = $state<{ sftpId: string; entry: SftpEntry } | null>(null);
 
   // ---------------------------------------------------------- persistence
   const TABS_KEY = 'rterm.tabs.v1';
@@ -399,8 +413,6 @@
   const activeHostId = $derived(activeTab?.hostId ?? null);
   const activeNoteId = $derived(activeTab?.kind === 'note' ? activeTab.hostId : null);
   const tabById = $derived(new Map(tabs.map(t => [t.id, t] as const)));
-  /** The About pill row only exists on the home tab — raise the AI dock above it then. */
-  const homeVisible = $derived(panes.some(p => p.active === HOME_ID));
   // Recently opened hosts for the session picker (most recent first).
   const RECENT_HOSTS_KEY = 'rterm.recent.hosts';
 
@@ -516,8 +528,13 @@
     if (host) openSftpHost(host);
   }
 
-  /** Opens a remote file (read-only viewer; edit on demand) in a new tab. */
-  function openSftpFile(parent: Tab, entry: { name: string; path: string }) {
+  /** Text files keep opening in a tab; images open in the right-hand preview. */
+  function openSftpFile(parent: Tab, entry: SftpEntry) {
+    if (imageMimeForPath(entry.path)) {
+      imagePreview = { sftpId: parent.id, entry };
+      return;
+    }
+
     const filePath = entry.path;
     const existing = tabs.find(t => t.kind === 'sftpfile' && t.filePath === filePath);
     if (existing) {
@@ -690,6 +707,17 @@
   let quickError = $state('');
   let allowAgent = $state(false);
 
+  let now = $state(new Date());
+  let clockTimer: ReturnType<typeof setInterval> | null = null;
+  const pad = (value: number) => String(value).padStart(2, '0');
+  const clockText = $derived(
+    `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`,
+  );
+
+  onDestroy(() => {
+    if (clockTimer) clearInterval(clockTimer);
+  });
+
   const QUICK_RE = /^\s*(?:ssh[ \t]+)?([A-Za-z0-9._-]+)@([A-Za-z0-9._-]+)(?::([0-9]{1,5}))?\s*$/;
 
   const quickParsed = $derived.by(() => {
@@ -716,7 +744,7 @@
     // per-connection opt-in so injected script cannot silently turn the agent
     // into a signing oracle for an attacker-controlled host.
     if (!allowAgent) {
-      quickError = 'Check “Allow SSH agent” to connect to a new host.';
+      quickError = 'Tick the SSH agent checkbox to connect to a new host.';
       return;
     }
     quickError = '';
@@ -1319,6 +1347,7 @@
       for (const t of tabs) {
         if (t.kind === 'sftpfile' && t.sftpId === id) doomed.add(t.id);
       }
+      if (imagePreview?.sftpId === id) imagePreview = null;
     }
     for (const tabId of doomed) removeSnapshot(tabId);
     tabs = tabs.filter(t => !doomed.has(t.id));
@@ -1334,6 +1363,8 @@
   }
 
   onMount(() => {
+    clockTimer = setInterval(() => (now = new Date()), 1000);
+
     // Show only the AI agents actually installed on this machine.
     void api.aiAgentsDetect().then(agents => (aiAgents = agents)).catch(() => (aiAgents = []));
 
@@ -1609,6 +1640,28 @@
       {/if}
     </div>
 
+    {#if aiAgents.length > 0}
+      <div class="side-ai" role="toolbar" aria-label="AI Agent ( Available on this device )">
+        {#if !collapsed}
+          <div class="side-ai-label">AI Agent ( Available on this device )</div>
+        {/if}
+        {#each aiAgents as agent (agent.id)}
+          <button
+            class="side-ai-btn"
+            class:launching={isAgentLaunching(agent)}
+            type="button"
+            title={isAgentLaunching(agent) ? `Launching ${agent.label}…` : `${agent.label} — opens in ~/Desktop`}
+            aria-label="Open {agent.label} in ~/Desktop"
+            aria-busy={isAgentLaunching(agent)}
+            onclick={() => openAgent(agent)}
+          >
+            <AiAgentIcon id={agent.id} size={collapsed ? 20 : 18} />
+            {#if !collapsed}<span>{agent.label}</span>{/if}
+          </button>
+        {/each}
+      </div>
+    {/if}
+
     <footer>
       {#if collapsed}
         <button
@@ -1666,6 +1719,17 @@
           {/if}
           <span class="who" title={accountName}>{accountName}</span>
           <span class="spacer"></span>
+          {#if account}
+            <button
+              class="icon-btn"
+              title="Change account"
+              aria-label="Change account"
+              disabled={app.busy}
+              onclick={() => void changeAccount()}
+            >
+              <Icon name="refresh" size={15} stroke={2.3} />
+            </button>
+          {/if}
           <button
             class="icon-btn"
             title="Sync now"
@@ -1684,6 +1748,7 @@
   </aside>
 
   <main>
+    <div class="workspace-wrap" class:with-preview={imagePreview !== null}>
       <div class="workspace axis-{splitAxis}" class:split={panes.length === 2}>
         {#each panes as pane, i (pane.id)}
           {#if i > 0}
@@ -1802,7 +1867,8 @@
                   <div class="pane" class:hidden={pane.active !== id}>
                     {#if tab.kind === 'home'}
                       <div class="empty-main home-panel">
-        <div class="hero" class:frosted={background.mode === 'image'} style={frostStyle()}>
+        <div class="hero" class:frosted={background.mode === 'image'} class:clock={!ui.homeQuickConnect} style={frostStyle()}>
+        {#if ui.homeQuickConnect}
           <div class="eyebrow"><span class="hero-badge">R</span>RUTERM · SSH CLIENT</div>
           <h1>Connect in one line.</h1>
           <p class="lede">
@@ -1829,9 +1895,14 @@
                 <Icon name="chevron-right" size={16} />
               </button>
             </div>
-            <label class="qc-agent">
-              <input type="checkbox" bind:checked={allowAgent} />
-              <span>Allow this host to use my SSH agent <span class="muted">(it can request signatures)</span></span>
+            <label class="qc-agent" for="qc-agent">
+              <span class="qc-check" class:checked={allowAgent}>
+                <input id="qc-agent" type="checkbox" bind:checked={allowAgent} />
+              </span>
+              <span class="qc-agent-text">
+                <span>Allow this host to use my SSH agent</span>
+                <span class="muted tiny">It can request signatures from your keys.</span>
+              </span>
             </label>
             <div class="qc-foot">
               {#if quickError}
@@ -1863,6 +1934,12 @@
               {/if}
             </button>
           </div>
+        {:else}
+          <div class="clock-view" role="timer" aria-label="Current time">
+            <div class="digital-clock mono">{clockText}</div>
+            <div class="clock-brand">RuTerm <span>|</span> SSH Client</div>
+          </div>
+        {/if}
         </div>
 
         <nav class="empty-links" aria-label="About RuTerm">
@@ -1990,6 +2067,20 @@
           </div>
         {/if}
       </div>
+
+      {#if imagePreview}
+        <div class="preview-divider" aria-hidden="true"></div>
+        <div class="preview-slot">
+          {#key `${imagePreview.sftpId}:${imagePreview.entry.path}`}
+            <ImagePreview
+              sftpId={imagePreview.sftpId}
+              entry={imagePreview.entry}
+              onclose={() => (imagePreview = null)}
+            />
+          {/key}
+        </div>
+      {/if}
+    </div>
 
     {#if pickerOpen}
       <div
@@ -2209,24 +2300,6 @@
         <Icon name="lock" size={15} />
         Lock vault
       </button>
-    </div>
-  {/if}
-
-  {#if aiAgents.length > 0}
-    <div class="ai-dock" class:raised={homeVisible} role="toolbar" aria-label="Launch AI agents">
-      {#each aiAgents as agent (agent.id)}
-        <button
-          class="ai-dock-btn"
-          class:launching={isAgentLaunching(agent)}
-          type="button"
-          title={isAgentLaunching(agent) ? `Launching ${agent.label}…` : `${agent.label} — opens in ~/Desktop`}
-          aria-label="Open {agent.label} in ~/Desktop"
-          aria-busy={isAgentLaunching(agent)}
-          onclick={() => openAgent(agent)}
-        >
-          <AiAgentIcon id={agent.id} size={24} />
-        </button>
-      {/each}
     </div>
   {/if}
 
@@ -2682,12 +2755,46 @@
     max-width: 700px;
     text-align: center;
   }
+  .hero.clock {
+    max-width: none;
+  }
+  /* Clock mode keeps the wallpaper more legible: lighter tint, gentler blur. */
+  .hero.clock.frosted {
+    background: color-mix(in srgb, var(--panel) 30%, transparent);
+    backdrop-filter: blur(7px) saturate(125%);
+    -webkit-backdrop-filter: blur(7px) saturate(125%);
+  }
+  .clock-view {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+    user-select: none;
+  }
+  .digital-clock {
+    font-size: clamp(38px, 6vw, 68px);
+    font-weight: 300;
+    line-height: 1;
+    letter-spacing: -0.04em;
+    color: color-mix(in srgb, var(--text) 82%, var(--bg));
+    font-variant-numeric: tabular-nums;
+  }
+  .clock-brand {
+    font-size: clamp(14px, 2vw, 19px);
+    font-weight: 650;
+    letter-spacing: 0.12em;
+    color: color-mix(in srgb, var(--text) 72%, var(--bg));
+  }
+  .clock-brand span {
+    margin: 0 6px;
+    color: var(--accent);
+  }
   /* Frosted card behind the text/form: the photo stays sharp everywhere else. */
   .hero.frosted {
     max-width: 640px;
     padding: 34px 40px 30px;
     border-radius: 22px;
-    border: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+    border: 1px solid var(--line);
     background: color-mix(in srgb, var(--panel) var(--frost-alpha, 45%), transparent);
     backdrop-filter: blur(var(--frost-blur, 10px)) saturate(150%);
     -webkit-backdrop-filter: blur(var(--frost-blur, 10px)) saturate(150%);
@@ -2826,62 +2933,154 @@
   }
   .qc-agent {
     display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-top: 10px;
-    font-size: 12px;
-    color: var(--text-secondary);
-    cursor: pointer;
-  }
-  .qc-agent input {
-    accent-color: var(--accent);
-  }
-
-  /* ------------------------------------------------- AI dock, bottom-right */
-  .ai-dock {
-    position: absolute;
-    right: 16px;
-    bottom: 16px;
-    z-index: 29;
-    display: flex;
-    gap: 6px;
-    align-items: center;
-    padding: 6px;
+    align-items: flex-start;
+    gap: 10px;
+    margin-top: 2px;
+    padding: 10px 12px;
     border: 1px solid var(--line);
-    border-radius: 14px;
-    background: var(--bg-elevated);
-    transition: bottom 0.18s ease;
-  }
-  /* Clear of the About pill row, which only renders on the home tab. */
-  .ai-dock.raised {
-    bottom: 64px;
-  }
-  .ai-dock-btn {
-    display: grid;
-    place-items: center;
-    width: 38px;
-    height: 38px;
-    border: 0;
     border-radius: 10px;
-    background: transparent;
+    background: var(--bg-elevated);
     cursor: pointer;
-    transition: background 0.12s ease;
   }
-  .ai-dock-btn:hover {
+  .qc-agent:hover {
+    border-color: var(--line-hover);
     background: var(--panel-hover);
   }
-  .ai-dock-btn:active {
-    background: var(--panel);
+  .qc-check {
+    position: relative;
+    display: block;
+    width: 22px;
+    height: 22px;
+    flex: 0 0 auto;
+    margin-top: 1px;
   }
-  .ai-dock-btn:focus-visible {
+  .qc-check input {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    opacity: 0;
+    cursor: pointer;
+  }
+  .qc-check::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: 7px;
+    border: 1px solid var(--line-hover);
+    background: var(--bg);
+    transition: background 0.15s ease, border-color 0.15s ease;
+  }
+  .qc-check::after {
+    content: '';
+    position: absolute;
+    left: 7px;
+    top: 3px;
+    width: 6px;
+    height: 11px;
+    border: solid var(--accent-on);
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+    opacity: 0;
+  }
+  .qc-check.checked::before {
+    background: var(--accent);
+    border-color: transparent;
+    box-shadow: 0 0 0 3px var(--accent-dim);
+  }
+  .qc-check.checked::after {
+    opacity: 1;
+  }
+  .qc-check:has(input:focus-visible) {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
+    border-radius: 7px;
   }
-  .ai-dock-btn.launching {
+  .qc-agent-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--text-secondary);
+  }
+  .qc-agent-text .tiny {
+    font-size: 11.5px;
+  }
+
+  /* ------------------------------------- AI agents, docked in the sidebar */
+  .side-ai {
+    flex: 0 0 auto;
+    max-height: 168px;
+    overflow-y: auto;
+    padding: 7px 10px 9px;
+    border-top: 1px solid var(--line);
+  }
+  .collapsed .side-ai {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    padding: 8px;
+  }
+  .side-ai-label {
+    margin-bottom: 5px;
+    font-size: 10.5px;
+    font-weight: 650;
+    letter-spacing: 0.02em;
+    line-height: 1.35;
+    color: var(--text-tertiary);
+    user-select: none;
+  }
+  .side-ai-btn {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    width: 100%;
+    height: 30px;
+    padding: 0 8px;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-tertiary);
+    font-size: 12.5px;
+    font-weight: 550;
+    text-align: left;
+    cursor: pointer;
+    transition: color 0.14s ease, background 0.14s ease, border-color 0.14s ease;
+  }
+  .side-ai-btn :global(.ai-icon) {
+    filter: grayscale(1);
+    opacity: 0.55;
+    transition: filter 0.14s ease, opacity 0.14s ease;
+  }
+  .side-ai-btn:hover,
+  .side-ai-btn:focus-visible {
+    color: var(--text);
     background: var(--panel-hover);
+    border-color: var(--line);
   }
-  .ai-dock-btn.launching :global(.ai-icon) {
+  .side-ai-btn:hover :global(.ai-icon),
+  .side-ai-btn:focus-visible :global(.ai-icon) {
+    filter: none;
+    opacity: 1;
+  }
+  .side-ai-btn.launching {
+    color: var(--text);
+  }
+  .side-ai-btn.launching :global(.ai-icon) {
     animation: aiLaunchPulse 1.15s ease-in-out infinite;
+  }
+  .collapsed .side-ai-btn {
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    justify-content: center;
+  }
+  .side-ai-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
   }
   @keyframes aiLaunchPulse {
     0%,
@@ -2895,7 +3094,7 @@
     }
   }
   @media (prefers-reduced-motion: reduce) {
-    .ai-dock-btn.launching :global(.ai-icon) {
+    .side-ai-btn.launching :global(.ai-icon) {
       animation: none;
     }
   }
@@ -2935,7 +3134,7 @@
   }
   .empty-links button {
     padding: 6px 14px;
-    border: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
+    border: 1px solid var(--line);
     border-radius: 999px;
     background: color-mix(in srgb, var(--panel) 55%, transparent);
     backdrop-filter: blur(16px) saturate(140%);
@@ -2997,6 +3196,29 @@
   }
 
   /* ---------- split workspace ---------- */
+  .workspace-wrap {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: row;
+  }
+  .workspace-wrap.with-preview .workspace {
+    flex: 1 1 56%;
+  }
+  .preview-divider {
+    flex: 0 0 1px;
+    background: var(--line);
+  }
+  .preview-slot {
+    flex: 1 1 44%;
+    min-width: 320px;
+    max-width: 60%;
+    min-height: 0;
+    display: flex;
+    background: var(--panel);
+  }
+
   .workspace {
     flex: 1;
     min-width: 0;
