@@ -20,6 +20,26 @@ fn show_about(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("about") {
         let _ = window.show();
         let _ = window.set_focus();
+        return;
+    }
+
+    // The panel is created on demand: closing a Tauri window destroys it, so a
+    // second About click must rebuild it from the template in tauri.conf.json.
+    let Some(config) = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == "about")
+        .cloned()
+    else {
+        return;
+    };
+    match tauri::WebviewWindowBuilder::from_config(app, &config).and_then(|builder| builder.build()) {
+        Ok(window) => {
+            let _ = window.set_focus();
+        }
+        Err(error) => eprintln!("could not open About window: {error}"),
     }
 }
 
@@ -172,9 +192,6 @@ pub fn run() {
             commands::vault_get,
             commands::vault_save,
             commands::vault_sync,
-            commands::json_read,
-            commands::json_write,
-            commands::json_download,
             commands::ssh_open,
             commands::ssh_open_adhoc,
             commands::ssh_write,

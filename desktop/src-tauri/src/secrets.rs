@@ -291,7 +291,8 @@ pub fn open_vault_with_context(
     open_vault_inner(vault, key, epoch, true)
 }
 
-/// Strict current-context open, for callers that only need the plaintext.
+/// Strict current-context open, used by the crypto tests.
+#[cfg(test)]
 pub fn open_vault(vault: &Vault, key: &SecretKey, epoch: &str) -> Result<Vault, CryptoError> {
     open_vault_inner(vault, key, epoch, false).map(|(vault, _)| vault)
 }
