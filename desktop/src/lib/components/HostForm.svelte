@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { api, type Host, type Identity } from '$lib/api';
+  import { api, displaySecret, SEALED_PLACEHOLDER, type Host, type Identity } from '$lib/api';
   import { addIdentity, app, fail, identities, notify } from '$lib/state.svelte';
   import Icon from './Icon.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
@@ -32,7 +32,7 @@
 
   function passwordValue(): string {
     return draft.auth.type === 'password' || draft.auth.type === 'keyboard_interactive'
-      ? draft.auth.password
+      ? displaySecret(draft.auth.password)
       : '';
   }
 
@@ -57,7 +57,8 @@
 
   function keyPassphrase(): string | null {
     const value = draft.auth.type === 'key' ? draft.auth.passphrase : null;
-    return value && value.trim() ? value : null;
+    if (!value || value === SEALED_PLACEHOLDER || !value.trim()) return null;
+    return value;
   }
 
   async function importKeyFile(event: Event) {
@@ -242,7 +243,7 @@
                 <input autocapitalize="off" autocorrect="off" spellcheck="false"
                   id="keyPass"
                   type="password"
-                  value={draft.auth.type === 'key' ? draft.auth.passphrase ?? '' : ''}
+                  value={draft.auth.type === 'key' ? displaySecret(draft.auth.passphrase) : ''}
                   oninput={e => {
                     if (draft.auth.type === 'key') draft.auth.passphrase = e.currentTarget.value;
                   }}

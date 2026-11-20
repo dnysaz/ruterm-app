@@ -92,17 +92,20 @@ pub fn open(
         .take_writer()
         .map_err(|e| format!("writer: {e}"))?;
 
-    sessions
-        .lock()
-        .map_err(|_| "state lock".to_string())?
-        .insert(
-            id.clone(),
-            LocalSession {
-                master: pair.master,
-                writer,
-                child,
-            },
-        );
+    let mut sessions_guard = sessions.lock().map_err(|_| "state lock".to_string())?;
+    // F-34: a colliding id would orphan the previous PTY/child and let one tab
+    // write into another tab's shell. Refuse instead of overwriting.
+    if sessions_guard.contains_key(&id) {
+        return Err("session id already in use".into());
+    }
+    sessions_guard.insert(
+        id.clone(),
+        LocalSession {
+            master: pair.master,
+            writer,
+            child,
+        },
+    );
     if let Ok(mut output) = app.state::<crate::state::AppState>().output.lock() {
         output.insert(id.clone(), crate::state::StreamEntry::new());
     }

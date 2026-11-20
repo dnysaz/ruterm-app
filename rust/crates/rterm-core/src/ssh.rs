@@ -43,6 +43,8 @@ pub enum SshError {
     Agent(String),
     #[error("unsupported key kind: {0}")]
     UnsupportedKey(String),
+    #[error("peer exceeded a resource limit: {0}")]
+    LimitExceeded(String),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -57,11 +59,22 @@ impl Default for TermSize {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct GeneratedKey {
     pub private_key: String,
     pub public_key: String,
     pub fingerprint: String,
+}
+
+// F-12/R-05: never print a freshly generated private key.
+impl std::fmt::Debug for GeneratedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeneratedKey")
+            .field("private_key", &"[REDACTED]")
+            .field("public_key", &self.public_key)
+            .field("fingerprint", &self.fingerprint)
+            .finish()
+    }
 }
 
 /// rand_core 0.10 adapter over the OS entropy source.
@@ -119,12 +132,23 @@ pub fn generate_key(kind: &str) -> Result<GeneratedKey, SshError> {
 }
 
 /// Result of reading an uploaded private key (`.pem`, OpenSSH, RSA/ECDSA/Ed25519).
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ImportedKey {
     pub private_key: String,
     pub fingerprint: String,
     /// `ed25519`, `rsa`, `ecdsa` or `imported`.
     pub kind: String,
+}
+
+// F-12/R-05: never print an imported private key.
+impl std::fmt::Debug for ImportedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImportedKey")
+            .field("private_key", &"[REDACTED]")
+            .field("fingerprint", &self.fingerprint)
+            .field("kind", &self.kind)
+            .finish()
+    }
 }
 
 /// Validates an uploaded key and extracts what the vault needs to store.
@@ -263,7 +287,10 @@ pub(crate) async fn connect_and_authenticate(target: &SshTarget) -> Result<Authe
     authenticate(&mut session, target).await?;
 
     let (fingerprint, banner) = {
-        let observed = fingerprint_slot.lock().expect("observed lock");
+        // F-47: handle poisoning without panicking the IPC task.
+        let observed = fingerprint_slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         (
             observed.fingerprint.clone().unwrap_or_default(),
             observed.banner.clone(),
@@ -271,7 +298,9 @@ pub(crate) async fn connect_and_authenticate(target: &SshTarget) -> Result<Authe
     };
 
     if let HostKeyPolicy::Pinned { fingerprint: expected } = &target.host_key_policy {
-        if expected != &fingerprint && !fingerprint.is_empty() {
+        // F-46: fail closed. An empty/absent observed fingerprint must never
+        // silently satisfy a pinned policy.
+        if fingerprint.is_empty() || expected != &fingerprint {
             return Err(SshError::HostKeyMismatch {
                 expected: expected.clone(),
                 actual: fingerprint,
@@ -712,6 +741,10 @@ pub struct ExecOutput {
     pub exit_status: Option<u32>,
 }
 
+/// Combined stdout/stderr ceiling for `exec_once` (F-44). A hostile host can
+/// otherwise stream unlimited output into the client's memory.
+const MAX_EXEC_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
 /// One-shot command execution; handy for health checks and the CLI.
 pub async fn exec_once(target: SshTarget, command: &str) -> Result<ExecOutput, SshError> {
     let fingerprint_slot = Arc::new(Mutex::new(Observed::default()));
@@ -729,12 +762,16 @@ pub async fn exec_once(target: SshTarget, command: &str) -> Result<ExecOutput, S
         .await
         .map_err(|_| SshError::Timeout)??;
     if let HostKeyPolicy::Pinned { fingerprint } = &target.host_key_policy {
-        let observed = fingerprint_slot.lock().expect("observed lock");
-        if let Some(actual) = &observed.fingerprint {
-            if fingerprint != actual {
+        let observed = fingerprint_slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // F-46: no observed fingerprint is a failure, not a pass.
+        match &observed.fingerprint {
+            Some(actual) if fingerprint == actual => {}
+            actual => {
                 return Err(SshError::HostKeyMismatch {
                     expected: fingerprint.clone(),
-                    actual: actual.clone(),
+                    actual: actual.clone().unwrap_or_default(),
                 });
             }
         }
@@ -745,10 +782,27 @@ pub async fn exec_once(target: SshTarget, command: &str) -> Result<ExecOutput, S
     channel.exec(true, command).await?;
 
     let mut out = ExecOutput::default();
+    let mut total = 0usize;
     while let Some(msg) = channel.wait().await {
         match msg {
-            ChannelMsg::Data { data } => out.stdout.extend_from_slice(&data),
-            ChannelMsg::ExtendedData { data, ext: 1 } => out.stderr.extend_from_slice(&data),
+            ChannelMsg::Data { data } => {
+                total = total.saturating_add(data.len());
+                if total > MAX_EXEC_OUTPUT_BYTES {
+                    return Err(SshError::LimitExceeded(
+                        "command produced too much output".into(),
+                    ));
+                }
+                out.stdout.extend_from_slice(&data);
+            }
+            ChannelMsg::ExtendedData { data, ext: 1 } => {
+                total = total.saturating_add(data.len());
+                if total > MAX_EXEC_OUTPUT_BYTES {
+                    return Err(SshError::LimitExceeded(
+                        "command produced too much output".into(),
+                    ));
+                }
+                out.stderr.extend_from_slice(&data);
+            }
             ChannelMsg::ExitStatus { exit_status } => out.exit_status = Some(exit_status),
             ChannelMsg::Close => break,
             _ => {}

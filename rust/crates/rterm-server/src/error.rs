@@ -38,12 +38,23 @@ impl IntoResponse for ApiError {
             ApiError::Upstream(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         };
-        if matches!(self, ApiError::Internal(_)) {
-            tracing::error!(error = %self, "internal server error");
-        }
+        // Internal and upstream errors can contain SQL, filesystem paths or
+        // upstream response bodies. Log them in full, but never send details
+        // to the renderer (F-41).
+        let message = match &self {
+            ApiError::Internal(_) => {
+                tracing::error!(error = %self, "internal server error");
+                "internal server error".to_string()
+            }
+            ApiError::Upstream(_) => {
+                tracing::error!(error = %self, "upstream auth error");
+                "upstream authentication is unavailable".to_string()
+            }
+            _ => self.to_string(),
+        };
         let body = ErrorBody {
             error: code,
-            message: self.to_string(),
+            message,
         };
         (status, Json(body)).into_response()
     }

@@ -10,6 +10,7 @@ import {
   type Vault,
   type VaultPayload,
 } from './api';
+import { clearAllSnapshots } from './scrollback';
 
 export type Screen = 'loading' | 'welcome' | 'setup' | 'unlock' | 'vault';
 
@@ -78,6 +79,14 @@ export async function bootstrap() {
   }
 }
 
+/** Opt in/out of caching the vault key in the OS keychain (F-31). */
+export async function setRememberKey(enabled: boolean) {
+  await api.vaultRememberKey(enabled);
+  app.canAutoUnlock = enabled;
+  if (app.status) app.status.key_saved = enabled;
+  notify(enabled ? 'Vault key saved to the OS keychain' : 'Saved vault key removed');
+}
+
 /** Explicit one-click unlock with the key cached in the OS keychain. */
 export async function unlockWithSavedKey() {
   app.busy = true;
@@ -85,8 +94,29 @@ export async function unlockWithSavedKey() {
   try {
     const payload = await api.vaultAutoUnlock();
     if (!payload) {
-      app.canAutoUnlock = false;
-      notify('No saved key on this device — enter your passphrase.');
+      // F-31: auto-unlock returns `None` both when no key is saved AND when a
+      // saved key transiently fails to decrypt. Only clear the flag (and never
+      // delete the keychain entry) when the key genuinely does not exist.
+      let keyExists = true;
+      try {
+        keyExists = await api.vaultSavedKeyExists();
+      } catch {
+        /* assume the key is present: fail closed, keep it */
+      }
+      if (!keyExists) {
+        // Genuinely gone (older build / cleared keychain) — safe to clear the
+        // stale flag; the delete is a no-op on an already-empty entry.
+        try {
+          await api.vaultRememberKey(false);
+        } catch {
+          /* best effort */
+        }
+        app.canAutoUnlock = false;
+        notify('No saved key on this device — enter your passphrase.');
+      } else {
+        // Key exists but could not unlock: leave it untouched.
+        notify('Saved key could not open the vault — enter your passphrase.');
+      }
       return;
     }
     app.vault = payload.vault;
@@ -118,6 +148,7 @@ export async function signOut() {
   app.busy = true;
   try {
     await api.authSignOut();
+    clearAllSnapshots();
     app.status = await api.appStatus();
     notify('Signed out of Google');
   } catch (error) {
@@ -181,6 +212,7 @@ export async function unlock(passphrase: string) {
 export async function lock() {
   try {
     await api.vaultLock();
+    clearAllSnapshots();
     app.vault = null;
     app.screen = 'unlock';
     app.status = await api.appStatus();

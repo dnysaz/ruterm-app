@@ -1,7 +1,7 @@
 {
   "name": "ruterm",
   "version": "0.1.0",
-  "description": "RuTerm — open-source SSH workspace for the desktop: local JSON vault, sealed secrets, zero-knowledge sync",
+  "description": "RuTerm — open-source SSH workspace for the desktop: local JSON vault, sealed secrets, credential-encrypted sync",
   "type": "module",
   "scripts": {
     "dev": "vite dev",
@@ -26,6 +26,9 @@
     "dompurify": "^3.4.18",
     "marked": "^18.2.1",
     "monaco-editor": "^0.57.0"
+  },
+  "overrides": {
+    "dompurify": "$dompurify"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.10",

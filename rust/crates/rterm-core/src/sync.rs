@@ -61,12 +61,24 @@ pub struct User {
     pub avatar_url: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct AuthSession {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_in: u64,
     pub user: User,
+}
+
+// F-12: bearer/refresh tokens must never appear in logs via `Debug`.
+impl std::fmt::Debug for AuthSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthSession")
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &"[REDACTED]")
+            .field("expires_in", &self.expires_in)
+            .field("user", &self.user)
+            .finish()
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -105,11 +117,13 @@ impl SyncClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            // F-47: never fall back to `Client::default()` — it silently drops
+            // the timeout/user-agent, so a builder failure becomes a hung app.
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .user_agent(concat!("rterm/", env!("CARGO_PKG_VERSION")))
                 .build()
-                .unwrap_or_default(),
+                .expect("failed to construct HTTP client"),
             token: None,
         }
     }

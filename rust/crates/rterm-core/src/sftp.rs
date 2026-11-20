@@ -100,7 +100,18 @@ pub(crate) fn parent_path(path: &str) -> Option<String> {
 /// Connects, authenticates, opens the `sftp` subsystem channel, and performs
 /// the SFTP handshake. Returns a session the caller keeps open.
 pub async fn open_sftp(target: &SshTarget) -> Result<SftpSession, SshError> {
+    open_sftp_with_fingerprint(target)
+        .await
+        .map(|(session, _)| session)
+}
+
+/// Same as [`open_sftp`], but also returns the observed host-key fingerprint so
+/// the caller can persist a TOFU pin (F-46).
+pub async fn open_sftp_with_fingerprint(
+    target: &SshTarget,
+) -> Result<(SftpSession, String), SshError> {
     let auth = connect_and_authenticate(target).await?;
+    let fingerprint = auth.fingerprint.clone();
     let channel = auth.session.channel_open_session().await?;
     channel
         .request_subsystem(false, "sftp")
@@ -111,7 +122,7 @@ pub async fn open_sftp(target: &SshTarget) -> Result<SftpSession, SshError> {
         .await
         .map_err(|e| SshError::Request(format!("sftp init failed: {e}")))?;
     sftp.set_timeout(30);
-    Ok(sftp)
+    Ok((sftp, fingerprint))
 }
 
 /// Best-effort home directory (SFTP servers start in the user's home).
@@ -122,8 +133,30 @@ pub async fn home_dir(sftp: &SftpSession) -> String {
         .unwrap_or_else(|_| "/".to_string())
 }
 
+/// Maximum entries/bytes returned from a single remote directory listing (F-44).
+const MAX_DIR_ENTRIES: usize = 10_000;
+const MAX_DIR_NAME_BYTES: usize = 4096;
+/// Total entries one recursive delete may touch (root + all descendants) (R-03).
+const MAX_DELETE_ENTRIES: usize = 10_000;
+
+/// Charge one entry against a recursive-delete budget, failing closed.
+fn charge_delete(budget: &mut usize) -> Result<(), SshError> {
+    if *budget == 0 {
+        return Err(SshError::LimitExceeded(format!(
+            "delete would touch more than {MAX_DELETE_ENTRIES} entries"
+        )));
+    }
+    *budget -= 1;
+    Ok(())
+}
+
 /// Lists one directory. Always returns entries sorted directories-first, then
 /// by name (case-insensitive). Canonicalizes the path first.
+///
+/// NOTE (R-03): `russh-sftp 3.0.1`'s high-level `read_dir` eagerly buffers the
+/// whole listing to EOF before returning, so the caps below protect the UI and
+/// return value but not peak memory inside the library. A true streaming cap
+/// would need a separate raw SFTP session (tracked as a known residual).
 pub async fn list_dir(sftp: &SftpSession, path: &str) -> Result<SftpDir, SshError> {
     let canonical = sftp
         .canonicalize(path)
@@ -133,27 +166,54 @@ pub async fn list_dir(sftp: &SftpSession, path: &str) -> Result<SftpDir, SshErro
         .read_dir(&canonical)
         .await
         .map_err(|e| err("cannot list directory", e))?;
-    let mut entries: Vec<SftpEntry> = read
-        .map(|entry| {
-            let md = entry.metadata();
-            SftpEntry {
-                name: entry.file_name(),
-                path: entry.path(),
-                is_dir: md.is_dir(),
-                is_symlink: md.is_symlink(),
-                size: md.size,
-                mtime: md.mtime,
-                permissions: mode_string(md.permissions),
-            }
-        })
-        .collect();
+    let mut total_bytes = 0usize;
+    let mut entries: Vec<SftpEntry> = Vec::new();
+    for entry in read {
+        if entries.len() >= MAX_DIR_ENTRIES {
+            return Err(SshError::LimitExceeded(format!(
+                "directory has more than {MAX_DIR_ENTRIES} entries"
+            )));
+        }
+        let md = entry.metadata();
+        let name = entry.file_name();
+        // R-02: never trust a path supplied by the remote server. Reject
+        // traversal/separator names and build each entry path ourselves from
+        // the requested directory, so `basename(path) == name` holds.
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains('\0')
+        {
+            return Err(SshError::Request("invalid filename in directory listing".into()));
+        }
+        let entry_path = join_path(path, &name);
+        total_bytes = total_bytes
+            .saturating_add(name.len())
+            .saturating_add(entry_path.len());
+        if name.len() > MAX_DIR_NAME_BYTES || total_bytes > MAX_DIR_ENTRIES * MAX_DIR_NAME_BYTES {
+            return Err(SshError::LimitExceeded(
+                "directory listing is too large".into(),
+            ));
+        }
+        entries.push(SftpEntry {
+            name,
+            path: entry_path,
+            is_dir: md.is_dir(),
+            is_symlink: md.is_symlink(),
+            size: md.size,
+            mtime: md.mtime,
+            permissions: mode_string(md.permissions),
+        });
+    }
     entries.sort_by(|a, b| {
         b.is_dir
             .cmp(&a.is_dir)
             .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     Ok(SftpDir {
-        path: canonical,
+        path: path.to_string(),
         entries,
     })
 }
@@ -173,7 +233,8 @@ pub async fn rename(sftp: &SftpSession, from: &str, to: &str) -> Result<(), SshE
 /// Removes a file, a symlink, or a directory tree. Directories are deleted
 /// non-empty — the UI is explicit about it ("Delete folder and N items").
 pub async fn remove_path(sftp: &SftpSession, path: &str, is_dir: bool) -> Result<(), SshError> {
-    remove_recursive(sftp, path, is_dir, 0).await
+    let mut budget = MAX_DELETE_ENTRIES;
+    remove_recursive(sftp, path, is_dir, 0, &mut budget).await
 }
 
 const MAX_DELETE_DEPTH: u32 = 64;
@@ -183,11 +244,13 @@ fn remove_recursive<'a>(
     path: &'a str,
     is_dir: bool,
     depth: u32,
+    budget: &'a mut usize,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SshError>> + Send + 'a>> {
     Box::pin(async move {
         if depth > MAX_DELETE_DEPTH {
             return Err(SshError::Request("delete too deep — refusing".into()));
         }
+        charge_delete(budget)?;
         if !is_dir {
             return sftp
                 .remove_file(path)
@@ -203,7 +266,7 @@ fn remove_recursive<'a>(
             let md = entry.metadata();
             let child = join_path(path, &entry.file_name());
             if md.is_dir() && !md.is_symlink() {
-                remove_recursive(sftp, &child, true, depth + 1).await?;
+                remove_recursive(sftp, &child, true, depth + 1, &mut *budget).await?;
             } else {
                 sftp.remove_file(&child)
                     .await

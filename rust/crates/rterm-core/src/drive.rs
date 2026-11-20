@@ -38,6 +38,8 @@ pub enum DriveError {
     Json(#[from] serde_json::Error),
     #[error("sync did not converge after {0} attempts")]
     TooManyRetries(u32),
+    #[error("vault key differs from the synced vault — re-enter the passphrase on this device")]
+    KeyMismatch,
 }
 
 #[derive(Deserialize)]
@@ -133,11 +135,13 @@ pub struct DriveClient {
 impl DriveClient {
     pub fn new(access_token: impl Into<String>) -> Self {
         Self {
+            // F-47: never fall back to `Client::default()` — it silently drops
+            // the timeout/user-agent, so a builder failure becomes a hung app.
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
                 .user_agent(concat!("rterm/", env!("CARGO_PKG_VERSION")))
                 .build()
-                .unwrap_or_default(),
+                .expect("failed to construct HTTP client"),
             token: access_token.into(),
             file_name: DEFAULT_FILE_NAME.to_string(),
         }
@@ -423,20 +427,34 @@ impl DriveClient {
         device_id: &str,
         max_attempts: u32,
     ) -> Result<JsonSyncOutcome, DriveError> {
-        let mut merged = local.clone();
-        let mut effective_kdf = kdf;
-        let mut effective_canary = canary.to_string();
+        let mut merged;
+        let starting_kdf = kdf.clone();
+        let starting_canary = canary.to_string();
         for attempt in 0..max_attempts.max(1) {
+            // Reset derived key-state on every retry: a previous attempt may
+            // have adopted a remote KDF that is no longer present on a 412
+            // re-fetch. Otherwise a stale/unsafe KDF could be pushed (F-38).
+            let mut effective_kdf = starting_kdf.clone();
+            let mut effective_canary = starting_canary.clone();
+            merged = local.clone();
             let remote = self.fetch_json().await?;
             let (revision, etag) = match &remote {
                 Some(remote) => {
-                    merged.merge(&remote.doc.vault);
-                    if effective_kdf.is_none() {
-                        effective_kdf = remote.doc.kdf.clone();
+                    match (starting_kdf.as_ref(), remote.doc.kdf.as_ref()) {
+                        (Some(a), Some(b)) if a != b => return Err(DriveError::KeyMismatch),
+                        (None, Some(b)) => {
+                            // Never adopt unvalidated (possibly OOM-inducing)
+                            // KDF parameters from a remote document (F-07/F-38).
+                            b.validate()?;
+                            effective_kdf = Some(b.clone());
+                            effective_canary = remote.doc.canary.clone();
+                        }
+                        _ => {}
                     }
                     if effective_canary.is_empty() {
                         effective_canary = remote.doc.canary.clone();
                     }
+                    merged.merge(&remote.doc.vault);
                     (remote.doc.revision, Some(remote.etag.clone()))
                 }
                 None => (0, None),

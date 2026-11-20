@@ -1,7 +1,7 @@
 // Shared state for the "Open external link?" confirmation, plus the delegated
 // click handler that routes every external <a> through the modal.
 
-import { toExternalHref } from './external';
+import { isUnsafeHref, toExternalHref } from './external';
 
 export const externalLink = $state({ href: null as string | null });
 
@@ -26,6 +26,11 @@ export function installExternalLinkHandler() {
     const anchor = target.closest('a');
     if (!anchor) return;
     const href = anchor.getAttribute('href');
+    if (isUnsafeHref(href)) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     if (!requestExternalLink(href)) return;
     event.preventDefault();
     event.stopPropagation();

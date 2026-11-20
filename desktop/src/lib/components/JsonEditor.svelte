@@ -34,27 +34,32 @@
   let error = $state('');
   let savedNote = $state('');
   let pendingKind = $state<JsonKind | null>(null);
+  /** Discard responses from a superseded load (F-55). */
+  let loadGeneration = 0;
 
   const dirty = $derived(text !== saved);
   const file = $derived(FILES.find(option => option.kind === kind) ?? FILES[0]);
 
   async function load(next: JsonKind) {
+    const generation = ++loadGeneration;
     kind = next;
     loading = true;
     error = '';
     savedNote = '';
     try {
       const doc = await api.jsonRead(next);
+      if (generation !== loadGeneration) return;
       path = doc.path;
       text = doc.text;
       saved = doc.text;
     } catch (e) {
+      if (generation !== loadGeneration) return;
       path = '';
       text = '';
       saved = '';
       error = errorText(e);
     } finally {
-      loading = false;
+      if (generation === loadGeneration) loading = false;
     }
   }
 
@@ -75,23 +80,26 @@
 
   async function save() {
     if (busy || loading) return;
+    const savingKind = kind;
+    const savingText = text;
     busy = true;
     error = '';
     savedNote = '';
     try {
-      const payload = await api.jsonWrite(kind, text);
+      const payload = await api.jsonWrite(savingKind, savingText);
+      if (savingKind !== kind) return; // user switched files mid-save (F-55)
       // A vault edit while unlocked returns the freshly decrypted vault, so the
       // rest of the app sees the new hosts without a re-unlock.
       if (payload) applyVaultPayload(payload);
-      saved = text;
-      if (!payload && kind === 'vault') {
+      saved = savingText;
+      if (!payload && savingKind === 'vault') {
         savedNote = 'Saved — applies next time the vault unlocks';
       } else {
         savedNote = 'Saved';
       }
       notify(`${file.label} saved`);
     } catch (e) {
-      error = errorText(e);
+      if (savingKind === kind) error = errorText(e);
     } finally {
       busy = false;
     }

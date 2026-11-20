@@ -2,8 +2,10 @@
 
 Serverless sync bridge for RuTerm — Cloudflare Worker + D1. The desktop app stays
 fully functional **offline and locally** without it; the bridge only adds cross-device
-sync. The server stores **ciphertext only** (end-to-end encrypted vaults), hashed
-refresh tokens, and account/device metadata.
+sync. Secrets (passwords, private keys, notes' secret fields) are sealed on the
+device before upload, but **host metadata stays in plain JSON** and is readable by
+the operator. The server also stores hashed refresh tokens and account/device
+metadata. This is credential-encrypted sync, not zero-knowledge storage.
 
 ## Endpoints
 
@@ -61,7 +63,9 @@ production and set the homepage/privacy URLs to
 ## Dev
 
 ```bash
-cp .dev.vars.example .dev.vars   # JWT_SECRET + GOOGLE_CLIENT_SECRET for local dev only
+cp .dev.vars.example .dev.vars
+# Replace the rejected JWT_SECRET placeholder in .dev.vars with a real random key:
+#   sed -i '' "s|^JWT_SECRET=.*|JWT_SECRET=$(openssl rand -hex 32)|" .dev.vars
 npm run db:migrate               # local D1
 npm run dev                      # http://127.0.0.1:8787
 npm run typecheck

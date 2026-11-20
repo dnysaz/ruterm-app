@@ -25,6 +25,20 @@ const CACHE_KEY = 'rterm.news.cache.v1';
 const LAST_SEEN_KEY = 'rterm.news.lastseen.v1';
 const FETCH_TIMEOUT_MS = 3500;
 
+// F-50: remote news is untrusted input. Cap every dimension before it reaches
+// the Markdown renderer or localStorage.
+const MAX_INDEX_ENTRIES = 100;
+const MAX_FILE_BYTES = 256 * 1024;
+const MAX_TITLE_CHARS = 200;
+const MAX_SUMMARY_CHARS = 300;
+const MAX_CACHE_BYTES = 2 * 1024 * 1024;
+const NEWS_FILE_RE = /^\d{4}-\d{2}-\d{2}-[a-z0-9-]+\.md$/;
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function byteLength(text: string): number {
+  return new TextEncoder().encode(text).byteLength;
+}
+
 export const newsState = $state({
   unread: 0,
   loaded: false,
@@ -39,9 +53,16 @@ interface CachePayload {
 function readCache(): CachePayload | null {
   try {
     const raw = localStorage.getItem(CACHE_KEY);
-    if (!raw) return null;
+    if (!raw || byteLength(raw) > MAX_CACHE_BYTES) return null;
     const parsed = JSON.parse(raw) as CachePayload;
-    if (!parsed?.index?.entries || !parsed?.files) return null;
+    if (!parsed?.index?.entries || !parsed?.files || typeof parsed.files !== 'object') return null;
+    if (!validIndex(parsed.index.entries)) return null;
+    // Reject a poisoned cache whose bodies are oversized or path-traversal names.
+    for (const [name, body] of Object.entries(parsed.files)) {
+      if (!NEWS_FILE_RE.test(name) || typeof body !== 'string' || byteLength(body) > MAX_FILE_BYTES) {
+        return null;
+      }
+    }
     return parsed;
   } catch {
     return null;
@@ -50,7 +71,9 @@ function readCache(): CachePayload | null {
 
 function writeCache(payload: CachePayload) {
   try {
-    localStorage.setItem(CACHE_KEY, JSON.stringify(payload));
+    const encoded = JSON.stringify(payload);
+    if (byteLength(encoded) > MAX_CACHE_BYTES) return;
+    localStorage.setItem(CACHE_KEY, encoded);
   } catch {
     /* storage full — non-fatal, remote fetch just happens again next launch */
   }
@@ -84,29 +107,53 @@ async function fetchWithTimeout(url: string): Promise<Response> {
 
 async function fetchText(url: string): Promise<string> {
   const response = await fetchWithTimeout(url);
-  if (!response.ok) throw new Error(`news: HTTP ${response.status} for ${url}`);
-  return response.text();
+  if (!response.ok) throw new Error(`news: HTTP ${response.status}`);
+  const declared = Number(response.headers.get('content-length') ?? '0');
+  if (Number.isFinite(declared) && declared > MAX_FILE_BYTES) {
+    throw new Error('news: body too large');
+  }
+  const text = await response.text();
+  if (byteLength(text) > MAX_FILE_BYTES) throw new Error('news: body too large');
+  return text;
 }
 
 async function fetchJson(url: string): Promise<{ entries?: Omit<NewsEntry, 'markdown' | 'source'>[] }> {
   const response = await fetchWithTimeout(url);
-  if (!response.ok) throw new Error(`news: HTTP ${response.status} for ${url}`);
-  return response.json();
+  if (!response.ok) throw new Error(`news: HTTP ${response.status}`);
+  const text = await response.text();
+  if (byteLength(text) > MAX_CACHE_BYTES) throw new Error('news: index too large');
+  return JSON.parse(text) as { entries?: Omit<NewsEntry, 'markdown' | 'source'>[] };
 }
 
 function sortEntries(entries: NewsEntry[]): NewsEntry[] {
   return [...entries].sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : b.file.localeCompare(a.file)));
 }
 
+function validEntry(e: unknown): e is Omit<NewsEntry, 'markdown' | 'source'> {
+  if (!e || typeof e !== 'object') return false;
+  const v = e as Record<string, unknown>;
+  return typeof v.file === 'string'
+    && NEWS_FILE_RE.test(v.file)
+    && typeof v.date === 'string'
+    && DATE_RE.test(v.date)
+    && !Number.isNaN(Date.parse(`${v.date}T00:00:00Z`))
+    && typeof v.title === 'string' && v.title.length > 0 && v.title.length <= MAX_TITLE_CHARS
+    && (v.summary === undefined
+        || (typeof v.summary === 'string' && v.summary.length <= MAX_SUMMARY_CHARS));
+}
+
 function validIndex(value: unknown): value is Omit<NewsEntry, 'markdown' | 'source'>[] {
-  return Array.isArray(value) && value.every(e => e && typeof e.file === 'string' && typeof e.date === 'string' && typeof e.title === 'string');
+  return Array.isArray(value)
+    && value.length <= MAX_INDEX_ENTRIES
+    && value.every(validEntry);
 }
 
 async function fromBundle(): Promise<NewsFeed> {
   try {
     const index = await fetchJson('/news/index.json');
+    const raw = validIndex(index.entries) ? index.entries : [];
     const entries = sortEntries(
-      (index.entries ?? []).map(e => ({ ...e, source: 'bundle' as const })),
+      raw.map(e => ({ ...e, source: 'bundle' as const })),
     );
     await Promise.all(
       entries.map(async entry => {

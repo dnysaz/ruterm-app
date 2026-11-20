@@ -5,7 +5,8 @@
 //! * [`ssh`]    - SSH sessions on top of russh
 //! * [`sftp`]   - SFTP file transfer sessions on the same transport
 //! * [`sync`]   - encrypted multi-device sync client (self-hosted server)
-//! * [`bridge`] - zero-knowledge sync client for the RuTerm bridge (Worker + D1)
+//! * [`bridge`] - credential-encrypted sync client for the RuTerm bridge (Worker + D1);
+//!   secrets are sealed client-side, but host metadata is plain JSON on the server
 
 pub mod bridge;
 pub mod crypto;

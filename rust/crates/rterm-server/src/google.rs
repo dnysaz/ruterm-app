@@ -63,12 +63,17 @@ pub async fn verify_id_token(
 ) -> Result<GoogleClaims, ApiError> {
     let header = decode_header(id_token)?;
     let set = jwks(http).await?;
+    // Fail closed: never fall back to an arbitrary key when the advertised
+    // `kid` is missing or unknown (F-47).
+    let kid = header
+        .kid
+        .as_deref()
+        .ok_or_else(|| ApiError::Unauthorized("google token has no key id".into()))?;
     let jwk = set
         .keys
         .iter()
-        .find(|k| header.kid.is_some() && k.common.key_id.as_deref() == header.kid.as_deref())
-        .or_else(|| set.keys.first())
-        .ok_or_else(|| ApiError::Upstream("google jwks is empty".into()))?;
+        .find(|k| k.common.key_id.as_deref() == Some(kid))
+        .ok_or_else(|| ApiError::Upstream("google signing key not found".into()))?;
 
     let mut validation = Validation::new(header.alg);
     validation.set_audience(&[client_id]);
@@ -79,7 +84,15 @@ pub async fn verify_id_token(
         .map_err(|e| ApiError::Unauthorized(format!("invalid google token: {e}")))?;
 
     let claims = data.claims;
-    if claims.email_verified == Some(false) {
+    validate_claims(&claims, allowed_domains)?;
+    Ok(claims)
+}
+
+/// Shared validation for every Google identity path. `email_verified` must be
+/// explicitly true (a missing claim is not good enough), and the domain
+/// allowlist is enforced on both the ID-token and userinfo flows (F-37/F-43).
+fn validate_claims(claims: &GoogleClaims, allowed_domains: &[String]) -> Result<(), ApiError> {
+    if claims.email_verified != Some(true) {
         return Err(ApiError::Unauthorized("google email is not verified".into()));
     }
     if claims.email.is_empty() {
@@ -92,12 +105,12 @@ pub async fn verify_id_token(
             .map(|(_, d)| d.to_lowercase())
             .unwrap_or_default();
         if !allowed_domains.contains(&domain) {
-            return Err(ApiError::Unauthorized(format!(
-                "domain {domain} is not allowed"
-            )));
+            return Err(ApiError::Unauthorized(
+                "google account domain is not allowed".into(),
+            ));
         }
     }
-    Ok(claims)
+    Ok(())
 }
 
 fn decode_header(token: &str) -> Result<jsonwebtoken::Header, ApiError> {
@@ -136,6 +149,7 @@ pub async fn exchange_code(
     client_secret: &str,
     code: &str,
     redirect_uri: &str,
+    allowed_domains: &[String],
 ) -> Result<GoogleClaims, ApiError> {
     let res = http
         .post(TOKEN_URL)
@@ -151,11 +165,10 @@ pub async fn exchange_code(
         .map_err(|e| ApiError::Upstream(e.to_string()))?;
 
     if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
-        return Err(ApiError::Unauthorized(format!(
-            "google code exchange failed ({status}): {body}"
-        )));
+        // Never echo Google's response body back to the client (F-41).
+        return Err(ApiError::Unauthorized(
+            "google code exchange failed".into(),
+        ));
     }
 
     let token: TokenResponse = res
@@ -164,8 +177,9 @@ pub async fn exchange_code(
         .map_err(|e| ApiError::Upstream(e.to_string()))?;
 
     if let Some(id_token) = token.id_token {
-        // Re-verify rather than trusting the transport alone.
-        return verify_id_token(http, client_id, &id_token, &[]).await;
+        // Re-verify rather than trusting the transport alone, including the
+        // domain allowlist (F-37).
+        return verify_id_token(http, client_id, &id_token, allowed_domains).await;
     }
 
     let access = token
@@ -181,27 +195,31 @@ pub async fn exchange_code(
         .await
         .map_err(|e| ApiError::Upstream(e.to_string()))?;
 
-    Ok(GoogleClaims {
+    let claims = GoogleClaims {
         sub: info.sub,
         email: info.email,
         email_verified: info.email_verified,
         name: info.name,
         picture: info.picture,
-    })
+    };
+    validate_claims(&claims, allowed_domains)?;
+    Ok(claims)
 }
 
 /// URL the desktop app should open in the system browser.
 pub fn authorization_url(client_id: &str, redirect_uri: &str, state: &str) -> String {
     format!(
         "https://accounts.google.com/o/oauth2/v2/auth?\
-         client_id={client_id}&\
+         client_id={client}&\
          redirect_uri={redirect}&\
          response_type=code&\
          scope=openid%20email%20profile&\
          access_type=offline&\
          prompt=select_account&\
-         state={state}",
-        redirect = urlencoding(redirect_uri)
+         state={state_enc}",
+        client = urlencoding(client_id),
+        redirect = urlencoding(redirect_uri),
+        state_enc = urlencoding(state),
     )
 }
 

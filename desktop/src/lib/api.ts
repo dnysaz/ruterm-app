@@ -2,6 +2,40 @@
 
 import { invoke } from '@tauri-apps/api/core';
 
+/// Sentinel returned by Rust in place of a real secret. Echo it back unchanged
+/// when saving a document you did not edit; Rust rehydrates the real value.
+export const SEALED_PLACEHOLDER = '__RTERM_SEALED__';
+
+export function displaySecret(value: string | null | undefined): string {
+  return value === SEALED_PLACEHOLDER ? '' : (value ?? '');
+}
+
+/// R-01: SFTP capability tokens live in sessionStorage (same model as PTY
+/// sessions). The token is read at call time so a reconnect in the owning
+/// panel is picked up by child file-view tabs.
+const sftpTokenKey = (sftpId: string) => `rterm.sftp-token.${sftpId}`;
+export function getSftpToken(sftpId: string): string {
+  try {
+    return sessionStorage.getItem(sftpTokenKey(sftpId)) ?? '';
+  } catch {
+    return '';
+  }
+}
+export function rememberSftpToken(sftpId: string, token: string): void {
+  try {
+    sessionStorage.setItem(sftpTokenKey(sftpId), token);
+  } catch {
+    /* storage disabled — the caller's in-memory copy still works */
+  }
+}
+export function forgetSftpToken(sftpId: string): void {
+  try {
+    sessionStorage.removeItem(sftpTokenKey(sftpId));
+  } catch {
+    /* ignore */
+  }
+}
+
 export type AuthMethod =
   | { type: 'password'; password: string }
   | { type: 'key'; identity_id: string; passphrase?: string | null }
@@ -180,6 +214,8 @@ export interface SftpOpenInfo {
   user: string;
   address: string;
   port: number;
+  /** Rust-issued capability; must be passed to every subsequent SFTP call. */
+  token: string;
 }
 
 export interface SftpFilePayload {
@@ -209,6 +245,10 @@ export const api = {
   vaultAdoptRemote: (passphrase: string) =>
     invoke<VaultPayload>('vault_adopt_remote', { passphrase }),
   vaultAutoUnlock: () => invoke<VaultPayload | null>('vault_try_auto_unlock'),
+  /** Read-only probe: is there actually a saved key? Never deletes. */
+  vaultSavedKeyExists: () => invoke<boolean>('vault_saved_key_exists'),
+  /** Explicit user opt-in/out for storing the vault key in the OS keychain. */
+  vaultRememberKey: (enabled: boolean) => invoke<void>('vault_remember_key', { enabled }),
   vaultLock: () => invoke<void>('vault_lock'),
   vaultGet: () => invoke<VaultPayload | null>('vault_get'),
   vaultSave: (vault: Vault) => invoke<VaultPayload>('vault_save', { vault }),
@@ -221,8 +261,9 @@ export const api = {
   /** Saves a copy to Downloads and returns its absolute path. */
   jsonDownload: (kind: JsonKind) => invoke<string>('json_download', { kind }),
 
+  /** Resolves to the Rust-issued capability required by every other command. */
   sshOpen: (sessionId: string, hostId: string, cols: number, rows: number) =>
-    invoke<void>('ssh_open', { sessionId, hostId, cols, rows }),
+    invoke<string>('ssh_open', { sessionId, hostId, cols, rows }),
   sshOpenAdhoc: (
     sessionId: string,
     username: string,
@@ -230,24 +271,27 @@ export const api = {
     port: number,
     auth: 'agent' | 'password',
     password: string | undefined,
+    allowAgent: boolean,
     cols: number,
     rows: number,
   ) =>
-    invoke<void>('ssh_open_adhoc', { sessionId, username, address, port, auth, password, cols, rows }),
-  sshWrite: (sessionId: string, dataB64: string) =>
-    invoke<void>('ssh_write', { sessionId, dataB64 }),
-  sshResize: (sessionId: string, cols: number, rows: number) =>
-    invoke<void>('ssh_resize', { sessionId, cols, rows }),
-  sshClose: (sessionId: string) => invoke<void>('ssh_close', { sessionId }),
+    invoke<string>('ssh_open_adhoc', { sessionId, username, address, port, auth, password, allowAgent, cols, rows }),
+  sshWrite: (sessionId: string, token: string, dataB64: string) =>
+    invoke<void>('ssh_write', { sessionId, token, dataB64 }),
+  sshResize: (sessionId: string, token: string, cols: number, rows: number) =>
+    invoke<void>('ssh_resize', { sessionId, token, cols, rows }),
+  sshClose: (sessionId: string, token: string) =>
+    invoke<void>('ssh_close', { sessionId, token }),
 
   localOpen: (sessionId: string, cols: number, rows: number, cwd?: string) =>
-    invoke<void>('local_open', { sessionId, cols, rows, cwd: cwd ?? null }),
+    invoke<string>('local_open', { sessionId, cols, rows, cwd: cwd ?? null }),
   aiAgentsDetect: () => invoke<AiAgent[]>('ai_agents_detect'),
-  localWrite: (sessionId: string, dataB64: string) =>
-    invoke<void>('local_write', { sessionId, dataB64 }),
-  localResize: (sessionId: string, cols: number, rows: number) =>
-    invoke<void>('local_resize', { sessionId, cols, rows }),
-  localClose: (sessionId: string) => invoke<void>('local_close', { sessionId }),
+  localWrite: (sessionId: string, token: string, dataB64: string) =>
+    invoke<void>('local_write', { sessionId, token, dataB64 }),
+  localResize: (sessionId: string, token: string, cols: number, rows: number) =>
+    invoke<void>('local_resize', { sessionId, token, cols, rows }),
+  localClose: (sessionId: string, token: string) =>
+    invoke<void>('local_close', { sessionId, token }),
 
   /// One-shot probe: detect the remote OS and persist it on the host.
   hostProbeOs: (hostId: string) => invoke<VaultPayload>('host_probe_os', { hostId }),
@@ -255,38 +299,45 @@ export const api = {
   sftpOpenHost: (sftpId: string, hostId: string) =>
     invoke<SftpOpenInfo>('sftp_open_host', { sftpId, hostId }),
   /// Quick-connect SFTP. Agent auth only — passwords are never kept around.
-  sftpOpenAdhoc: (sftpId: string, username: string, address: string, port: number) =>
-    invoke<SftpOpenInfo>('sftp_open_adhoc', { sftpId, username, address, port }),
-  sftpList: (sftpId: string, path: string) => invoke<SftpDir>('sftp_list', { sftpId, path }),
-  sftpMkdir: (sftpId: string, path: string) => invoke<void>('sftp_mkdir', { sftpId, path }),
-  sftpRename: (sftpId: string, from: string, to: string) =>
-    invoke<void>('sftp_rename', { sftpId, from, to }),
-  sftpRemove: (sftpId: string, path: string, isDir: boolean) =>
-    invoke<void>('sftp_remove', { sftpId, path, isDir }),
-  /// Uploads a local file (real path) into `remoteDir`; resolves to the final remote path.
-  sftpUpload: (sftpId: string, localPath: string, remoteDir: string) =>
-    invoke<string>('sftp_upload', { sftpId, localPath, remoteDir }),
+  sftpOpenAdhoc: (sftpId: string, username: string, address: string, port: number, allowAgent: boolean) =>
+    invoke<SftpOpenInfo>('sftp_open_adhoc', { sftpId, username, address, port, allowAgent }),
+  sftpList: (sftpId: string, token: string, path: string) =>
+    invoke<SftpDir>('sftp_list', { sftpId, token, path }),
+  sftpMkdir: (sftpId: string, token: string, path: string) =>
+    invoke<void>('sftp_mkdir', { sftpId, token, path }),
+  sftpRename: (sftpId: string, token: string, from: string, to: string) =>
+    invoke<void>('sftp_rename', { sftpId, token, from, to }),
+  sftpRemove: (sftpId: string, token: string, path: string, isDir: boolean) =>
+    invoke<void>('sftp_remove', { sftpId, token, path, isDir }),
+  /// Native dialog runs in Rust; returns a one-shot handle for `sftpUpload`.
+  sftpPickUpload: () => invoke<string>('sftp_pick_upload'),
+  sftpPickUploads: () => invoke<string[]>('sftp_pick_uploads'),
+  /// Uploads a local file (picked in Rust) into `remoteDir`; resolves to the final remote path.
+  sftpUpload: (sftpId: string, token: string, localToken: string, remoteDir: string) =>
+    invoke<string>('sftp_upload', { sftpId, token, localToken, remoteDir }),
   /// Upload from dropped File bytes (no path available in the webview).
-  sftpUploadBytes: (sftpId: string, remotePath: string, bytesB64: string) =>
-    invoke<void>('sftp_upload_bytes', { sftpId, remotePath, bytesB64 }),
-  sftpDownload: (sftpId: string, remotePath: string, localPath: string) =>
-    invoke<void>('sftp_download', { sftpId, remotePath, localPath }),
+  sftpUploadBytes: (sftpId: string, token: string, remotePath: string, bytesB64: string) =>
+    invoke<void>('sftp_upload_bytes', { sftpId, token, remotePath, bytesB64 }),
+  sftpPickDownload: (defaultName: string) =>
+    invoke<string>('sftp_pick_download', { defaultName }),
+  sftpDownload: (sftpId: string, token: string, remotePath: string, localToken: string) =>
+    invoke<void>('sftp_download', { sftpId, token, remotePath, localToken }),
   /// Opens a new editor tab on a remote file (2 MB cap).
-  sftpReadFile: (sftpId: string, path: string) =>
-    invoke<SftpFilePayload>('sftp_read_file', { sftpId, path }),
+  sftpReadFile: (sftpId: string, token: string, path: string) =>
+    invoke<SftpFilePayload>('sftp_read_file', { sftpId, token, path }),
   /// Reads a remote image for the in-app preview (12 MB cap).
-  sftpReadImage: (sftpId: string, path: string) =>
-    invoke<SftpImagePayload>('sftp_read_image', { sftpId, path }),
-  sftpWriteFile: (sftpId: string, path: string, content: string) =>
-    invoke<void>('sftp_write_file', { sftpId, path, content }),
+  sftpReadImage: (sftpId: string, token: string, path: string) =>
+    invoke<SftpImagePayload>('sftp_read_image', { sftpId, token, path }),
+  sftpWriteFile: (sftpId: string, token: string, path: string, content: string) =>
+    invoke<void>('sftp_write_file', { sftpId, token, path, content }),
   /// Creates an empty remote file; fails if it already exists.
-  sftpCreateFile: (sftpId: string, path: string) =>
-    invoke<void>('sftp_create_file', { sftpId, path }),
-  sftpClose: (sftpId: string) => invoke<void>('sftp_close', { sftpId }),
+  sftpCreateFile: (sftpId: string, token: string, path: string) =>
+    invoke<void>('sftp_create_file', { sftpId, token, path }),
+  sftpClose: (sftpId: string, token: string) => invoke<void>('sftp_close', { sftpId, token }),
 
   /// Replays an existing session after a webview reload.
-  sessionAttach: (sessionId: string) =>
-    invoke<SessionAttach | null>('session_attach', { sessionId }),
+  sessionAttach: (sessionId: string, token: string) =>
+    invoke<SessionAttach | null>('session_attach', { sessionId, token }),
   sshImportKey: (label: string, pem: string, passphrase: string | null) =>
     invoke<Identity>('ssh_import_key', { label, pem, passphrase }),
   sshKeygen: (kind: string, label: string) =>

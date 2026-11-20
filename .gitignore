@@ -63,3 +63,7 @@ yarn-error.log*
 .tsbuildinfo
 # Local staging for installers — distributed via GitHub Releases, not git
 /dist/
+
+# Local audit / re-audit reports — working notes, not shipped or versioned
+check.md
+check_2.md

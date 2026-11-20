@@ -6,8 +6,8 @@
  * a restart, and SSH/local sessions reconnect into a fresh shell below it.
  *
  * The snapshot is plain text with ANSI escapes in localStorage. It never
- * syncs, never joins the vault, and can contain sensitive output — which is
- * why Settings can turn it off (disabling also erases everything saved).
+ * syncs, never joins the vault, and can contain sensitive output — so it is
+ * OFF by default, erased on lock/sign-out, and users must opt in explicitly.
  */
 
 const KEY = 'rterm.scrollback.v1';
@@ -19,9 +19,9 @@ const MAX_TOTAL_CHARS = 512 * 1024;
 
 export function isRestoreEnabled(): boolean {
   try {
-    return localStorage.getItem(PREF_KEY) !== 'off';
+    return localStorage.getItem(PREF_KEY) === 'on';
   } catch {
-    return true;
+    return false;
   }
 }
 
@@ -100,6 +100,16 @@ export function removeSnapshot(id: string) {
   delete all[id];
   try {
     localStorage.setItem(KEY, JSON.stringify(all));
+  } catch {
+    /* ignore */
+  }
+}
+
+/// Called when the vault is locked or the account is signed out: plaintext
+/// terminal output must never outlive the unlocked session (F-49).
+export function clearAllSnapshots() {
+  try {
+    localStorage.removeItem(KEY);
   } catch {
     /* ignore */
   }

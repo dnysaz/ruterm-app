@@ -1,7 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { save as saveDialog } from '@tauri-apps/plugin-dialog';
-  import { api, errorText } from '$lib/api';
+  import { api, errorText, getSftpToken } from '$lib/api';
   import { imageMimeForPath } from '$lib/images';
   import { languageForPath } from '$lib/languages';
   import Icon from './Icon.svelte';
@@ -59,7 +58,7 @@
     if (mime) {
       // Images are previewed, not edited: one call, then a data: URL.
       try {
-        const image = await api.sftpReadImage(sftpId, path);
+        const image = await api.sftpReadImage(sftpId, getSftpToken(sftpId), path);
         imageSrc = `data:${mime};base64,${image.data}`;
         size = image.size;
         phase = 'image';
@@ -70,7 +69,7 @@
       return;
     }
     try {
-      const payload = await api.sftpReadFile(sftpId, path);
+      const payload = await api.sftpReadFile(sftpId, getSftpToken(sftpId), path);
       size = payload.size;
       if (payload.content === null) {
         content = '';
@@ -112,7 +111,7 @@
     saving = true;
     saveError = '';
     try {
-      await api.sftpWriteFile(sftpId, path, draft);
+      await api.sftpWriteFile(sftpId, getSftpToken(sftpId), path, draft);
       content = draft;
       size = new TextEncoder().encode(draft).length;
       dirty = false;
@@ -127,9 +126,8 @@
 
   async function downloadInstead() {
     try {
-      const local = await saveDialog({ defaultPath: baseName(path), title: 'Download to…' });
-      if (!local) return;
-      await api.sftpDownload(sftpId, path, local);
+      const localToken = await api.sftpPickDownload(baseName(path));
+      await api.sftpDownload(sftpId, getSftpToken(sftpId), path, localToken);
       showToast('Downloaded');
     } catch (e) {
       showToast(errorText(e));

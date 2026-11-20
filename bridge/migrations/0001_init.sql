@@ -34,8 +34,8 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 CREATE INDEX IF NOT EXISTS refresh_tokens_lookup ON refresh_tokens(token_hash);
 CREATE INDEX IF NOT EXISTS refresh_tokens_user ON refresh_tokens(user_id);
 
--- The vault blob is end-to-end encrypted on the client before upload;
--- the server only ever sees ciphertext + a revision counter.
+-- Secret fields are sealed on the client before upload. Host metadata in the
+-- vault JSON stays in plain text and is readable by the operator.
 CREATE TABLE IF NOT EXISTS vaults (
   user_id     TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   revision    INTEGER NOT NULL DEFAULT 0,

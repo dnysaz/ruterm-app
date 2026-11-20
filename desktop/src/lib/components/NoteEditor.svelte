@@ -1,7 +1,6 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
-  import { marked } from 'marked';
-  import DOMPurify from 'dompurify';
+  import { renderSafeMarkdown } from '$lib/markdown';
   import type { Note } from '$lib/api';
   import { terminalTint } from '$lib/background.svelte';
 
@@ -39,9 +38,7 @@
   }
 
   function renderMarkdown(markdown: string): string {
-    const html = marked.parse(markdown || '', { gfm: true, breaks: true }) as string;
-    if (typeof DOMPurify?.sanitize === 'function') return DOMPurify.sanitize(html);
-    return html;
+    return renderSafeMarkdown(markdown);
   }
 
   /** Same frosted-glass treatment the terminal uses: backdrop (if any) bleeds

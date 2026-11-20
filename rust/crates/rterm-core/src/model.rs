@@ -17,7 +17,7 @@ pub fn now() -> DateTime<Utc> {
 /// How we authenticate to a host.
 ///
 /// Secrets live inside the encrypted vault, never on the sync server in clear.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthMethod {
     Password {
@@ -43,6 +43,24 @@ impl Default for AuthMethod {
     }
 }
 
+// F-12/R-05: credentials must never leak through a derived `Debug`.
+impl std::fmt::Debug for AuthMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Password { .. } => f.write_str("Password { password: [REDACTED] }"),
+            Self::Key { identity_id, passphrase } => f
+                .debug_struct("Key")
+                .field("identity_id", identity_id)
+                .field("passphrase", &passphrase.as_ref().map(|_| "[REDACTED]"))
+                .finish(),
+            Self::Agent => f.write_str("Agent"),
+            Self::KeyboardInteractive { .. } => {
+                f.write_str("KeyboardInteractive { password: [REDACTED] }")
+            }
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityKind {
@@ -53,7 +71,7 @@ pub enum IdentityKind {
 }
 
 /// A reusable SSH key.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Identity {
     pub id: Id,
     pub label: String,
@@ -73,6 +91,23 @@ pub struct Identity {
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
     pub deleted: bool,
+}
+
+// F-12/R-05: private key material and its passphrase are never printed.
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Identity")
+            .field("id", &self.id)
+            .field("label", &self.label)
+            .field("private_key", &"[REDACTED]")
+            .field("passphrase", &self.passphrase.as_ref().map(|_| "[REDACTED]"))
+            .field("kind", &self.kind)
+            .field("fingerprint", &self.fingerprint)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("deleted", &self.deleted)
+            .finish()
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -350,9 +385,11 @@ impl Vault {
         self.hosts.iter().filter(|h| !h.deleted)
     }
 
-    /// Merge `remote` into `self` using last-writer-wins per entity.
-    /// Tombstones (`deleted = true`) take part in the comparison, so a delete
-    /// propagates as long as it is the newest edit.
+    /// Merge `remote` into `self` using last-writer-wins per live entity.
+    /// A tombstone (`deleted = true`) is terminal: it wins over any live record
+    /// regardless of `updated_at`, so a clock-skewed older client or a replayed
+    /// snapshot can never resurrect a deleted secret (R-04). A future undelete
+    /// feature must mint a NEW id instead of clearing a tombstone in place.
     pub fn merge(&mut self, remote: &Vault) {
         merge_vec(&mut self.hosts, remote.hosts.clone());
         merge_vec(&mut self.groups, remote.groups.clone());
@@ -378,15 +415,41 @@ impl Vault {
         self.updated_at = Some(now());
     }
 
-    /// Compact tombstones older than `days` (keeps payload small over time).
+    /// Remove the payload of old tombstones but KEEP the tombstone itself.
+    /// Dropping the record entirely lets an offline replica replay the older
+    /// live entity and resurrect a deleted secret (F-39).
     pub fn compact_tombstones(&mut self, days: i64) {
         let cutoff = Utc::now() - chrono::Duration::days(days);
-        self.hosts.retain(|h| !h.deleted || h.updated_at > cutoff);
-        self.groups.retain(|g| !g.deleted || g.updated_at > cutoff);
-        self.identities.retain(|i| !i.deleted || i.updated_at > cutoff);
-        self.snippets.retain(|s| !s.deleted || s.updated_at > cutoff);
-        self.notes.retain(|n| !n.deleted || n.updated_at > cutoff);
-        self.port_forwards.retain(|p| !p.deleted || p.updated_at > cutoff);
+        for host in self.hosts.iter_mut().filter(|h| h.deleted && h.updated_at <= cutoff) {
+            host.auth = AuthMethod::Agent;
+            host.notes.clear();
+            host.tags.clear();
+            host.label.clear();
+            host.address.clear();
+        }
+        for identity in self.identities.iter_mut().filter(|i| i.deleted && i.updated_at <= cutoff) {
+            identity.private_key.clear();
+            identity.passphrase = None;
+            identity.label.clear();
+        }
+        for snippet in self.snippets.iter_mut().filter(|s| s.deleted && s.updated_at <= cutoff) {
+            snippet.content.clear();
+            snippet.label.clear();
+        }
+        for note in self.notes.iter_mut().filter(|n| n.deleted && n.updated_at <= cutoff) {
+            note.body.clear();
+        }
+        for group in self.groups.iter_mut().filter(|g| g.deleted && g.updated_at <= cutoff) {
+            group.label.clear();
+        }
+        // R-04: port-forward tombstones were skipped, leaving bind/target hosts
+        // (which can be internal hostnames) in old synced tombstones.
+        for pf in self.port_forwards.iter_mut().filter(|p| p.deleted && p.updated_at <= cutoff) {
+            pf.label = None;
+            pf.bind_host.clear();
+            pf.target_host.clear();
+            // id / kind / ports stay so the tombstone remains a valid record.
+        }
     }
 
     /// All tags in use, sorted and de-duplicated.
@@ -406,6 +469,7 @@ impl Vault {
 pub trait SyncItem {
     fn id(&self) -> Id;
     fn updated_at(&self) -> DateTime<Utc>;
+    fn deleted(&self) -> bool;
 }
 
 macro_rules! sync_item {
@@ -416,6 +480,9 @@ macro_rules! sync_item {
             }
             fn updated_at(&self) -> DateTime<Utc> {
                 self.updated_at
+            }
+            fn deleted(&self) -> bool {
+                self.deleted
             }
         }
     };
@@ -428,6 +495,17 @@ sync_item!(Snippet);
 sync_item!(Note);
 sync_item!(PortForward);
 
+/// Whether `incoming` should replace `current` for the same entity id.
+/// Deletes dominate `updated_at`: a skewed clock or a replayed snapshot must
+/// never resurrect a secret that was deliberately deleted (R-04).
+fn should_replace<T: SyncItem>(current: &T, incoming: &T) -> bool {
+    match (current.deleted(), incoming.deleted()) {
+        (true, false) => false, // tombstone is terminal
+        (false, true) => true,  // delete wins even if its clock is behind
+        _ => incoming.updated_at() > current.updated_at(),
+    }
+}
+
 fn merge_vec<T: SyncItem + Clone>(local: &mut Vec<T>, remote: Vec<T>) {
     let mut index: HashMap<Id, usize> = local
         .iter()
@@ -438,7 +516,7 @@ fn merge_vec<T: SyncItem + Clone>(local: &mut Vec<T>, remote: Vec<T>) {
     for item in remote {
         match index.get(&item.id()) {
             Some(&i) => {
-                if item.updated_at() > local[i].updated_at() {
+                if should_replace(&local[i], &item) {
                     local[i] = item;
                 }
             }
@@ -543,5 +621,82 @@ mod tests {
         remote.hosts.push(tombstone);
         local.merge(&remote);
         assert!(local.hosts[0].deleted);
+    }
+
+    #[test]
+    fn tombstone_wins_equal_timestamp_and_compaction_keeps_it() {
+        let id = Uuid::new_v4();
+        let t0 = Utc::now() - chrono::Duration::days(400);
+        let mut tombstone = host(id, "gone", t0);
+        tombstone.deleted = true;
+        tombstone.notes = "a secret".into();
+        let mut local = Vault::default();
+        local.hosts.push(host(id, "alive", t0));
+        let mut remote = Vault::default();
+        remote.hosts.push(tombstone);
+        local.merge(&remote);
+        assert!(local.hosts[0].deleted);
+        local.compact_tombstones(30);
+        assert_eq!(local.hosts.len(), 1, "tombstone must survive compaction");
+        assert!(local.hosts[0].notes.is_empty(), "payload must be stripped");
+    }
+
+    #[test]
+    fn skewed_live_record_cannot_resurrect_tombstone() {
+        let id = Uuid::new_v4();
+        let t0 = Utc::now();
+        let mut tombstone = host(id, "gone", t0);
+        tombstone.deleted = true;
+        tombstone.notes = "secret".into();
+        let mut local = Vault::default();
+        local.hosts.push(tombstone);
+        let mut remote = Vault::default();
+        // A clock-skewed replica's live record is one day newer.
+        remote.hosts.push(host(id, "resurrected", t0 + chrono::Duration::days(1)));
+        local.merge(&remote);
+        assert_eq!(local.hosts.len(), 1);
+        assert!(local.hosts[0].deleted, "tombstone must remain terminal (R-04)");
+        assert_eq!(local.hosts[0].label, "gone");
+        assert_eq!(local.hosts[0].notes, "secret");
+    }
+
+    #[test]
+    fn older_tombstone_still_deletes_newer_live_record() {
+        let id = Uuid::new_v4();
+        let t0 = Utc::now();
+        let mut local = Vault::default();
+        local.hosts.push(host(id, "alive", t0 + chrono::Duration::days(1)));
+        let mut tombstone = host(id, "gone", t0);
+        tombstone.deleted = true;
+        let mut remote = Vault::default();
+        remote.hosts.push(tombstone);
+        local.merge(&remote);
+        assert!(local.hosts[0].deleted, "a delete must win even when its clock is behind (R-04)");
+    }
+
+    #[test]
+    fn port_forward_tombstone_is_compacted() {
+        let id = Uuid::new_v4();
+        let t0 = Utc::now() - chrono::Duration::days(400);
+        let mut pf = PortForward {
+            id,
+            host_id: Uuid::new_v4(),
+            kind: ForwardKind::Local,
+            bind_host: "127.0.0.1".into(),
+            bind_port: 8080,
+            target_host: "internal.example".into(),
+            target_port: 22,
+            label: Some("old forward".into()),
+            updated_at: t0,
+            deleted: true,
+        };
+        pf.deleted = true;
+        let mut vault = Vault::default();
+        vault.port_forwards.push(pf);
+        vault.compact_tombstones(30);
+        assert_eq!(vault.port_forwards.len(), 1, "tombstone must survive");
+        assert!(vault.port_forwards[0].label.is_none());
+        assert!(vault.port_forwards[0].bind_host.is_empty());
+        assert!(vault.port_forwards[0].target_host.is_empty());
     }
 }

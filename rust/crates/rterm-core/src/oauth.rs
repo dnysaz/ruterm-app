@@ -6,8 +6,9 @@
 //! * Mobile: the native Google Sign-In SDK obtains the access token; the app
 //!   passes it to [`crate::drive::DriveClient`].
 //!
-//! The vault itself is end-to-end encrypted, so Google only ever stores
-//! ciphertext in the hidden `appDataFolder` of the user's own Drive.
+//! Vault secrets are encrypted client-side before upload to the hidden
+//! `appDataFolder` of the user's own Drive; host metadata in the document is
+//! plain JSON and readable by anyone with access to that Drive file.
 
 use std::time::Duration;
 
@@ -50,7 +51,7 @@ pub struct GoogleAccount {
     pub picture: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct GoogleTokens {
     pub access_token: String,
     #[serde(default)]
@@ -64,10 +65,32 @@ pub struct GoogleTokens {
     pub id_token: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+// F-12: redact token material in Debug output.
+impl std::fmt::Debug for GoogleTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoogleTokens")
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "<redacted>"))
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .field("id_token", &self.id_token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct GoogleSession {
     pub tokens: GoogleTokens,
     pub account: GoogleAccount,
+}
+
+impl std::fmt::Debug for GoogleSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoogleSession")
+            .field("tokens", &self.tokens)
+            .field("account", &self.account)
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]
@@ -164,7 +187,9 @@ pub async fn authorize_loopback(
         .await
         .map_err(|_| OAuthError::Timeout)??;
 
-    if !returned_state.is_empty() && returned_state != state {
+    // State is mandatory: an empty or missing value must never bypass CSRF
+    // validation (F-15).
+    if returned_state != state {
         return Err(OAuthError::Protocol("oauth state mismatch".into()));
     }
 
@@ -324,10 +349,10 @@ async fn wait_for_code(listener: TcpListener) -> Result<(String, String), OAuthE
                 "code" => code = percent_decode(v),
                 "state" => state = percent_decode(v),
                 "error" => {
-                    let message = percent_decode(v);
-                    respond(&mut socket, 400, &format!("<h1>Login failed</h1><p>{message}</p>"))
-                        .await;
-                    return Err(OAuthError::Google(message));
+                    // Never reflect the attacker-controlled `error` value into
+                    // the loopback HTML (F-16). Show a static message only.
+                    respond(&mut socket, 400, "<h1>Login failed</h1><p>See the app for details.</p>").await;
+                    return Err(OAuthError::Protocol("google authorization was denied".into()));
                 }
                 _ => {}
             }
@@ -365,8 +390,12 @@ fn percent_decode(input: &str) -> String {
     while i < bytes.len() {
         match bytes[i] {
             b'%' if i + 2 < bytes.len() => {
-                if let Ok(hex) = u8::from_str_radix(&input[i + 1..i + 3], 16) {
-                    out.push(hex);
+                // Decode from bytes: slicing the &str at i+1..i+3 can land in
+                // the middle of a multi-byte UTF-8 sequence and panic (F-47).
+                let hi = hex_nibble(bytes[i + 1]);
+                let lo = hex_nibble(bytes[i + 2]);
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    out.push((hi << 4) | lo);
                     i += 3;
                     continue;
                 }
@@ -386,6 +415,15 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn urlencode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -397,4 +435,18 @@ fn urlencode(value: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_decode_handles_multibyte_without_panic() {
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("caf%C3%A9"), "café");
+        // A multi-byte char immediately after a stray '%' used to panic.
+        assert_eq!(percent_decode("%é"), "%é");
+        assert_eq!(percent_decode("%ZZ"), "%ZZ");
+    }
 }

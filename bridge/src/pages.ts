@@ -48,9 +48,10 @@ export function landing(): Response {
 <p class="wordmark">RuTerm<span class="cursor">_</span></p>
 <h1>Your SSH hosts, sealed.</h1>
 <p>RuTerm is an open-source, privacy-first SSH client for macOS built with Tauri
-and Rust. Vaults are encrypted end-to-end on your device — this domain exists only as
-a zero-knowledge sync bridge, so your terminal sessions and credentials follow you
-without ever being readable by anyone else.</p>
+and Rust. Secrets are sealed on your device — this domain exists only as a
+credential-encrypted sync bridge, so your credentials follow you without being readable
+by anyone else. Host metadata (addresses, usernames, tags) is stored in plain JSON and
+is visible to the operator; see the <a href="/privacy">privacy policy</a>.</p>
 <ul>
   <li>Field-level encryption: only passwords and private keys are sealed (XChaCha20-Poly1305, Argon2id).</li>
   <li>One JSON vault, kept in sync across devices — or offline, entirely local.</li>
@@ -68,14 +69,18 @@ export function privacy(): Response {
 <h1>Privacy policy</h1>
 <p class="muted">Last updated: November 2026</p>
 <p>The RuTerm sync bridge ("the service") is operated as a minimal,
-zero-knowledge store. This page explains what the service does and does not see.</p>
+credential store. Sealed credentials are unreadable, but host metadata is
+stored in plain JSON and visible to the operator. This page explains what the
+service does and does not see.</p>
 <ul>
   <li><strong>Account.</strong> When you sign in with Google, the service receives your
       Google account identifier (<code>sub</code>), email address and display name. It is
       used solely to authenticate you and identify your devices.</li>
-  <li><strong>Vault data.</strong> Your vault is encrypted on your device before upload.
-      The service stores ciphertext, a revision counter and timestamps. It cannot decrypt,
-      inspect or scan your hosts, credentials, keys, notes or terminal output.</li>
+  <li><strong>Vault data.</strong> Secrets (passwords, private keys, secret note fields) are
+      sealed on your device before upload. The service stores those sealed values, plus host
+      metadata (addresses, usernames, tags) in plain JSON, a revision counter and timestamps.
+      It cannot decrypt your credentials, keys or notes, but the operator can read your host
+      metadata. This is credential-encrypted sync, not zero-knowledge storage.</li>
   <li><strong>Devices.</strong> The service records the device name, platform and app
       version you register, so you can see and revoke sessions.</li>
   <li><strong>Refresh tokens.</strong> Stored only as SHA-256 hashes, rotated on every use,

@@ -1,7 +1,7 @@
 # Sync architecture — RuTerm bridge (Cloudflare Worker + D1)
 
 RuTerm works fully offline with a local `vault.json`. Signing in with Google
-adds cross-device sync through a **zero-knowledge bridge** you deploy yourself:
+adds cross-device sync through a **credential-encrypted bridge** you deploy yourself:
 
 ```
 Desktop app ──loopback+PKCE──► Google (consent, your Desktop client ID)
@@ -28,7 +28,8 @@ on-device before upload (XChaCha20-Poly1305, Argon2id).
 - No VPS to patch or pay for idle time; the Worker + D1 free tier covers
   early usage, and the whole bridge is one `wrangler deploy`.
 - The E2E encryption model is unchanged: the server stores ciphertext +
-  a revision counter, nothing else. It cannot read hosts, keys or passwords.
+  a revision counter and plaintext host metadata (labels, addresses,
+  usernames, tags, notes, settings). It cannot read sealed passwords or keys.
 - The same Desktop OAuth client ID is shared by all platforms (PKCE, no
   secret), so users configure nothing.
 

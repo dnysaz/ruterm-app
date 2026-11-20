@@ -34,7 +34,7 @@
     /** Shown under the title in the connecting overlay. */
     address?: string;
     /** One-shot target for quick-connect tabs (never persisted). */
-    adhoc?: { username: string; address: string; port: number };
+    adhoc?: { username: string; address: string; port: number; allowAgent?: boolean };
     /** Local PTY only: start the shell in this directory. */
     cwd?: string;
     /** Local PTY only: command typed into the shell right after spawn. */
@@ -98,6 +98,20 @@
   let observer: ResizeObserver | null = null;
   let flushSave: (() => void) | null = null;
   let status = $state<SessionStatus>('connecting');
+  /** Rust-issued capability for this PTY; never persisted outside sessionStorage. */
+  // svelte-ignore state_referenced_locally
+  const tokenKey = `rterm.session-token.${sessionId}`;
+  let sessionToken = $state(
+    typeof sessionStorage === 'undefined' ? '' : (sessionStorage.getItem(tokenKey) ?? ''),
+  );
+  function rememberToken(token: string) {
+    sessionToken = token;
+    try {
+      sessionStorage.setItem(tokenKey, token);
+    } catch {
+      /* storage disabled — the in-memory token still works until reload */
+    }
+  }
   /** Reactive tint for the terminal backdrop — see Settings → Background. */
   const tint = $derived(terminalTint());
 
@@ -190,12 +204,16 @@
 
     const write = (data: string) => {
       const payload = toBase64(new TextEncoder().encode(data));
-      void (kind === 'local' ? api.localWrite(sessionId, payload) : api.sshWrite(sessionId, payload)).catch(
+      void (kind === 'local'
+        ? api.localWrite(sessionId, sessionToken, payload)
+        : api.sshWrite(sessionId, sessionToken, payload)).catch(
         () => {},
       );
     };
     const resize = (cols: number, rows: number) => {
-      void (kind === 'local' ? api.localResize(sessionId, cols, rows) : api.sshResize(sessionId, cols, rows)).catch(
+      void (kind === 'local'
+        ? api.localResize(sessionId, sessionToken, cols, rows)
+        : api.sshResize(sessionId, sessionToken, cols, rows)).catch(
         () => {},
       );
     };
@@ -227,9 +245,10 @@
         adhoc?.port ?? 22,
         password === undefined ? 'agent' : 'password',
         password,
+        adhoc?.allowAgent === true,
         terminal.cols,
         terminal.rows,
-      );
+      ).then(rememberToken);
 
     const startPasswordMode = (reason: string) => {
       passwordMode = true;
@@ -388,7 +407,7 @@
       void (async () => {
         let info = null;
         try {
-          info = await api.sessionAttach(sessionId);
+          info = sessionToken ? await api.sessionAttach(sessionId, sessionToken) : null;
         } catch {
           info = null;
         }
@@ -430,19 +449,20 @@
 
         const openRequest =
           kind === 'local'
-            ? api.localOpen(sessionId, terminal.cols, terminal.rows, cwd).then(() => {
+            ? api.localOpen(sessionId, terminal.cols, terminal.rows, cwd).then(token => {
+                rememberToken(token);
                 // AI-agent tabs: type the agent command once the PTY is up.
                 // The kernel buffers the write until the login shell reads
                 // it, so no timing hack is needed.
                 if (command) {
                   const payload = toBase64(new TextEncoder().encode(`${command}\n`));
                   commandSentAt = Date.now();
-                  void api.localWrite(sessionId, payload).catch(() => {});
+                  void api.localWrite(sessionId, token, payload).catch(() => {});
                 }
               })
             : kind === 'adhoc'
               ? openAdhoc()
-              : api.sshOpen(sessionId, hostId, terminal.cols, terminal.rows);
+              : api.sshOpen(sessionId, hostId, terminal.cols, terminal.rows).then(rememberToken);
         // The overlay above the terminal shows the connection animation while
         // the session is opening; it goes away on the first terminal state.
         openRequest
@@ -484,7 +504,14 @@
     unlisteners.forEach(fn => fn());
     observer?.disconnect();
     term?.dispose();
-    void (kind === 'local' ? api.localClose(sessionId) : api.sshClose(sessionId)).catch(() => {});
+    void (kind === 'local'
+      ? api.localClose(sessionId, sessionToken)
+      : api.sshClose(sessionId, sessionToken)).catch(() => {});
+    try {
+      sessionStorage.removeItem(tokenKey);
+    } catch {
+      /* ignore */
+    }
   });
 </script>
 

@@ -3,7 +3,7 @@
 **RuTerm is an open-source SSH workspace for the desktop.** Hosts, identities,
 keys and terminal preferences live in a single JSON document that stays readable
 on your own machine, secrets are sealed locally, and — if you want it — the whole
-vault syncs through a **zero-knowledge bridge** you control. MIT licensed, no
+vault syncs through a **credential-encrypted bridge** you control. MIT licensed, no
 subscription, no account server, no vendor holding your credentials.
 
 A Termius-class workflow, built in the open.
@@ -70,8 +70,9 @@ A Termius-class workflow, built in the open.
   backup-able.
 - **Field-level encryption.** Passwords and private keys are sealed with
   XChaCha20-Poly1305 (Argon2id-derived key); everything else stays readable.
-- **Notes** (free-form Markdown) live in the same document — sealed like
-  everything else, synced like everything else — and open as full tabs in the UI.
+- **Notes** (free-form Markdown) live in the same document and open as full
+  tabs in the UI. Notes are readable JSON, so sync metadata stays visible to
+  the bridge operator.
 - Atomic writes (tmp → fsync → rename) with the previous file kept as
   `vault.json.bak`.
 - The vault key is cached in the OS keychain so reopening the app doesn't ask
@@ -83,9 +84,10 @@ A Termius-class workflow, built in the open.
 
 - Sign in with Google (one Desktop OAuth client, PKCE, system browser). The
   one client secret Google requires lives in the bridge, never in the app.
-- Sync goes through a **zero-knowledge bridge** (Cloudflare Worker + D1) that
-  stores ciphertext and a revision counter only. The operator cannot read your
-  credentials — there is nothing to leak.
+- Sync goes through a **credential-encrypted bridge** (Cloudflare Worker + D1).
+  Credential fields are sealed client-side; host labels, addresses, usernames,
+  notes, tags and settings remain readable metadata on the server. The operator
+  cannot read sealed credentials, but can read that metadata.
 - Deploy your own bridge (`bridge/`) in one command, or try the experimental
   hosted instance at `sync.lagitest.xyz`.
 - New device? Point it at the bridge, sign in, enter the same vault passphrase —
@@ -139,7 +141,7 @@ desktop/                Tauri v2 app (Svelte 5 + Vite) — the UI and command la
 rust/crates/rterm-core/ model · crypto · ssh (russh) · bridge client · OAuth
 rust/crates/rterm-cli/  headless harness for the SSH engine (used by tests)
 rust/crates/rterm-server/ legacy, optional — superseded by bridge/
-bridge/                 zero-knowledge sync bridge: Cloudflare Worker + D1 (TypeScript)
+bridge/                 credential-encrypted sync bridge: Cloudflare Worker + D1 (TypeScript)
 News/                   release notes (.md) — source of the in-app What's New tab
 docs/                   ARCHITECTURE · BUILD · SYNC · TESTING · GOOGLE_OAUTH
 ```
@@ -226,7 +228,7 @@ One document, on disk and on the bridge (field-level ciphertext inside):
   "revision": 7,
   "device_id": "3f0c…",
   "updated_at": "2026-11-18T09:12:33Z",
-  "kdf": { "alg": "argon2id", "salt_b64": "…", "m_cost": 65536, "t_cost": 3, "p_cost": 1 },
+  "kdf": { "alg": "argon2id", "salt_b64": "…", "m_cost": 19456, "t_cost": 2, "p_cost": 1 },
   "canary": "enc:v1:…",
   "vault": {
     "schema": 1,
@@ -246,8 +248,9 @@ One document, on disk and on the bridge (field-level ciphertext inside):
 
 - `kdf` and `canary` are part of the synced copy (neither is secret) so a new
   device can derive the same key from the same passphrase.
-- Sealed fields: host passwords, keyboard-interactive passwords, identity
-  private keys and their passphrases — stored as `enc:v1:<nonce_b64>:<ciphertext_b64>`.
+- Sealed fields: host passwords, key passphrases, keyboard-interactive
+  passwords, identity private keys and their passphrases — stored as
+  `enc:v1:<nonce_b64>:<ciphertext_b64>` and bound to the entity/field.
 - Writes are atomic (tmp → fsync → rename) and keep `vault.json.bak`.
 - The vault key is cached in the OS keychain; the refresh token never touches
   the JSON file.
@@ -257,8 +260,9 @@ One document, on disk and on the bridge (field-level ciphertext inside):
 - The passphrase never leaves the device; there is **no recovery**. If you lose
   the vault file and the passphrase, the sealed secrets are unrecoverable —
   keep your own backups of `vault.json`.
-- The bridge sees ciphertext and a revision counter, nothing else. It cannot
-  decrypt hosts, passwords or keys. It also cannot rescue a lost passphrase.
+- The bridge cannot decrypt sealed credentials, but it can read plaintext
+  host metadata (labels, addresses, usernames, tags, notes and settings) plus
+  the revision counter. It also cannot rescue a lost passphrase.
 - Refresh tokens rotate on every use; their SHA-256 hash lives in D1
   (`refresh_tokens` table), plaintext tokens never persist.
 - Google appears in the picture only for sign-in (`openid email profile`

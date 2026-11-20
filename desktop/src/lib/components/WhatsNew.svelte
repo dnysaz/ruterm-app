@@ -1,7 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { marked } from 'marked';
-  import DOMPurify from 'dompurify';
+  import { renderSafeMarkdown } from '$lib/markdown';
   import Icon from './Icon.svelte';
   import { loadNews, loadUnreadIds, markAllRead, type NewsEntry } from '$lib/news.svelte';
 
@@ -26,13 +25,11 @@
   }
 
   function renderMarkdown(markdown: string): string {
-    let html = marked.parse(markdown, { gfm: true, breaks: true }) as string;
-    // Relative links/images in notes point at the repo — send them to GitHub.
-    html = html.replace(/src="(?!https?:|data:)([^"]+)"/g, `src="${REPO_RAW}/$1"`);
-    html = html.replace(/href="(?!https?:|#|mailto:)([^"]+)"/g, `href="https://github.com/dnysaz/ruterm-app/blob/main/$1"`);
-    if (typeof DOMPurify?.sanitize === 'function') return DOMPurify.sanitize(html);
-    // Sanitizer unavailable — show the escaped source rather than raw HTML.
-    return html.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    // Relative links/images in release notes point at the repo — send them to GitHub.
+    return renderSafeMarkdown(markdown, {
+      linkBase: 'https://github.com/dnysaz/ruterm-app/blob/main/',
+      imageBase: `${REPO_RAW}/`,
+    });
   }
 
   async function refresh(force: boolean) {

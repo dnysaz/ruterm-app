@@ -74,7 +74,7 @@ enc:v1:<nonce_b64>:<ciphertext_b64>
 ```
 
 - XChaCha20-Poly1305, 24-byte random nonce per value.
-- Key = the vault `SecretKey`; no AAD.
+- Key = the vault `SecretKey`; associated data = key epoch || entity id || field name.
 - Sealed: host passwords, keyboard-interactive passwords, `private_key`,
   `passphrase`. Everything else stays readable so the file can be `jq`-ed,
   diffed and reviewed.
@@ -84,7 +84,7 @@ enc:v1:<nonce_b64>:<ciphertext_b64>
 ### Key handling & keychain
 
 ```
-passphrase ──Argon2id(salt, m=64MiB, t=3, p=1)──► SecretKey(32B)
+passphrase ──Argon2id(salt, m=19MiB, t=2, p=1)──► SecretKey(32B)
                                                    │
                      ┌─────────────────────────────┴──────────────┐
                      ▼                                            ▼
@@ -134,8 +134,9 @@ the same key from the same passphrase and then open the vault via
 
 The vault key itself never syncs — the passphrase **must be identical** on every
 device. If it differs, `open_vault` fails and sync is aborted without touching
-local data. The server stores only ciphertext + revision — not even the operator
-can read the contents. Deploy: `bridge/README.md`, details: `docs/SYNC.md`.
+local data. Secret fields are ciphertext on the server, but host metadata is
+plain JSON and readable by the operator (credential-encrypted sync, not
+zero-knowledge). Deploy: `bridge/README.md`, details: `docs/SYNC.md`.
 
 ## SSH sessions
 

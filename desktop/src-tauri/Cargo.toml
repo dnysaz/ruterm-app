@@ -27,11 +27,13 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "linux-
 portable-pty = "0.9.0"
 tauri-plugin-opener = "2.7.3"
 tauri-plugin-dialog = "2"
+zeroize = "1"
 
 # See https://tauri.app/concept/size/ for the release profile rationale.
+# R-09: no `panic = "abort"` — unwinding keeps a single bad IPC payload from
+# killing the whole app, and Tauri's desktop target is a binary, not a cdylib.
 [profile.release]
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
 strip = true

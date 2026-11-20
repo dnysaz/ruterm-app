@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api } from '$lib/api';
-  import { app, fail, lock, notify, signIn, signOut, syncNow } from '$lib/state.svelte';
+  import { api, errorText } from '$lib/api';
+  import { app, fail, lock, notify, setRememberKey, signIn, signOut, syncNow } from '$lib/state.svelte';
   import { applyTheme, ui, type Theme } from '$lib/ui.svelte';
   import { isRestoreEnabled, setRestoreEnabled } from '$lib/scrollback';
   import Icon from './Icon.svelte';
@@ -213,9 +213,8 @@
           </label>
         </div>
         <p class="hint">
-          Quitting the app stops every session — the text you read is saved so it is still there
-          when the app reopens, with a fresh connection below it. Stored as plain text in local
-          storage, never synced. Turn off to store nothing; existing snapshots are erased.
+          Off by default: terminal text can contain secrets. If enabled, the last lines are kept
+          as plain text in local storage (never synced) and erased on lock or sign-out.
         </p>
       </section>
 
@@ -244,7 +243,26 @@
               Lock vault
             </button>
           </div>
+          <div class="row">
+            <div class="cell">
+              <div class="strong">Remember key on this device</div>
+              <small>Off by default. Stores the vault key in your OS keychain for one-click unlock.</small>
+            </div>
+            <input
+              type="checkbox"
+              class="switch"
+              checked={app.canAutoUnlock}
+              onchange={event =>
+                void setRememberKey(event.currentTarget.checked).catch(error =>
+                  notify(errorText(error)),
+                )}
+            />
+          </div>
         </div>
+        <p class="hint">
+          Anyone who can unlock this device account could then open your vault without the
+          passphrase. Turn this off to remove the saved key at any time.
+        </p>
       </section>
 
       <section class="section">

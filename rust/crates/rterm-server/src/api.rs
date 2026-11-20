@@ -1,7 +1,13 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration as StdDuration, Instant};
 
-use axum::extract::{FromRequestParts, Path, Query, State};
-use axum::http::{header, request::Parts, StatusCode};
+use axum::body::Body;
+use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
+use axum::http::{header, request::Parts, Request, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use chrono::{Duration, Utc};
@@ -16,14 +22,84 @@ use crate::error::{ApiError, ApiResult};
 use crate::google;
 use crate::Config;
 
+/// Best-effort in-process throttle for `/v1/auth/*`. Slows online guessing on
+/// a self-hosted instance; not a substitute for an edge WAF (F-14).
+#[derive(Clone, Default)]
+pub struct AuthLimiter {
+    hits: Arc<Mutex<HashMap<String, (usize, Instant)>>>,
+}
+
+impl AuthLimiter {
+    fn allow(&self, key: &str) -> bool {
+        let mut hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let entry = hits.entry(key.to_string()).or_insert((0, now));
+        if now.duration_since(entry.1) >= StdDuration::from_secs(60) {
+            *entry = (1, now);
+            return true;
+        }
+        entry.0 += 1;
+        entry.0 <= 10
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub cfg: Arc<Config>,
     pub db: SqlitePool,
     pub http: reqwest::Client,
+    pub limiter: AuthLimiter,
+}
+
+async fn auth_rate_limit(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    if req.uri().path().starts_with("/v1/auth/") {
+        let ip = req
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0.ip().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        if !state.limiter.allow(&ip) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "error": "rate_limited" })),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
 }
 
 pub fn router(state: AppState) -> Router {
+    use axum::http::{HeaderValue, Method, header};
+    use tower_http::cors::CorsLayer;
+
+    // Restrictive CORS: only explicitly configured origins (F-42). Tauri
+    // webviews and same-origin health checks are unaffected.
+    let origins: Vec<HeaderValue> = state
+        .cfg
+        .allowed_origins
+        .iter()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    let cors = if origins.is_empty() {
+        CorsLayer::new()
+    } else {
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
+            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+    };
+
     Router::new()
         .route("/health", get(health))
         .route("/v1/auth/google", post(auth_google))
@@ -37,9 +113,13 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/devices", get(list_devices))
         .route("/v1/devices/{id}", delete(delete_device))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
-            8 * 1024 * 1024,
+            state.cfg.max_vault_bytes.min(8 * 1024 * 1024) + 64 * 1024,
         ))
-        .layer(tower_http::cors::CorsLayer::permissive())
+        .layer(cors)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_rate_limit,
+        ))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -136,6 +216,7 @@ async fn finish_login(
 ) -> ApiResult<AuthResponse> {
     let user = db::upsert_user(&state.db, google_sub, email, name, avatar_url).await?;
     let refresh = new_refresh_token();
+    let refresh_expires_at = Utc::now() + Duration::days(state.cfg.refresh_token_ttl_days);
     let (dev_name, platform, version) = device.normalized();
     let device_id = db::create_device(
         &state.db,
@@ -144,6 +225,7 @@ async fn finish_login(
         &platform,
         &version,
         &hash_token(&refresh),
+        refresh_expires_at,
     )
     .await?;
     let (access_token, expires_in) = issue_access_token(&state.cfg, &user, &device_id)?;
@@ -211,6 +293,7 @@ async fn auth_google_code(
         client_secret,
         &body.code,
         &redirect,
+        &state.cfg.google_allowed_domains,
     )
     .await?;
     let res = finish_login(
@@ -289,9 +372,21 @@ async fn auth_refresh(
         .await?
         .ok_or_else(|| ApiError::Unauthorized("user no longer exists".into()))?;
 
-    // Rotate the refresh token on every use.
+    // Rotate the refresh token on every use. The conditional update rejects
+    // concurrent/stale reuse of the old token (F-09/F-45).
     let new_refresh = new_refresh_token();
-    db::rotate_refresh(&state.db, &device.device_id, &hash_token(&new_refresh)).await?;
+    let new_expires_at = Utc::now() + Duration::days(state.cfg.refresh_token_ttl_days);
+    if !db::rotate_refresh(
+        &state.db,
+        &device.device_id,
+        &hash_token(&body.refresh_token),
+        &hash_token(&new_refresh),
+        new_expires_at,
+    )
+    .await?
+    {
+        return Err(ApiError::Unauthorized("invalid refresh token".into()));
+    }
     let (access_token, expires_in) = issue_access_token(&state.cfg, &user, &device.device_id)?;
 
     Ok(Json(AuthResponse {
@@ -341,6 +436,12 @@ impl FromRequestParts<AppState> for Authed {
 
         if data.claims.typ != "access" {
             return Err(ApiError::Unauthorized("wrong token type".into()));
+        }
+        // A revoked device must lose access immediately, even with a valid,
+        // unexpired JWT (F-36). Also binds the token to its owner so a token
+        // cannot be replayed against another user's device id.
+        if !db::device_is_active(&state.db, &data.claims.sub, &data.claims.did).await? {
+            return Err(ApiError::Unauthorized("device revoked".into()));
         }
         let _ = db::touch_device(&state.db, &data.claims.did).await;
         Ok(Authed {

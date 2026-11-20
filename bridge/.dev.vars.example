@@ -1,4 +1,5 @@
-# Local dev only — never committed (repo-root .gitignore covers .dev.vars via !.env.example? no:)
-# copy to .dev.vars and fill a random value.
-JWT_SECRET=dev-only-change-me-0123456789abcdef0123456789abcdef
+# Local dev only — never committed. COPY THIS FILE, THEN REPLACE JWT_SECRET.
+# The placeholder below is deliberately rejected by the Worker at startup.
+# Generate a real value with: openssl rand -hex 32
+JWT_SECRET=REPLACE_WITH_THE_OUTPUT_OF_openssl_rand_hex_32
 GOOGLE_CLIENT_SECRET=dev-only-placeholder-desktop-client-secret

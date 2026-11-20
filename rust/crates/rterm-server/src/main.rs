@@ -30,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
         cfg: Arc::new(cfg),
         db: pool,
         http,
+        limiter: api::AuthLimiter::default(),
     };
     let app = api::router(state);
 
@@ -37,6 +38,10 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("cannot bind {bind}"))?;
     tracing::info!("rterm sync server listening on http://{bind}");
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

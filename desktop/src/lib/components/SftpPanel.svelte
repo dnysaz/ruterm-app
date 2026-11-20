@@ -1,7 +1,14 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from 'svelte';
-  import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
-  import { api, errorText, type SessionStatus, type SftpDir, type SftpEntry } from '$lib/api';
+  import {
+    api,
+    errorText,
+    forgetSftpToken,
+    rememberSftpToken,
+    type SessionStatus,
+    type SftpDir,
+    type SftpEntry,
+  } from '$lib/api';
   import Icon from './Icon.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
 
@@ -9,6 +16,7 @@
     username: string;
     address: string;
     port: number;
+    allowAgent: boolean;
   }
 
   let {
@@ -48,6 +56,8 @@
   let toastTimer: ReturnType<typeof setTimeout> | null = null;
   let dropHover = $state(false);
   let info = $state<{ user: string; address: string; port: number } | null>(null);
+  /** Rust-issued capability for this SFTP session; required on every call. */
+  let sftpToken = $state('');
   /** Dot files are hidden by default (like Finder); this toggles them. */
   let showHidden = $state(false);
 
@@ -92,6 +102,12 @@
     return dirPath.endsWith('/') ? `${dirPath}${name}` : `${dirPath}/${name}`;
   }
 
+  function safeEntryName(name: string): string | null {
+    const trimmed = name.trim();
+    if (!trimmed || trimmed === '.' || trimmed === '..' || /[/\\\0]/.test(trimmed)) return null;
+    return trimmed;
+  }
+
   function baseName(p: string): string {
     const trimmed = p.replace(/\/+$/, '');
     return trimmed.slice(trimmed.lastIndexOf('/') + 1);
@@ -106,9 +122,11 @@
     error = '';
     try {
       const opened = adhoc
-        ? await api.sftpOpenAdhoc(sftpId, adhoc.username, adhoc.address, adhoc.port)
+        ? await api.sftpOpenAdhoc(sftpId, adhoc.username, adhoc.address, adhoc.port, adhoc.allowAgent === true)
         : await api.sftpOpenHost(sftpId, hostId);
       info = { user: opened.user, address: opened.address, port: opened.port };
+      sftpToken = opened.token;
+      rememberSftpToken(sftpId, opened.token);
       phase = 'ready';
       setStatus('connected');
       await refresh(opened.home);
@@ -123,7 +141,7 @@
     const target = path ?? dir?.path ?? '/';
     loading = true;
     try {
-      dir = await api.sftpList(sftpId, target);
+      dir = await api.sftpList(sftpId, sftpToken, target);
       selected = null;
     } catch (e) {
       showToast(errorText(e));
@@ -148,18 +166,13 @@
   // ------------------------------------------------------------- actions
   async function uploadFiles() {
     try {
-      const picked = await openDialog({
-        multiple: true,
-        directory: false,
-        title: 'Upload files',
-      });
-      if (!picked) return;
-      const paths = Array.isArray(picked) ? picked : [picked];
-      busy += paths.length;
+      const handles = await api.sftpPickUploads();
+      if (!handles.length) return;
+      busy += handles.length;
       let failed = 0;
-      for (const localPath of paths) {
+      for (const localToken of handles) {
         try {
-          await api.sftpUpload(sftpId, localPath, dir?.path ?? '/');
+          await api.sftpUpload(sftpId, sftpToken, localToken, dir?.path ?? '/');
         } catch {
           failed += 1;
         } finally {
@@ -176,14 +189,10 @@
 
   async function downloadEntry(entry: SftpEntry) {
     try {
-      const local = await saveDialog({
-        defaultPath: entry.name,
-        title: 'Download to…',
-      });
-      if (!local) return;
+      const localToken = await api.sftpPickDownload(entry.name);
       busy += 1;
       try {
-        await api.sftpDownload(sftpId, entry.path, local);
+        await api.sftpDownload(sftpId, sftpToken, entry.path, localToken);
       } finally {
         busy -= 1;
       }
@@ -212,13 +221,13 @@
     const remotePath = joinPath(dir?.path ?? '/', name);
     try {
       if (kind === 'file') {
-        await api.sftpCreateFile(sftpId, remotePath);
+        await api.sftpCreateFile(sftpId, sftpToken, remotePath);
         await refresh();
         // A brand-new file is useless to leave sitting there — open it.
         onopenfile?.({ name, path: remotePath, is_dir: false, is_symlink: false, size: 0, mtime: Math.floor(Date.now() / 1000), permissions: null });
         return;
       }
-      await api.sftpMkdir(sftpId, remotePath);
+      await api.sftpMkdir(sftpId, sftpToken, remotePath);
       await refresh();
     } catch (e) {
       showToast(errorText(e));
@@ -247,7 +256,7 @@
     }
     const parent = target.slice(0, target.length - entry.name.length);
     try {
-      await api.sftpRename(sftpId, target, joinPath(parent, draft));
+      await api.sftpRename(sftpId, sftpToken, target, joinPath(parent, draft));
       await refresh();
     } catch (e) {
       showToast(errorText(e));
@@ -259,7 +268,7 @@
     toDelete = null;
     if (!entry) return;
     try {
-      await api.sftpRemove(sftpId, entry.path, entry.is_dir);
+      await api.sftpRemove(sftpId, sftpToken, entry.path, entry.is_dir);
       await refresh();
     } catch (e) {
       showToast(errorText(e));
@@ -285,9 +294,14 @@
     busy += files.length;
     let failed = 0;
     for (const file of files) {
+      const name = safeEntryName(file.name);
+      if (!name) {
+        failed += 1;
+        continue;
+      }
       try {
         const buf = new Uint8Array(await file.arrayBuffer());
-        await api.sftpUploadBytes(sftpId, joinPath(target, file.name), bytesToBase64(buf));
+        await api.sftpUploadBytes(sftpId, sftpToken, joinPath(target, name), bytesToBase64(buf));
       } catch {
         failed += 1;
       } finally {
@@ -316,7 +330,8 @@
 
   onDestroy(() => {
     if (toastTimer) clearTimeout(toastTimer);
-    void api.sftpClose(sftpId).catch(() => {});
+    void api.sftpClose(sftpId, sftpToken).catch(() => {});
+    forgetSftpToken(sftpId);
   });
 
   // ------------------------------------------------------------- format

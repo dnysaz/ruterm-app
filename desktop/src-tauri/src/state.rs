@@ -1,7 +1,7 @@
 //! Shared application state: unlocked vault, Google session, live SSH handles.
 
 use rterm_core::crypto::{KdfParams, SecretKey};
-use rterm_core::model::Vault;
+use rterm_core::model::{Identity, Vault};
 use rterm_core::oauth::GoogleAccount;
 use rterm_core::sftp::SftpSession;
 use rterm_core::ssh::SshHandle;
@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use crate::store::AppSettings;
 
@@ -26,6 +27,8 @@ pub struct Session {
 pub struct Paths {
     pub vault: PathBuf,
     pub settings: PathBuf,
+    /// Persisted trust-on-first-use host-key pins (`user@host:port` → SHA256).
+    pub tofu: PathBuf,
 }
 
 /// One entry per live or recently finished session: a small rolling buffer of
@@ -71,6 +74,18 @@ pub struct AppState {
     pub sftp: tokio::sync::Mutex<HashMap<String, SftpSession>>,
     /// Output buffers for every session, keyed by session id (tab id).
     pub output: Mutex<HashMap<String, StreamEntry>>,
+    /// Opaque, Rust-issued capability per terminal session. Every write,
+    /// resize, close and replay must present the token returned by `*_open`.
+    pub session_tokens: Mutex<HashMap<String, String>>,
+    /// Same capability model for SFTP sessions: every list/read/write/close
+    /// must present the token returned by `sftp_open_*` (R-01).
+    pub sftp_tokens: Mutex<HashMap<String, String>>,
+    /// One-shot handles for local paths chosen in a native dialog. Renderer
+    /// never supplies a raw local path to an SFTP command.
+    pub local_file_tokens: Mutex<HashMap<String, PathBuf>>,
+    /// Newly generated/imported private keys awaiting the renderer's next
+    /// `vault_save`. Kept in Rust so the plaintext key never crosses IPC.
+    pub pending_identities: Mutex<HashMap<Uuid, Identity>>,
 }
 
 impl AppState {
@@ -88,6 +103,10 @@ impl AppState {
             local: Mutex::new(HashMap::new()),
             sftp: tokio::sync::Mutex::new(HashMap::new()),
             output: Mutex::new(HashMap::new()),
+            session_tokens: Mutex::new(HashMap::new()),
+            sftp_tokens: Mutex::new(HashMap::new()),
+            local_file_tokens: Mutex::new(HashMap::new()),
+            pending_identities: Mutex::new(HashMap::new()),
         }
     }
 
@@ -103,16 +122,23 @@ impl AppState {
     /// settings.json (self-hosted), else the `RTERM_BRIDGE_URL` baked in at
     /// build time (official releases). Empty means sync is unavailable but
     /// the local vault keeps working.
+    ///
+    /// This value decides where OAuth codes, refresh tokens and the encrypted
+    /// vault are sent, so it is validated before every use (F-02). Plain HTTP
+    /// is only accepted for a loopback bridge in debug builds.
     pub async fn bridge_url(&self) -> Result<String, String> {
         let settings = self.settings_rw.read().await;
-        let local = settings.bridge_url.trim().to_string();
-        if !local.is_empty() {
-            return Ok(local);
-        }
-        if let Some(env_url) = option_env!("RTERM_BRIDGE_URL").map(str::trim).filter(|v| !v.is_empty()) {
-            return Ok(env_url.to_string());
-        }
-        Err("Sync bridge is not configured yet — local vault still works offline".into())
+        let local = settings.bridge_url.trim();
+        let candidate = if !local.is_empty() {
+            local
+        } else if let Some(env_url) =
+            option_env!("RTERM_BRIDGE_URL").map(str::trim).filter(|v| !v.is_empty())
+        {
+            env_url
+        } else {
+            return Err("Sync bridge is not configured yet — local vault still works offline".into());
+        };
+        validate_bridge_url(candidate)
     }
 
     pub async fn unlocked_key(&self) -> Result<SecretKey, String> {
@@ -130,6 +156,30 @@ impl AppState {
             .clone()
             .ok_or_else(|| "Vault is locked".to_string())
     }
+}
+
+/// Rejects URLs that would leak OAuth material or the synced vault to a
+/// plaintext or attacker-controlled endpoint.
+pub fn validate_bridge_url(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        return Ok(String::new());
+    }
+    let url = tauri::Url::parse(value)
+        .map_err(|_| "Bridge URL must be an absolute URL".to_string())?;
+    match url.scheme() {
+        "https" => {}
+        "http" if cfg!(debug_assertions) => {
+            let host = url.host_str().unwrap_or("");
+            if host != "127.0.0.1" && host != "localhost" {
+                return Err("A plaintext bridge URL is only allowed on loopback in debug builds".into());
+            }
+        }
+        other => return Err(format!("Unsupported bridge URL scheme: {other}")),
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("Bridge URL must not contain credentials".into());
+    }
+    Ok(value.trim_end_matches('/').to_string())
 }
 
 // --------------------------------------------------------------- keychain

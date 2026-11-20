@@ -42,6 +42,23 @@ const clampDim = (value: unknown, fallback = DEFAULTS.dim): number => {
   return Math.min(85, Math.max(0, Math.round(n)));
 };
 
+// F-54: a custom wallpaper must be a base64 data URL of a supported image
+// type. Anything else (CSS injection, remote tracking URLs, script tricks)
+// is rejected both when persisted and when read back from localStorage.
+const MAX_CUSTOM_BYTES = 8 * 1024 * 1024;
+const DATA_IMAGE_RE = /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+={0,2}$/;
+
+function isValidDataImage(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length <= MAX_CUSTOM_BYTES
+    && DATA_IMAGE_RE.test(value);
+}
+
+/** Escapes a value for use inside `url("…")` in an inline style. */
+function cssUrl(value: string): string {
+  return value.replace(/[\\")]/g, c => `\\${c}`).replace(/\n|\r/g, '');
+}
+
 function read(): BackgroundChoice {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -69,7 +86,8 @@ function read(): BackgroundChoice {
 
 function readCustom(): string | null {
   try {
-    return localStorage.getItem(CUSTOM_KEY);
+    const value = localStorage.getItem(CUSTOM_KEY);
+    return isValidDataImage(value) ? value : null;
   } catch {
     return null;
   }
@@ -113,6 +131,7 @@ export function setBackgroundPattern(patternId: string) {
  * session, just not across restarts.
  */
 export function setBackgroundCustom(src: string): boolean {
+  if (!isValidDataImage(src)) return false;
   backgroundCustom.src = src;
   let saved = true;
   try {
@@ -165,13 +184,10 @@ export function setBackgroundTermDim(value: number) {
  */
 export function backgroundStyle(): string {
   if (background.mode === 'image') {
-    const src =
-      background.imageId === 'custom' && backgroundCustom.src
-        ? backgroundCustom.src
-        : findImage(background.imageId).src;
-    const safeSrc = src.replace(/'/g, '%27');
+    const custom = background.imageId === 'custom' ? backgroundCustom.src : null;
+    const src = custom && isValidDataImage(custom) ? custom : findImage(background.imageId).src;
     return (
-      `background-image: url('${safeSrc}'); ` +
+      `background-image: url("${cssUrl(src)}"); ` +
       `background-size: cover; background-position: center; background-repeat: no-repeat;`
     );
   }

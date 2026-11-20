@@ -8,9 +8,52 @@ use chrono::{DateTime, Utc};
 use rterm_core::crypto::KdfParams;
 use rterm_core::model::Vault;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+/// Owner-only permissions for app data (F-11).
+#[cfg(unix)]
+pub fn restrict_dir(path: &Path) -> Result<(), String> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("chmod 0700 {}: {e}", path.display()))
+}
+
+#[cfg(not(unix))]
+pub fn restrict_dir(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+pub fn restrict_file(path: &Path) -> Result<(), String> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("chmod 0600 {}: {e}", path.display()))
+}
+
+#[cfg(not(unix))]
+pub fn restrict_file(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+/// Flush a directory entry so a rename survives a crash/power loss (F-13).
+#[cfg(unix)]
+fn sync_parent(path: &Path) -> Result<(), String> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let handle = fs::File::open(dir)
+        .map_err(|e| format!("open {}: {e}", dir.display()))?;
+    handle
+        .sync_all()
+        .map_err(|e| format!("fsync {}: {e}", dir.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct VaultFile {
@@ -55,19 +98,33 @@ pub fn read(path: &Path) -> Result<Option<VaultFile>, String> {
 pub fn write_atomic(path: &Path, file: &VaultFile) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+        restrict_dir(dir)?;
     }
+    let backup = path.with_extension("json.bak");
     if path.exists() {
-        let backup = path.with_extension("json.bak");
-        let _ = fs::copy(path, backup);
+        let _ = fs::copy(path, &backup);
+        let _ = restrict_file(&backup);
     }
     let text = serde_json::to_string_pretty(file).map_err(|e| e.to_string())?;
     let tmp = path.with_extension("json.tmp");
     {
+        #[cfg(unix)]
+        let mut out = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| e.to_string())?;
+        #[cfg(not(unix))]
         let mut out = fs::File::create(&tmp).map_err(|e| e.to_string())?;
         out.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
         out.sync_all().map_err(|e| e.to_string())?;
     }
+    restrict_file(&tmp)?;
     fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))?;
+    restrict_file(path)?;
+    sync_parent(path)?;
     Ok(())
 }
 
@@ -121,16 +178,102 @@ impl Default for AppSettings {
 }
 
 pub fn read_settings(path: &Path) -> AppSettings {
-    fs::read_to_string(path)
+    let mut settings: AppSettings = fs::read_to_string(path)
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // A hand-edited or truncated settings file must not yield an empty device
+    // id, which would be reused as an identity across installs (F-34).
+    if settings.device_id.trim().is_empty() {
+        settings.device_id = uuid::Uuid::new_v4().to_string();
+    }
+    settings
 }
 
 pub fn write_settings(path: &Path, settings: &AppSettings) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        restrict_dir(dir)?;
+    }
+    if settings.device_id.trim().is_empty() {
+        return Err("refusing to save settings with an empty device id".into());
     }
     let text = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
-    fs::write(path, text).map_err(|e| format!("failed to save settings: {e}"))
+    {
+        #[cfg(unix)]
+        let mut out = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("failed to save settings: {e}"))?;
+        #[cfg(not(unix))]
+        let mut out = fs::File::create(path).map_err(|e| format!("failed to save settings: {e}"))?;
+        out.write_all(text.as_bytes())
+            .map_err(|e| format!("failed to save settings: {e}"))?;
+        out.sync_all()
+            .map_err(|e| format!("failed to save settings: {e}"))?;
+    }
+    restrict_file(path)?;
+    sync_parent(path)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------- TOFU host pins (F-46)
+
+/// Reads the persisted `user@host:port → SHA256 fingerprint` map. A corrupt or
+/// unreadable file yields an empty map: callers then fall back to a fresh TOFU
+/// observation instead of trusting garbage.
+pub fn read_tofu(path: &Path) -> HashMap<String, String> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<HashMap<String, String>>(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Persists an observed host-key fingerprint. Never overwrites an existing pin
+/// with a different value: a changed fingerprint must surface as a mismatch,
+/// not be silently accepted (TOFU warning).
+pub fn remember_fingerprint(
+    path: &Path,
+    host_key: &str,
+    fingerprint: &str,
+) -> Result<(), String> {
+    if host_key.is_empty() || fingerprint.is_empty() {
+        return Err("invalid host key or fingerprint".into());
+    }
+    let mut pins = read_tofu(path);
+    if let Some(existing) = pins.get(host_key) {
+        if existing != fingerprint {
+            return Err("host key fingerprint changed — refusing to overwrite pin".into());
+        }
+        return Ok(());
+    }
+    pins.insert(host_key.to_string(), fingerprint.to_string());
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        restrict_dir(dir)?;
+    }
+    let text = serde_json::to_string_pretty(&pins).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    {
+        #[cfg(unix)]
+        let mut out = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| e.to_string())?;
+        #[cfg(not(unix))]
+        let mut out = fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        out.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+        out.sync_all().map_err(|e| e.to_string())?;
+    }
+    restrict_file(&tmp)?;
+    fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    restrict_file(path)?;
+    sync_parent(path)?;
+    Ok(())
 }

@@ -1,14 +1,15 @@
 //! Client-side end-to-end encryption for the vault.
 //!
-//! The server only ever stores [`SealedVault`]: a JSON envelope containing an
-//! XChaCha20-Poly1305 ciphertext plus the Argon2id parameters used to turn the
-//! user's passphrase into the vault key. The passphrase never leaves the
-//! device, so a compromised server cannot read hostnames, passwords or keys.
+//! Secret fields travel inside [`SealedVault`]: an XChaCha20-Poly1305 envelope
+//! plus the Argon2id parameters used to turn the passphrase into the vault key.
+//! The passphrase never leaves the device, so a compromised server cannot read
+//! passwords, private keys or secret notes. Host metadata (addresses, usernames,
+//! tags) is NOT encrypted and is readable by the sync operator.
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     XChaCha20Poly1305, XNonce,
 };
 use rand::RngCore;
@@ -38,6 +39,8 @@ pub enum CryptoError {
     Json(#[from] serde_json::Error),
     #[error("unsupported vault schema {0}")]
     Schema(u32),
+    #[error("unsafe KDF parameters: {0}")]
+    UnsafeKdf(String),
 }
 
 /// 32-byte symmetric key. Zeroized on drop and never printed.
@@ -138,18 +141,32 @@ impl KdfParams {
         Ok(B64.decode(&self.salt_b64)?)
     }
 
-    /// Cheap parameters, for unit tests only.
-    #[cfg(test)]
-    pub fn new_test() -> Self {
-        let mut params = Self::new_default();
-        params.m_cost = 8;
-        params.t_cost = 1;
-        params
+    /// Reject attacker-controlled cost parameters before Argon2 allocates
+    /// memory. These bounds come from the OWASP 2024 baseline and cap a single
+    /// derivation at ~256 MiB / 10 passes (F-07).
+    pub fn validate(&self) -> Result<(), CryptoError> {
+        if self.alg != "argon2id" {
+            return Err(CryptoError::UnsafeKdf(format!("unsupported algorithm {}", self.alg)));
+        }
+        let salt_len = self.salt()?.len();
+        if !(SALT_LEN..=64).contains(&salt_len) {
+            return Err(CryptoError::UnsafeKdf(format!("salt length {salt_len}")));
+        }
+        if !(19 * 1024..=256 * 1024).contains(&self.m_cost) {
+            return Err(CryptoError::UnsafeKdf(format!("m_cost {}", self.m_cost)));
+        }
+        if !(2..=10).contains(&self.t_cost) {
+            return Err(CryptoError::UnsafeKdf(format!("t_cost {}", self.t_cost)));
+        }
+        if !(1..=4).contains(&self.p_cost) {
+            return Err(CryptoError::UnsafeKdf(format!("p_cost {}", self.p_cost)));
+        }
+        Ok(())
     }
 }
 
 /// What the sync server stores. Contains no plaintext and no key material.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct SealedVault {
     pub v: u32,
     /// `None` means the key is a high-entropy recovery key used directly.
@@ -158,10 +175,21 @@ pub struct SealedVault {
     pub ciphertext_b64: String,
 }
 
-pub fn derive_key(passphrase: &str, params: &KdfParams) -> Result<SecretKey, CryptoError> {
-    if params.alg != "argon2id" {
-        return Err(CryptoError::Kdf(format!("unsupported kdf {}", params.alg)));
+// F-12: keep ciphertext out of debug logs (recent plaintext edits can leak
+// through length/contents otherwise).
+impl std::fmt::Debug for SealedVault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedVault")
+            .field("v", &self.v)
+            .field("kdf", &self.kdf)
+            .field("nonce_b64", &self.nonce_b64)
+            .field("ciphertext_b64", &"<redacted>")
+            .finish()
     }
+}
+
+pub fn derive_key(passphrase: &str, params: &KdfParams) -> Result<SecretKey, CryptoError> {
+    params.validate()?;
     let salt = params.salt()?;
     let argon_params = Params::new(params.m_cost, params.t_cost, params.p_cost, Some(KEY_LEN))
         .map_err(|e| CryptoError::Kdf(e.to_string()))?;
@@ -173,17 +201,21 @@ pub fn derive_key(passphrase: &str, params: &KdfParams) -> Result<SecretKey, Cry
     Ok(SecretKey(out))
 }
 
+/// Seals plaintext with mandatory associated data. `aad` binds the ciphertext
+/// to the field/entity it belongs to, so swapping two sealed values fails
+/// authentication (F-29).
 pub fn seal_bytes(
     plaintext: &[u8],
     key: &SecretKey,
     kdf: Option<KdfParams>,
+    aad: &[u8],
 ) -> Result<SealedVault, CryptoError> {
     let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = XNonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(nonce, Payload { msg: plaintext, aad })
         .map_err(|_| CryptoError::Encrypt)?;
     Ok(SealedVault {
         v: SCHEMA,
@@ -193,7 +225,11 @@ pub fn seal_bytes(
     })
 }
 
-pub fn open_bytes(sealed: &SealedVault, key: &SecretKey) -> Result<Vec<u8>, CryptoError> {
+pub fn open_bytes(
+    sealed: &SealedVault,
+    key: &SecretKey,
+    aad: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
     if sealed.v > SCHEMA {
         return Err(CryptoError::Schema(sealed.v));
     }
@@ -204,17 +240,21 @@ pub fn open_bytes(sealed: &SealedVault, key: &SecretKey) -> Result<Vec<u8>, Cryp
     let ciphertext = B64.decode(&sealed.ciphertext_b64)?;
     let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
     cipher
-        .decrypt(XNonce::from_slice(&nonce_bytes), ciphertext.as_ref())
+        .decrypt(
+            XNonce::from_slice(&nonce_bytes),
+            Payload { msg: ciphertext.as_ref(), aad },
+        )
         .map_err(|_| CryptoError::Decrypt)
 }
 
 pub fn seal_vault(vault: &Vault, key: &SecretKey, kdf: Option<KdfParams>) -> Result<SealedVault, CryptoError> {
     let plaintext = serde_json::to_vec(vault)?;
-    seal_bytes(&plaintext, key, kdf)
+    // Top-level blobs predate AAD; keep empty AAD so existing vaults stay readable.
+    seal_bytes(&plaintext, key, kdf, b"")
 }
 
 pub fn open_vault(sealed: &SealedVault, key: &SecretKey) -> Result<Vault, CryptoError> {
-    let plaintext = open_bytes(sealed, key)?;
+    let plaintext = open_bytes(sealed, key, b"")?;
     Ok(serde_json::from_slice(&plaintext)?)
 }
 
@@ -352,11 +392,42 @@ mod tests {
     #[test]
     fn roundtrip_with_passphrase() {
         let vault = sample_vault();
-        let params = KdfParams::new_test();
+        let params = KdfParams::new_default();
         let key = derive_key("correct horse battery staple", &params).unwrap();
         let sealed = seal_vault(&vault, &key, Some(params)).unwrap();
         let (opened, _) = open_vault_with_passphrase(&sealed, "correct horse battery staple").unwrap();
         assert_eq!(opened.hosts[0].address, "10.0.0.1");
+    }
+
+    #[test]
+    fn kdf_bounds_are_enforced() {
+        let mut params = KdfParams::new_default();
+        params.m_cost = u32::MAX;
+        assert!(derive_key("passphrase", &params).is_err());
+        params = KdfParams::new_default();
+        params.t_cost = 99;
+        assert!(derive_key("passphrase", &params).is_err());
+        params = KdfParams::new_default();
+        params.p_cost = 0;
+        assert!(derive_key("passphrase", &params).is_err());
+        params = KdfParams::new_default();
+        params.salt_b64 = "AAAA".into();
+        assert!(derive_key("passphrase", &params).is_err());
+        params = KdfParams::new_default();
+        params.alg = "argon2i".into();
+        assert!(derive_key("passphrase", &params).is_err());
+    }
+
+    #[test]
+    fn aad_binds_ciphertext_to_context() {
+        let key = SecretKey::generate();
+        let sealed = seal_bytes(b"secret", &key, None, b"host-1|password").unwrap();
+        assert_eq!(
+            open_bytes(&sealed, &key, b"host-1|password").unwrap(),
+            b"secret"
+        );
+        assert!(open_bytes(&sealed, &key, b"host-2|password").is_err());
+        assert!(open_bytes(&sealed, &key, b"host-1|passphrase").is_err());
     }
 
     #[test]

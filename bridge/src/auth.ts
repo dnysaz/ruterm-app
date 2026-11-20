@@ -8,13 +8,39 @@ export interface AccessClaims {
 const ISSUER = 'rterm-bridge';
 const AUDIENCE = 'rterm-app';
 const ACCESS_TTL_SECS = 3600;
+const MIN_SECRET_BYTES = 32;
+const WEAK_MARKERS = [
+  'dev-only', 'dev_only', 'changeme', 'change-me', 'change_me',
+  'example', 'placeholder', 'replace',
+];
+
+/** Fail closed: a missing/known-weak secret must never sign a real token.
+ *  HMAC-SHA256 is safe with any high-entropy >=32-byte key, so no extra KDF
+ *  is needed — the important part is refusing predictable values. */
+export function validateJwtSecret(secret: string | undefined | null): string {
+  if (typeof secret !== 'string') throw new Error('JWT_SECRET is not set');
+  const value = secret.trim();
+  if (value.length < MIN_SECRET_BYTES) {
+    throw new Error(`JWT_SECRET must be at least ${MIN_SECRET_BYTES} bytes`);
+  }
+  const lower = value.toLowerCase();
+  if (WEAK_MARKERS.some(marker => lower.includes(marker))) {
+    throw new Error('JWT_SECRET looks like a placeholder');
+  }
+  if (new Set(value).size < 8) throw new Error('JWT_SECRET has too little entropy');
+  return value;
+}
+
+function keyFor(secret: string): Uint8Array {
+  return new TextEncoder().encode(validateJwtSecret(secret));
+}
 
 export async function issueAccessToken(
   secret: string,
   userId: string,
   deviceId: string,
 ): Promise<{ token: string; expiresIn: number }> {
-  const key = new TextEncoder().encode(secret);
+  const key = keyFor(secret);
   const token = await new SignJWT({ did: deviceId })
     .setProtectedHeader({ alg: 'HS256' })
     .setSubject(userId)
@@ -31,7 +57,7 @@ export async function verifyAccessToken(
   token: string,
 ): Promise<AccessClaims | null> {
   try {
-    const key = new TextEncoder().encode(secret);
+    const key = keyFor(secret);
     const { payload } = await jwtVerify(token, key, {
       issuer: ISSUER,
       audience: AUDIENCE,

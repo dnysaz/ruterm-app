@@ -73,6 +73,7 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
             platform TEXT NOT NULL,
             app_version TEXT NOT NULL DEFAULT '',
             refresh_hash TEXT,
+            refresh_expires_at TEXT,
             created_at TEXT NOT NULL,
             last_seen_at TEXT,
             revoked_at TEXT
@@ -88,6 +89,17 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
     ];
     for stmt in statements {
         sqlx::query(stmt).execute(pool).await?;
+    }
+    // Forward migration for databases created before refresh expiry existed.
+    let has_expiry: bool =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pragma_table_info('devices') WHERE name = 'refresh_expires_at'")
+            .fetch_one(pool)
+            .await?
+            > 0;
+    if !has_expiry {
+        sqlx::query("ALTER TABLE devices ADD COLUMN refresh_expires_at TEXT")
+            .execute(pool)
+            .await?;
     }
     Ok(())
 }
@@ -167,12 +179,13 @@ pub async fn create_device(
     platform: &str,
     app_version: &str,
     refresh_hash: &str,
+    refresh_expires_at: DateTime<Utc>,
 ) -> Result<String> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     sqlx::query(
-        "INSERT INTO devices (id, user_id, name, platform, app_version, refresh_hash, created_at, last_seen_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO devices (id, user_id, name, platform, app_version, refresh_hash, refresh_expires_at, created_at, last_seen_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(user_id)
@@ -180,6 +193,7 @@ pub async fn create_device(
     .bind(platform)
     .bind(app_version)
     .bind(refresh_hash)
+    .bind(refresh_expires_at)
     .bind(now)
     .bind(now)
     .execute(pool)
@@ -196,10 +210,15 @@ pub async fn find_device_by_refresh(
     pool: &SqlitePool,
     refresh_hash: &str,
 ) -> Result<Option<RefreshDevice>> {
+    // NULL expiry must be rejected, not treated as "valid forever": legacy
+    // rows without an expiry are forced to re-authenticate (F-45).
     let row = sqlx::query(
-        "SELECT id, user_id FROM devices WHERE refresh_hash = ? AND revoked_at IS NULL",
+        "SELECT id, user_id FROM devices
+         WHERE refresh_hash = ? AND revoked_at IS NULL
+           AND refresh_expires_at IS NOT NULL AND refresh_expires_at > ?",
     )
     .bind(refresh_hash)
+    .bind(Utc::now())
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|r| RefreshDevice {
@@ -208,18 +227,48 @@ pub async fn find_device_by_refresh(
     }))
 }
 
+/// Conditional rotation: a stale/concurrent refresh cannot overwrite a newer
+/// token hash. Returns false when the presented hash is no longer current.
 pub async fn rotate_refresh(
     pool: &SqlitePool,
     device_id: &str,
+    old_hash: &str,
     new_hash: &str,
-) -> Result<()> {
-    sqlx::query("UPDATE devices SET refresh_hash = ?, last_seen_at = ? WHERE id = ?")
-        .bind(new_hash)
-        .bind(Utc::now())
-        .bind(device_id)
-        .execute(pool)
-        .await?;
-    Ok(())
+    refresh_expires_at: DateTime<Utc>,
+) -> Result<bool> {
+    // Rotation must also fail for an already-expired token; an old hash with a
+    // NULL/expired deadline can no longer mint a fresh token (F-45).
+    let res = sqlx::query(
+        "UPDATE devices SET refresh_hash = ?, refresh_expires_at = ?, last_seen_at = ?
+         WHERE id = ? AND refresh_hash = ? AND revoked_at IS NULL
+           AND refresh_expires_at IS NOT NULL AND refresh_expires_at > ?",
+    )
+    .bind(new_hash)
+    .bind(refresh_expires_at)
+    .bind(Utc::now())
+    .bind(device_id)
+    .bind(old_hash)
+    .bind(Utc::now())
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Access tokens are bearer tokens; verify on every request that the device
+/// still belongs to the user and has not been revoked (F-36).
+pub async fn device_is_active(
+    pool: &SqlitePool,
+    user_id: &str,
+    device_id: &str,
+) -> Result<bool> {
+    let row: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM devices WHERE id = ? AND user_id = ? AND revoked_at IS NULL",
+    )
+    .bind(device_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
 }
 
 pub async fn touch_device(pool: &SqlitePool, device_id: &str) -> Result<()> {

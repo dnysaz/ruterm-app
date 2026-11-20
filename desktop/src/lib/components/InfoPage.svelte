@@ -66,7 +66,7 @@
           <p>
             RuTerm is an open-source SSH workspace for the desktop — hosts, keys and terminal
             preferences in one JSON document, sealed on your machine and synced through a
-            <strong>zero-knowledge bridge</strong> you control. It is the Termius-class workflow
+            <strong>credential-encrypted bridge</strong> you control. It is the Termius-class workflow
             without a subscription: no account server, no per-seat pricing, no vendor holding
             your credentials.
           </p>
@@ -82,7 +82,7 @@
           <ul class="list">
             <li><strong>Local-first.</strong> The vault is a plain JSON file you can read, diff and back up.</li>
             <li><strong>Field-level encryption.</strong> Hosts and settings stay readable; passwords and private keys are sealed with <span class="mono">XChaCha20-Poly1305</span> + <span class="mono">Argon2id</span>.</li>
-            <li><strong>Zero-knowledge sync.</strong> The optional bridge (Cloudflare Worker + D1) stores ciphertext and a revision counter only — the operator cannot read your credentials.</li>
+            <li><strong>Encrypted credentials.</strong> The optional bridge (Cloudflare Worker + D1) stores sealed credentials plus readable host metadata; the operator cannot read passwords or keys but can see labels, addresses and notes.</li>
             <li><strong>Native SSH.</strong> russh in Rust, PTY sessions streamed into xterm.js — real terminals, not emulated panes.</li>
             <li><strong>Reload-proof sessions.</strong> Tabs, splits and per-tab scrollback survive a restart; SSH reconnects below the restored text.</li>
           </ul>

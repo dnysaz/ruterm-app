@@ -37,6 +37,8 @@
     username: string;
     address: string;
     port: number;
+    /** Explicit consent to offer the local SSH agent to this host (F-06). */
+    allowAgent: boolean;
   }
 
   interface Tab {
@@ -238,6 +240,9 @@
                   username: String(t.adhoc.username),
                   address: String(t.adhoc.address),
                   port: Math.min(65535, Math.max(1, Math.floor(Number(t.adhoc.port) || 22))),
+                  // Restored tabs keep only explicit prior consent; anything
+                  // else defaults to no agent access (F-06).
+                  allowAgent: (t.adhoc as { allowAgent?: unknown }).allowAgent === true,
                 }
               : undefined;
           return {
@@ -683,6 +688,7 @@
   /// and get a session without creating a vault host first.
   let quickTarget = $state('');
   let quickError = $state('');
+  let allowAgent = $state(false);
 
   const QUICK_RE = /^\s*(?:ssh[ \t]+)?([A-Za-z0-9._-]+)@([A-Za-z0-9._-]+)(?::([0-9]{1,5}))?\s*$/;
 
@@ -706,6 +712,13 @@
       quickError = 'Port must be between 1 and 65535';
       return;
     }
+    // F-06: quick-connect always uses the SSH agent. Require a deliberate
+    // per-connection opt-in so injected script cannot silently turn the agent
+    // into a signing oracle for an attacker-controlled host.
+    if (!allowAgent) {
+      quickError = 'Check “Allow SSH agent” to connect to a new host.';
+      return;
+    }
     quickError = '';
     const tab: Tab = {
       id: crypto.randomUUID(),
@@ -717,11 +730,13 @@
         username: match[1],
         address: match[2],
         port,
+        allowAgent: true,
       },
     };
     tabs = [...tabs, tab];
     addTabToPane(tab.id, lastFocusedOrFirst());
     quickTarget = '';
+    allowAgent = false;
   }
 
   function cycleTab(direction: 1 | -1) {
@@ -1814,13 +1829,17 @@
                 <Icon name="chevron-right" size={16} />
               </button>
             </div>
+            <label class="qc-agent">
+              <input type="checkbox" bind:checked={allowAgent} />
+              <span>Allow this host to use my SSH agent <span class="muted">(it can request signatures)</span></span>
+            </label>
             <div class="qc-foot">
               {#if quickError}
                 <p class="qc-error" role="alert">{quickError}</p>
               {:else if quickParsed}
                 <p class="qc-parsed tiny mono">→ {quickParsed.username}@{quickParsed.address}:{quickParsed.port} · opens a new tab</p>
               {:else}
-                <p class="qc-hint tiny muted">Opens directly in a new tab — the terminal will ask for a password if your SSH agent can’t sign in.</p>
+                <p class="qc-hint tiny muted">Opens directly in a new tab — your host key is pinned on first contact.</p>
               {/if}
             </div>
           </form>
@@ -2804,6 +2823,18 @@
   }
   .qc-foot {
     min-height: 18px;
+  }
+  .qc-agent {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 10px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    cursor: pointer;
+  }
+  .qc-agent input {
+    accent-color: var(--accent);
   }
 
   /* ------------------------------------------------- AI dock, bottom-right */
