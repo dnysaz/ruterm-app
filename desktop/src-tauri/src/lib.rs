@@ -12,6 +12,91 @@ mod store;
 use tauri::plugin::Builder as PluginBuilder;
 use tauri::{Manager, Url};
 
+const ABOUT_MENU_ID: &str = "about-ruterm";
+const GITHUB_MENU_ID: &str = "github-ruterm";
+const REPO_URL: &str = "https://github.com/dnysaz/ruterm-app";
+
+fn show_about(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("about") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn app_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+
+    let about = MenuItem::with_id(app, ABOUT_MENU_ID, "About RuTerm", true, None::<&str>)?;
+    let github = MenuItem::with_id(app, GITHUB_MENU_ID, "GitHub Repository", true, None::<&str>)?;
+
+    let app_name = app.package_info().name.clone();
+    let menu = Menu::with_items(
+        app,
+        &[
+            &Submenu::with_items(
+                app,
+                app_name,
+                true,
+                &[
+                    &about,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::services(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::hide(app, None)?,
+                    &PredefinedMenuItem::hide_others(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::quit(app, None)?,
+                ],
+            )?,
+            &Submenu::with_items(
+                app,
+                "File",
+                true,
+                &[&PredefinedMenuItem::close_window(app, None)?],
+            )?,
+            &Submenu::with_items(
+                app,
+                "Edit",
+                true,
+                &[
+                    &PredefinedMenuItem::undo(app, None)?,
+                    &PredefinedMenuItem::redo(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::cut(app, None)?,
+                    &PredefinedMenuItem::copy(app, None)?,
+                    &PredefinedMenuItem::paste(app, None)?,
+                    &PredefinedMenuItem::select_all(app, None)?,
+                ],
+            )?,
+            &Submenu::with_items(
+                app,
+                "View",
+                true,
+                &[&PredefinedMenuItem::fullscreen(app, None)?],
+            )?,
+            &Submenu::with_items(
+                app,
+                "Window",
+                true,
+                &[
+                    &PredefinedMenuItem::minimize(app, None)?,
+                    &PredefinedMenuItem::maximize(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::close_window(app, None)?,
+                ],
+            )?,
+            &Submenu::with_items(app, "Help", true, &[&github])?,
+        ],
+    )?;
+    Ok(menu)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn app_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    tauri::menu::Menu::default(app)
+}
+
 /// Only the app's own origins may be loaded in the main webview. Capabilities
 /// are keyed by window label, not by document, so a successful navigation to
 /// an attacker origin would otherwise expose every IPC command to it.
@@ -40,6 +125,14 @@ pub fn run() {
                 .on_navigation(|_webview, url| allowed_navigation(url))
                 .build(),
         )
+        .menu(app_menu)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            ABOUT_MENU_ID => show_about(app),
+            GITHUB_MENU_ID => {
+                let _ = tauri_plugin_opener::open_url(REPO_URL, None::<&str>);
+            }
+            _ => {}
+        })
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
