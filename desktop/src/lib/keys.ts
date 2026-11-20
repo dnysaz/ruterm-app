@@ -1,4 +1,4 @@
-import { zoomIn, zoomOut, zoomReset } from '$lib/ui.svelte';
+import { zoomIn, zoomOut, zoomReset } from '#lib/ui.svelte';
 
 const isMac = navigator.platform.toLowerCase().includes('mac');
 

@@ -1,12 +1,12 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, errorText } from '$lib/api';
-  import { app, fail, lock, notify, setRememberKey, signIn, signOut, syncNow } from '$lib/state.svelte';
-  import { applyTheme, ui, type Theme } from '$lib/ui.svelte';
-  import { isRestoreEnabled, setRestoreEnabled } from '$lib/scrollback';
+  import { api, errorText } from '#lib/api';
+  import { app, fail, lock, notify, setRememberKey, signIn, signOut, syncNow } from '#lib/state.svelte';
+  import { applyTheme, ui, type Theme } from '#lib/ui.svelte';
+  import { isRestoreEnabled, setRestoreEnabled } from '#lib/scrollback';
   import Icon from './Icon.svelte';
   import BackgroundSettings from './BackgroundSettings.svelte';
-  import { newsState } from '$lib/news.svelte';
+  import { newsState } from '#lib/news.svelte';
 
   let {
     onclose,

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, errorText, type JsonKind } from '$lib/api';
-  import { app, applyVaultPayload, notify } from '$lib/state.svelte';
+  import { api, errorText, type JsonKind } from '#lib/api';
+  import { app, applyVaultPayload, notify } from '#lib/state.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import Icon from './Icon.svelte';
 

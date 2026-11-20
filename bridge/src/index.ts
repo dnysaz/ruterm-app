@@ -366,8 +366,12 @@ async function authLogout(env: Env, request: Request): Promise<Response> {
   if (parsed.ok && typeof parsed.value.refresh_token === 'string') {
     const hash = await sha256Hex(parsed.value.refresh_token);
     const row = await env.DB.prepare(
-      'SELECT family_id FROM refresh_tokens WHERE token_hash = ? AND user_id = ?',
-    ).bind(hash, auth.userId).first<{ family_id: string }>();
+      `SELECT family_id FROM refresh_tokens
+       WHERE token_hash = ? AND user_id = ? AND device_id = ?`,
+    ).bind(hash, auth.userId, auth.deviceId).first<{ family_id: string }>();
+    // Only revoke the family that belongs to the authenticated device. Without
+    // the device_id check, a token from device A paired with an access token
+    // from device B could revoke A's whole session family (cross-device DoS).
     if (row?.family_id) await revokeFamily(env, row.family_id, 'logout');
   }
   // Revoke the device so already-issued access tokens stop working (F-22).

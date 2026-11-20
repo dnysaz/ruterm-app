@@ -1,16 +1,16 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
   import { fade } from 'svelte/transition';
-  import type { SessionStatus } from '$lib/api';
+  import type { SessionStatus } from '#lib/api';
   import { Terminal as XTerm } from '@xterm/xterm';
   import { FitAddon } from '@xterm/addon-fit';
   import { SerializeAddon } from '@xterm/addon-serialize';
   import { LigaturesAddon } from '@xterm/addon-ligatures';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-  import { api } from '$lib/api';
-  import { ui, type Theme } from '$lib/ui.svelte';
-  import { terminalTint } from '$lib/background.svelte';
-  import { isRestoreEnabled, readSnapshot, saveSnapshot } from '$lib/scrollback';
+  import { api } from '#lib/api';
+  import { ui, type Theme } from '#lib/ui.svelte';
+  import { terminalTint } from '#lib/background.svelte';
+  import { isRestoreEnabled, readSnapshot, saveSnapshot } from '#lib/scrollback';
   import Icon from './Icon.svelte';
   import '@xterm/xterm/css/xterm.css';
 

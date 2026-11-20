@@ -7,7 +7,7 @@
     signIn,
     unlock,
     unlockWithSavedKey,
-  } from '$lib/state.svelte';
+  } from '#lib/state.svelte';
 
   const isSetup = $derived(!app.status?.has_vault);
   const signedIn = $derived(app.status?.signed_in === true);

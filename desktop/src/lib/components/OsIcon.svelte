@@ -1,6 +1,6 @@
 <script lang="ts">
   /* Official brand mark (or monogram) on a light "app icon" disc. */
-  import { osLook } from '$lib/os';
+  import { osLook } from '#lib/os';
 
   interface Props {
     os?: string | null;

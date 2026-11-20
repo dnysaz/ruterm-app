@@ -1,8 +1,8 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
-  import { externalLink, closeExternalLink } from '$lib/externalLink.svelte';
-  import { openExternalLink } from '$lib/external';
+  import { externalLink, closeExternalLink } from '#lib/externalLink.svelte';
+  import { openExternalLink } from '#lib/external';
 
   async function confirmOpen() {
     const href = externalLink.href;

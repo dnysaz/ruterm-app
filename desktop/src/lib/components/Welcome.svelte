@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { app, signIn } from '$lib/state.svelte';
+  import { app, signIn } from '#lib/state.svelte';
 
   function continueLocal() {
     app.screen = app.status?.has_vault ? 'unlock' : 'setup';

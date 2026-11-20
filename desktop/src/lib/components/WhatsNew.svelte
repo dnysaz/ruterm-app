@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { renderSafeMarkdown } from '$lib/markdown';
+  import { renderSafeMarkdown } from '#lib/markdown';
   import Icon from './Icon.svelte';
-  import { loadNews, loadUnreadIds, markAllRead, type NewsEntry } from '$lib/news.svelte';
+  import { loadNews, loadUnreadIds, markAllRead, type NewsEntry } from '#lib/news.svelte';
 
   let { onclose }: { onclose?: () => void } = $props();
 

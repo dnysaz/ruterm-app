@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
-  import { renderSafeMarkdown } from '$lib/markdown';
-  import type { Note } from '$lib/api';
-  import { terminalTint } from '$lib/background.svelte';
+  import { renderSafeMarkdown } from '#lib/markdown';
+  import type { Note } from '#lib/api';
+  import { terminalTint } from '#lib/background.svelte';
 
   let {
     note,

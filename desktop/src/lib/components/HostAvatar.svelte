@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Host } from '$lib/api';
+  import type { Host } from '#lib/api';
 
   import OsIcon from './OsIcon.svelte';
 

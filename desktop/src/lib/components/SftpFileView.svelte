@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, errorText, getSftpToken } from '$lib/api';
-  import { imageMimeForPath } from '$lib/images';
-  import { languageForPath } from '$lib/languages';
+  import { api, errorText, getSftpToken } from '#lib/api';
+  import { imageMimeForPath } from '#lib/images';
+  import { languageForPath } from '#lib/languages';
   import Icon from './Icon.svelte';
   import CodeEditor from './CodeEditor.svelte';
 

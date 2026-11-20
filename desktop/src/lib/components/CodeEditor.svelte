@@ -170,7 +170,7 @@
 
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { ui } from '$lib/ui.svelte';
+  import { ui } from '#lib/ui.svelte';
   import type * as Monaco from 'monaco-editor';
 
   let {

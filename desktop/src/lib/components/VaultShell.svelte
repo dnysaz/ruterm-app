@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, newHost, type AiAgent, type Host, type Note, type SessionStatus } from '$lib/api';
-  import { background, backgroundStyle, frostStyle } from '$lib/background.svelte';
+  import { api, newHost, type AiAgent, type Host, type Note, type SessionStatus } from '#lib/api';
+  import { background, backgroundStyle, frostStyle } from '#lib/background.svelte';
   import {
     app,
     applyVaultPayload,
@@ -16,13 +16,13 @@
     saveNote,
     syncNow,
     syncQuiet,
-  } from '$lib/state.svelte';
+  } from '#lib/state.svelte';
   import HostAvatar from './HostAvatar.svelte';
   import HostForm from './HostForm.svelte';
   import Icon from './Icon.svelte';
   import SftpPanel from './SftpPanel.svelte';
   import SftpFileView from './SftpFileView.svelte';
-  import { removeSnapshot } from '$lib/scrollback';
+  import { removeSnapshot } from '#lib/scrollback';
   import Settings from './Settings.svelte';
   import Terminal from './Terminal.svelte';
   import InfoPage from './InfoPage.svelte';
@@ -31,7 +31,7 @@
   import ConfirmDialog from './ConfirmDialog.svelte';
   import AiAgentIcon from './AiAgentIcon.svelte';
   import WhatsNew from './WhatsNew.svelte';
-  import { initNews, newsState } from '$lib/news.svelte';
+  import { initNews, newsState } from '#lib/news.svelte';
 
   interface AdhocTarget {
     username: string;

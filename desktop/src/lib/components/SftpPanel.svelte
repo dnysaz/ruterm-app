@@ -8,7 +8,7 @@
     type SessionStatus,
     type SftpDir,
     type SftpEntry,
-  } from '$lib/api';
+  } from '#lib/api';
   import Icon from './Icon.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
 

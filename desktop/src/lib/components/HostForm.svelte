@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { api, displaySecret, SEALED_PLACEHOLDER, type Host, type Identity } from '$lib/api';
-  import { addIdentity, app, fail, identities, notify } from '$lib/state.svelte';
+  import { api, displaySecret, SEALED_PLACEHOLDER, type Host, type Identity } from '#lib/api';
+  import { addIdentity, app, fail, identities, notify } from '#lib/state.svelte';
   import Icon from './Icon.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
 

@@ -1,11 +1,11 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { app, bootstrap } from '$lib/state.svelte';
-  import { installShortcuts } from '$lib/keys';
-  import { restoreTheme, restoreZoom } from '$lib/ui.svelte';
-  import Welcome from '$lib/components/Welcome.svelte';
-  import Unlock from '$lib/components/Unlock.svelte';
-  import VaultShell from '$lib/components/VaultShell.svelte';
+  import { app, bootstrap } from '#lib/state.svelte';
+  import { installShortcuts } from '#lib/keys';
+  import { restoreTheme, restoreZoom } from '#lib/ui.svelte';
+  import Welcome from '#lib/components/Welcome.svelte';
+  import Unlock from '#lib/components/Unlock.svelte';
+  import VaultShell from '#lib/components/VaultShell.svelte';
 
   onMount(() => {
     restoreTheme();

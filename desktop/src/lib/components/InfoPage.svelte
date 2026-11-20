@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api } from '$lib/api';
+  import { api } from '#lib/api';
   import Icon from './Icon.svelte';
 
   type InfoPageKind = 'about' | 'terms' | 'privacy' | 'contact' | 'github';

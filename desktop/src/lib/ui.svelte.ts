@@ -1,4 +1,4 @@
-import { api } from '$lib/api';
+import { api } from '#lib/api';
 
 /**
  * App-wide UI scale. Tauri scales the whole webview natively, so xterm and the

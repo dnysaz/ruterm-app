@@ -6,7 +6,7 @@
     BACKGROUND_IMAGES,
     BACKGROUND_PATTERNS,
     type BackgroundMode,
-  } from '$lib/background';
+  } from '#lib/background';
   import {
     background,
     backgroundCustom,
@@ -18,7 +18,7 @@
     setBackgroundMode,
     setBackgroundPattern,
     setBackgroundTermDim,
-  } from '$lib/background.svelte';
+  } from '#lib/background.svelte';
 
   const MODES: { value: BackgroundMode; label: string }[] = [
     { value: 'none', label: 'Off' },
