@@ -1,7 +1,13 @@
 {
   "version": 1,
-  "generated_at": "2026-11-20T06:14:55.869Z",
+  "generated_at": "2026-11-20T06:43:15.891Z",
   "entries": [
+    {
+      "file": "2026-11-20-sftp-streaming.md",
+      "date": "2026-11-20",
+      "title": "Directory listings, without the surprise memory spike",
+      "summary": "One last security follow-up for the SFTP panel. Listing a folder used to ask the"
+    },
     {
       "file": "2026-11-20-security-hardening.md",
       "date": "2026-11-20",

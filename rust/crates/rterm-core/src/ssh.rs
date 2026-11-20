@@ -256,8 +256,12 @@ struct Observed {
     banner: Option<String>,
 }
 
+/// Concrete SSH handle type. Kept crate-private because `Handler` is an
+/// implementation detail; `SftpConnection` stores it without exposing it.
+pub(crate) type SshSessionHandle = client::Handle<Handler>;
+
 pub(crate) struct Authed {
-    pub session: client::Handle<Handler>,
+    pub session: SshSessionHandle,
     pub fingerprint: String,
     pub banner: Option<String>,
 }

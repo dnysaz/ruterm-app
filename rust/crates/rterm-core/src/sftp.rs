@@ -1,18 +1,25 @@
 //! SFTP sessions on the same russh transport as the terminal.
 //!
-//! An SFTP tab opens its own channel with subsystem `sftp` after the shared
-//! connect+authenticate handshake (`crate::ssh::connect_and_authenticate`).
-//! One [`SftpSession`] is kept per tab by the Tauri layer; this module is
-//! stateless pure-async functions over it.
+//! An SFTP tab opens two channels with subsystem `sftp` after the shared
+//! connect+authenticate handshake (`crate::ssh::connect_and_authenticate`):
+//!
+//! * a high-level [`SftpSession`] for ordinary file operations, and
+//! * a [`RawSftpSession`] used **only** for directory reads, so entries can be
+//!   consumed one `SSH_FXP_NAME` packet at a time and the 10,000-entry cap is
+//!   enforced before another entry is retained (R-03).
+//!
+//! One [`SftpConnection`] (which owns both channels plus the SSH handle) is
+//! kept per tab by the Tauri layer.
 
-use std::path::Path;
+use std::{ops::Deref, path::Path};
 
 pub use russh_sftp::client::SftpSession;
-use russh_sftp::client::error::Error as SftpError;
+use russh_sftp::client::{RawSftpSession, error::Error as SftpError};
+use russh_sftp::protocol::{File, FileAttributes, StatusCode};
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy};
 
-use crate::ssh::{SshError, SshTarget, connect_and_authenticate};
+use crate::ssh::{SshError, SshSessionHandle, SshTarget, connect_and_authenticate};
 
 /// One directory entry, shipped to the UI.
 #[derive(Serialize, Clone, Debug)]
@@ -29,8 +36,8 @@ pub struct SftpEntry {
     pub permissions: Option<String>,
 }
 
-/// A directory listing. `path` is the *canonical* (absolute) path — listings
-/// always report where they were actually taken from.
+/// A directory listing. `path` is exactly the directory the caller requested;
+/// it is echoed back locally rather than obtained from server canonicalization.
 #[derive(Serialize, Clone, Debug)]
 pub struct SftpDir {
     pub path: String,
@@ -97,9 +104,47 @@ pub(crate) fn parent_path(path: &str) -> Option<String> {
     }
 }
 
-/// Connects, authenticates, opens the `sftp` subsystem channel, and performs
-/// the SFTP handshake. Returns a session the caller keeps open.
-pub async fn open_sftp(target: &SshTarget) -> Result<SftpSession, SshError> {
+/// One live SFTP tab: high-level session, streaming raw session, and the SSH
+/// handle both channels belong to. `Deref` keeps the dozen file-operation
+/// call sites unchanged — they still see an ordinary `SftpSession`.
+pub struct SftpConnection {
+    high: SftpSession,
+    raw: RawSftpSession,
+    // Keep the authenticated transport alive; dropping a russh Handle only
+    // detaches its task, but owning it here makes the lifetime explicit and
+    // lets us open both subsystem channels from the same connection.
+    _ssh: SshSessionHandle,
+}
+
+impl Deref for SftpConnection {
+    type Target = SftpSession;
+
+    fn deref(&self) -> &Self::Target {
+        &self.high
+    }
+}
+
+/// Opens a second `sftp` subsystem channel on an existing SSH connection and
+/// initializes it as a raw packet session. Request ids are allocated by this
+/// session, so they cannot collide with the high-level session's ids.
+async fn open_raw_sftp(ssh: &SshSessionHandle) -> Result<RawSftpSession, SshError> {
+    let channel = ssh.channel_open_session().await?;
+    channel
+        .request_subsystem(false, "sftp")
+        .await
+        .map_err(|e| SshError::Request(format!("raw sftp subsystem refused: {e}")))?;
+    let stream = channel.into_stream();
+    let raw = RawSftpSession::new(stream);
+    raw.init()
+        .await
+        .map_err(|e| err("raw sftp init failed", e))?;
+    raw.set_timeout(30);
+    Ok(raw)
+}
+
+/// Connects, authenticates, opens both `sftp` subsystem channels, and performs
+/// both SFTP handshakes. Returns a connection the caller keeps open.
+pub async fn open_sftp(target: &SshTarget) -> Result<SftpConnection, SshError> {
     open_sftp_with_fingerprint(target)
         .await
         .map(|(session, _)| session)
@@ -109,7 +154,7 @@ pub async fn open_sftp(target: &SshTarget) -> Result<SftpSession, SshError> {
 /// the caller can persist a TOFU pin (F-46).
 pub async fn open_sftp_with_fingerprint(
     target: &SshTarget,
-) -> Result<(SftpSession, String), SshError> {
+) -> Result<(SftpConnection, String), SshError> {
     let auth = connect_and_authenticate(target).await?;
     let fingerprint = auth.fingerprint.clone();
     let channel = auth.session.channel_open_session().await?;
@@ -122,7 +167,15 @@ pub async fn open_sftp_with_fingerprint(
         .await
         .map_err(|e| SshError::Request(format!("sftp init failed: {e}")))?;
     sftp.set_timeout(30);
-    Ok((sftp, fingerprint))
+    let raw = open_raw_sftp(&auth.session).await?;
+    Ok((
+        SftpConnection {
+            high: sftp,
+            raw,
+            _ssh: auth.session,
+        },
+        fingerprint,
+    ))
 }
 
 /// Best-effort home directory (SFTP servers start in the user's home).
@@ -150,68 +203,150 @@ fn charge_delete(budget: &mut usize) -> Result<(), SshError> {
     Ok(())
 }
 
-/// Lists one directory. Always returns entries sorted directories-first, then
-/// by name (case-insensitive). Canonicalizes the path first.
-///
-/// NOTE (R-03): `russh-sftp 3.0.1`'s high-level `read_dir` eagerly buffers the
-/// whole listing to EOF before returning, so the caps below protect the UI and
-/// return value but not peak memory inside the library. A true streaming cap
-/// would need a separate raw SFTP session (tracked as a known residual).
-pub async fn list_dir(sftp: &SftpSession, path: &str) -> Result<SftpDir, SshError> {
-    let canonical = sftp
-        .canonicalize(path)
-        .await
-        .map_err(|e| err("cannot resolve path", e))?;
-    let read = sftp
-        .read_dir(&canonical)
-        .await
-        .map_err(|e| err("cannot list directory", e))?;
-    let mut total_bytes = 0usize;
-    let mut entries: Vec<SftpEntry> = Vec::new();
-    for entry in read {
-        if entries.len() >= MAX_DIR_ENTRIES {
-            return Err(SshError::LimitExceeded(format!(
-                "directory has more than {MAX_DIR_ENTRIES} entries"
-            )));
-        }
-        let md = entry.metadata();
-        let name = entry.file_name();
-        // R-02: never trust a path supplied by the remote server. Reject
-        // traversal/separator names and build each entry path ourselves from
-        // the requested directory, so `basename(path) == name` holds.
-        if name.is_empty()
-            || name == "."
-            || name == ".."
-            || name.contains('/')
-            || name.contains('\\')
-            || name.contains('\0')
-        {
-            return Err(SshError::Request("invalid filename in directory listing".into()));
-        }
-        let entry_path = join_path(path, &name);
-        total_bytes = total_bytes
-            .saturating_add(name.len())
-            .saturating_add(entry_path.len());
-        if name.len() > MAX_DIR_NAME_BYTES || total_bytes > MAX_DIR_ENTRIES * MAX_DIR_NAME_BYTES {
-            return Err(SshError::LimitExceeded(
-                "directory listing is too large".into(),
-            ));
-        }
-        entries.push(SftpEntry {
-            name,
-            path: entry_path,
-            is_dir: md.is_dir(),
-            is_symlink: md.is_symlink(),
-            size: md.size,
-            mtime: md.mtime,
-            permissions: mode_string(md.permissions),
-        });
+/// One `SSH_FXP_NAME` packet at a time from a directory handle. The library
+/// owns framing, request ids, timeout, and ATTRS decoding; we only decide when
+/// to stop and always close the handle, including on early cap exit or error.
+struct RawDirIter<'a> {
+    raw: &'a RawSftpSession,
+    handle: String,
+    batch: std::vec::IntoIter<File>,
+    eof: bool,
+}
+
+impl<'a> RawDirIter<'a> {
+    async fn open(raw: &'a RawSftpSession, path: &str) -> Result<Self, SshError> {
+        let handle = raw
+            .opendir(path)
+            .await
+            .map_err(|e| err("cannot open directory", e))?;
+        Ok(Self {
+            raw,
+            handle: handle.handle,
+            batch: Vec::new().into_iter(),
+            eof: false,
+        })
     }
+
+    async fn next_file(&mut self) -> Result<Option<File>, SshError> {
+        while self.batch.len() == 0 {
+            if self.eof {
+                return Ok(None);
+            }
+            match self.raw.readdir(self.handle.as_str()).await {
+                Ok(name) => self.batch = name.files.into_iter(),
+                Err(SftpError::Status(status)) if status.status_code == StatusCode::Eof => {
+                    self.eof = true;
+                    return Ok(None);
+                }
+                Err(e) => return Err(err("cannot read directory", e)),
+            }
+        }
+        Ok(self.batch.next())
+    }
+
+    async fn close(self) -> Result<(), SshError> {
+        self.raw
+            .close(self.handle.as_str())
+            .await
+            .map_err(|e| err("cannot close directory", e))?;
+        Ok(())
+    }
+}
+
+fn valid_filename(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+}
+
+/// Builds a UI entry from a wire `File`. R-02 layer A: the name is validated
+/// and the path is assembled locally from the directory the user requested —
+/// no server-supplied path is ever used.
+fn entry_from_file(dir: &str, file: &File) -> Result<SftpEntry, SshError> {
+    if !valid_filename(&file.filename) {
+        return Err(SshError::Request("invalid filename in directory listing".into()));
+    }
+    let attrs: &FileAttributes = &file.attrs;
+    Ok(SftpEntry {
+        name: file.filename.clone(),
+        path: join_path(dir, &file.filename),
+        is_dir: attrs.is_dir(),
+        is_symlink: attrs.is_symlink(),
+        size: attrs.size,
+        mtime: attrs.mtime,
+        permissions: mode_string(attrs.permissions),
+    })
+}
+
+/// Appends one entry only while it fits the caps. Kept separate so the
+/// "never retain entry 10,001" invariant is directly unit-testable.
+fn accept_entry(
+    entries: &mut Vec<SftpEntry>,
+    total_bytes: &mut usize,
+    entry: SftpEntry,
+) -> Result<(), SshError> {
+    if entries.len() >= MAX_DIR_ENTRIES {
+        return Err(SshError::LimitExceeded(format!(
+            "directory has more than {MAX_DIR_ENTRIES} entries"
+        )));
+    }
+    *total_bytes = total_bytes
+        .saturating_add(entry.name.len())
+        .saturating_add(entry.path.len());
+    if entry.name.len() > MAX_DIR_NAME_BYTES || *total_bytes > MAX_DIR_ENTRIES * MAX_DIR_NAME_BYTES {
+        return Err(SshError::LimitExceeded(
+            "directory listing is too large".into(),
+        ));
+    }
+    entries.push(entry);
+    Ok(())
+}
+
+/// Streams a bounded listing over the raw channel. Peak memory is
+/// O(10,000 entries + one SFTP packet), independent of the remote directory
+/// size: we stop as soon as entry 10,001 is seen and close the handle.
+async fn raw_list_dir(raw: &RawSftpSession, path: &str) -> Result<Vec<SftpEntry>, SshError> {
+    let mut iter = RawDirIter::open(raw, path).await?;
+    let listing = async {
+        let mut entries: Vec<SftpEntry> = Vec::new();
+        let mut total_bytes = 0usize;
+        while let Some(file) = iter.next_file().await? {
+            // Match the high-level iterator's behavior: dot entries are noise,
+            // not real children. Anything else invalid still fails closed.
+            if file.filename == "." || file.filename == ".." {
+                continue;
+            }
+            let entry = entry_from_file(path, &file)?;
+            accept_entry(&mut entries, &mut total_bytes, entry)?;
+        }
+        Ok::<Vec<SftpEntry>, SshError>(entries)
+    }
+    .await;
+    // Always close the remote handle, even when the listing hit a cap or a
+    // server error mid-stream. Preserve the listing error if both fail.
+    let close = iter.close().await;
+    let mut entries = listing?;
+    close?;
     entries.sort_by(|a, b| {
         b.is_dir
             .cmp(&a.is_dir)
             .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
+    Ok(entries)
+}
+
+/// Lists one directory. Always returns entries sorted directories-first, then
+/// by name (case-insensitive).
+///
+/// R-02: the requested `path` is passed straight to OPENDIR and echoed back in
+/// `SftpDir.path`; we never call server-controlled `canonicalize()` here, and
+/// every `SftpEntry.path` is built locally from that same requested path.
+/// R-03: entries are read and capped one packet at a time on the raw channel.
+pub async fn list_dir(sftp: &SftpConnection, path: &str) -> Result<SftpDir, SshError> {
+    let entries = raw_list_dir(&sftp.raw, path).await?;
     Ok(SftpDir {
         path: path.to_string(),
         entries,
@@ -232,7 +367,7 @@ pub async fn rename(sftp: &SftpSession, from: &str, to: &str) -> Result<(), SshE
 
 /// Removes a file, a symlink, or a directory tree. Directories are deleted
 /// non-empty — the UI is explicit about it ("Delete folder and N items").
-pub async fn remove_path(sftp: &SftpSession, path: &str, is_dir: bool) -> Result<(), SshError> {
+pub async fn remove_path(sftp: &SftpConnection, path: &str, is_dir: bool) -> Result<(), SshError> {
     let mut budget = MAX_DELETE_ENTRIES;
     remove_recursive(sftp, path, is_dir, 0, &mut budget).await
 }
@@ -240,7 +375,7 @@ pub async fn remove_path(sftp: &SftpSession, path: &str, is_dir: bool) -> Result
 const MAX_DELETE_DEPTH: u32 = 64;
 
 fn remove_recursive<'a>(
-    sftp: &'a SftpSession,
+    sftp: &'a SftpConnection,
     path: &'a str,
     is_dir: bool,
     depth: u32,
@@ -253,27 +388,43 @@ fn remove_recursive<'a>(
         charge_delete(budget)?;
         if !is_dir {
             return sftp
+                .high
                 .remove_file(path)
                 .await
                 .map_err(|e| err("cannot delete file", e));
         }
-        // A directory (or a symlink to one): delete children first.
-        let read = sftp
-            .read_dir(path)
-            .await
-            .map_err(|e| err("cannot read folder to delete", e))?;
-        for entry in read {
-            let md = entry.metadata();
-            let child = join_path(path, &entry.file_name());
-            if md.is_dir() && !md.is_symlink() {
-                remove_recursive(sftp, &child, true, depth + 1, &mut *budget).await?;
-            } else {
-                sftp.remove_file(&child)
-                    .await
-                    .map_err(|e| err("cannot delete entry", e))?;
+        // A directory (or a symlink to one): delete children first. The raw
+        // channel charges the global delete budget per *wire entry*, so an
+        // oversized directory fails before its entries are all materialized.
+        let mut iter = RawDirIter::open(&sftp.raw, path).await?;
+        let walk = async {
+            while let Some(file) = iter.next_file().await? {
+                if file.filename == "." || file.filename == ".." {
+                    continue;
+                }
+                charge_delete(budget)?;
+                // Never let a hostile server escape the tree via a crafted name.
+                if !valid_filename(&file.filename) {
+                    return Err(SshError::Request("invalid filename in directory listing".into()));
+                }
+                let child = join_path(path, &file.filename);
+                if file.attrs.is_dir() && !file.attrs.is_symlink() {
+                    remove_recursive(sftp, &child, true, depth + 1, &mut *budget).await?;
+                } else {
+                    sftp.high
+                        .remove_file(&child)
+                        .await
+                        .map_err(|e| err("cannot delete entry", e))?;
+                }
             }
+            Ok::<(), SshError>(())
         }
-        sftp.remove_dir(path)
+        .await;
+        let close = iter.close().await;
+        walk?;
+        close?;
+        sftp.high
+            .remove_dir(path)
             .await
             .map_err(|e| err("cannot remove folder", e))
     })
@@ -566,4 +717,294 @@ pub async fn create_file(sftp: &SftpSession, path: &str) -> Result<(), SshError>
     file.close()
         .await
         .map_err(|e| SshError::Request(format!("create finish failed: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::{Buf, Bytes};
+    use russh_sftp::{
+        protocol::{Handle, Name, Packet, Status, Version},
+        server::{Handler, StatusReply},
+    };
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncRead, AsyncWrite, duplex};
+
+    fn wire_file(name: &str, permissions: Option<u32>) -> File {
+        File {
+            filename: name.into(),
+            longname: String::new(),
+            attrs: FileAttributes {
+                permissions,
+                size: Some(7),
+                mtime: Some(1_700_000_000),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn ok_status(id: u32) -> Status {
+        Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: String::new(),
+            language_tag: "en-US".into(),
+        }
+    }
+
+    /// In-process SFTP server that hands out names in bounded batches, so the
+    /// client has to issue several READDIR packets and stop at the cap itself.
+    struct MockDir {
+        files: Vec<File>,
+        batch: usize,
+        delivered: Arc<Mutex<usize>>,
+        fail_with: Option<StatusCode>,
+    }
+
+    impl Handler for MockDir {
+        type Error = StatusReply;
+
+        fn unimplemented(&self) -> Self::Error {
+            StatusReply::new(StatusCode::OpUnsupported)
+        }
+
+        async fn opendir(&mut self, id: u32, _path: String) -> Result<Handle, Self::Error> {
+            Ok(Handle {
+                id,
+                handle: "test-handle".into(),
+            })
+        }
+
+        async fn readdir(&mut self, id: u32, _handle: String) -> Result<Name, Self::Error> {
+            if let Some(code) = self.fail_with {
+                return Err(code.into());
+            }
+            if self.files.is_empty() {
+                return Err(StatusCode::Eof.into());
+            }
+            let n = self.batch.min(self.files.len());
+            let files: Vec<File> = self.files.drain(..n).collect();
+            *self.delivered.lock().unwrap() += files.len();
+            Ok(Name { id, files })
+        }
+
+        async fn close(&mut self, id: u32, _handle: String) -> Result<Status, Self::Error> {
+            Ok(ok_status(id))
+        }
+    }
+
+    async fn mock_raw(mock: MockDir) -> RawSftpSession {
+        let (client, server) = duplex(256 * 1024);
+        tokio::spawn(russh_sftp::server::run(server, mock));
+        let raw = RawSftpSession::new(client);
+        raw.init().await.expect("sftp init");
+        raw
+    }
+
+    async fn read_wire_packet<S: AsyncRead + Unpin>(stream: &mut S) -> Packet {
+        let mut len = [0u8; 4];
+        stream.read_exact(&mut len).await.expect("packet length");
+        let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
+        stream.read_exact(&mut buf).await.expect("packet body");
+        let mut bytes = Bytes::from(buf);
+        Packet::try_from(&mut bytes).expect("decode packet")
+    }
+
+    async fn write_wire_packet<S: AsyncWrite + Unpin>(stream: &mut S, packet: Packet) {
+        let bytes = Bytes::try_from(packet).expect("encode packet");
+        stream.write_all(&bytes).await.expect("write packet");
+        stream.flush().await.expect("flush packet");
+    }
+
+    #[test]
+    fn accept_entry_never_retains_entry_past_cap() {
+        let mut entries = Vec::new();
+        let mut total_bytes = 0usize;
+        for i in 0..MAX_DIR_ENTRIES {
+            let name = format!("f{i}");
+            let entry = SftpEntry {
+                path: format!("/remote/{name}"),
+                name,
+                is_dir: false,
+                is_symlink: false,
+                size: None,
+                mtime: None,
+                permissions: None,
+            };
+            accept_entry(&mut entries, &mut total_bytes, entry).expect("entry fits");
+        }
+        assert_eq!(entries.len(), MAX_DIR_ENTRIES);
+        let extra = SftpEntry {
+            name: "overflow".into(),
+            path: "/remote/overflow".into(),
+            is_dir: false,
+            is_symlink: false,
+            size: None,
+            mtime: None,
+            permissions: None,
+        };
+        let err = accept_entry(&mut entries, &mut total_bytes, extra).unwrap_err();
+        assert!(matches!(err, SshError::LimitExceeded(_)), "{err:?}");
+        assert_eq!(entries.len(), MAX_DIR_ENTRIES, "entry 10,001 was retained");
+    }
+
+    #[tokio::test]
+    async fn raw_list_decodes_attrs_sorts_and_keeps_requested_path() {
+        let raw = mock_raw(MockDir {
+            files: vec![
+                wire_file("z.txt", Some(0o100_644)),
+                wire_file("adir", Some(0o040_755)),
+            ],
+            batch: 1,
+            delivered: Arc::new(Mutex::new(0)),
+            fail_with: None,
+        })
+        .await;
+        let dir = raw_list_dir(&raw, "/remote").await.expect("listing");
+        assert_eq!(dir.len(), 2);
+        assert_eq!(dir[0].name, "adir");
+        assert_eq!(dir[0].path, "/remote/adir");
+        assert!(dir[0].is_dir);
+        assert_eq!(dir[1].name, "z.txt");
+        assert_eq!(dir[1].path, "/remote/z.txt");
+        assert_eq!(dir[1].size, Some(7));
+        assert_eq!(dir[1].mtime, Some(1_700_000_000));
+        assert_eq!(dir[1].permissions.as_deref(), Some("-rw-r--r--"));
+    }
+
+    #[tokio::test]
+    async fn raw_list_rejects_server_supplied_traversal_name() {
+        let raw = mock_raw(MockDir {
+            files: vec![wire_file("../escape", Some(0o100_644))],
+            batch: 1,
+            delivered: Arc::new(Mutex::new(0)),
+            fail_with: None,
+        })
+        .await;
+        let err = raw_list_dir(&raw, "/remote").await.unwrap_err();
+        assert!(matches!(err, SshError::Request(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn raw_list_stops_at_entry_cap() {
+        let files = (0..=MAX_DIR_ENTRIES)
+            .map(|i| wire_file(&format!("f{i}"), Some(0o100_644)))
+            .collect();
+        let delivered = Arc::new(Mutex::new(0));
+        let raw = mock_raw(MockDir {
+            files,
+            batch: 200,
+            delivered: delivered.clone(),
+            fail_with: None,
+        })
+        .await;
+        let err = raw_list_dir(&raw, "/remote").await.unwrap_err();
+        assert!(matches!(err, SshError::LimitExceeded(_)), "{err:?}");
+        assert!(
+            *delivered.lock().unwrap() > MAX_DIR_ENTRIES,
+            "server never delivered entry 10,001, so the cap was not exercised"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_list_propagates_non_eof_status() {
+        let raw = mock_raw(MockDir {
+            files: Vec::new(),
+            batch: 1,
+            delivered: Arc::new(Mutex::new(0)),
+            fail_with: Some(StatusCode::PermissionDenied),
+        })
+        .await;
+        let err = raw_list_dir(&raw, "/remote").await.unwrap_err();
+        assert!(matches!(err, SshError::Request(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn raw_list_times_out_when_server_never_replies() {
+        let (client, mut server) = duplex(16 * 1024);
+        let raw = RawSftpSession::new(client);
+        raw.set_timeout(1);
+        let task = tokio::spawn(async move {
+            assert!(matches!(read_wire_packet(&mut server).await, Packet::Init(_)));
+            write_wire_packet(&mut server, Packet::Version(Version::new())).await;
+            // Swallow OPENDIR but never answer it.
+            let _ = read_wire_packet(&mut server).await;
+            std::future::pending::<()>().await;
+        });
+        raw.init().await.expect("sftp init");
+        let err = raw_list_dir(&raw, "/remote").await.unwrap_err();
+        task.abort();
+        assert!(matches!(&err, SshError::Request(m) if m.contains("Timeout")), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn raw_list_ignores_mismatched_request_id_and_times_out() {
+        let (client, mut server) = duplex(16 * 1024);
+        let raw = RawSftpSession::new(client);
+        raw.set_timeout(1);
+        let task = tokio::spawn(async move {
+            assert!(matches!(read_wire_packet(&mut server).await, Packet::Init(_)));
+            write_wire_packet(&mut server, Packet::Version(Version::new())).await;
+
+            let open = read_wire_packet(&mut server).await;
+            let id = open.get_request_id();
+            write_wire_packet(
+                &mut server,
+                Packet::Handle(Handle {
+                    id,
+                    handle: "h".into(),
+                }),
+            )
+            .await;
+
+            assert!(matches!(read_wire_packet(&mut server).await, Packet::ReadDir(_)));
+            write_wire_packet(
+                &mut server,
+                Packet::Status(Status {
+                    id: id.wrapping_add(999),
+                    status_code: StatusCode::Eof,
+                    error_message: String::new(),
+                    language_tag: "en-US".into(),
+                }),
+            )
+            .await;
+
+            // Answer CLOSE correctly so only the mismatched READDIR times out.
+            let close = read_wire_packet(&mut server).await;
+            write_wire_packet(&mut server, Packet::Status(ok_status(close.get_request_id()))).await;
+            std::future::pending::<()>().await;
+        });
+        raw.init().await.expect("sftp init");
+        let err = raw_list_dir(&raw, "/remote").await.unwrap_err();
+        task.abort();
+        assert!(matches!(&err, SshError::Request(m) if m.contains("Timeout")), "{err:?}");
+    }
+
+    #[test]
+    fn version_and_status_packets_round_trip_over_wire_encoding() {
+        // Direct check of the framing the raw session relies on.
+        let mut bytes = Bytes::try_from(Packet::Status(ok_status(42))).expect("encode");
+        bytes.advance(4); // frame length; Packet::try_from decodes type + payload
+        let decoded = Packet::try_from(&mut bytes).expect("decode");
+        match decoded {
+            Packet::Status(status) => {
+                assert_eq!(status.id, 42);
+                assert_eq!(status.status_code, StatusCode::Ok);
+            }
+            other => panic!("unexpected packet: {other:?}"),
+        }
+        let mut bytes = Bytes::try_from(Packet::Handle(Handle {
+            id: 7,
+            handle: "h".into(),
+        }))
+        .expect("encode");
+        bytes.advance(4);
+        match Packet::try_from(&mut bytes).expect("decode") {
+            Packet::Handle(handle) => {
+                assert_eq!(handle.id, 7);
+                assert_eq!(handle.handle, "h");
+            }
+            other => panic!("unexpected packet: {other:?}"),
+        }
+    }
 }

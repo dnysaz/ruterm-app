@@ -1589,8 +1589,9 @@ pub async fn ui_set_zoom(window: tauri::WebviewWindow, scale: f64) -> Result<(),
 
 // -------------------------------------------------------------------- sftp
 //
-// One `SftpSession` (a dedicated SSH connection with the `sftp` subsystem)
-// per SFTP tab. The UI keys tabs by id; commands look the session up here.
+// One `SftpConnection` (a dedicated SSH connection with two `sftp` subsystem
+// channels: high-level I/O + raw streaming reads) per SFTP tab. The UI keys
+// tabs by id; commands look the connection up here.
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
