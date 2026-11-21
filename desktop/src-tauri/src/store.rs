@@ -155,6 +155,10 @@ pub struct AppSettings {
     /// RFC 3339 timestamp of the last successful sync, if any.
     #[serde(default)]
     pub last_synced_at: Option<String>,
+    /// Active interface theme, mirrored here so the AI chat can read it.
+    /// The webview profile is still the source of truth on launch.
+    #[serde(default)]
+    pub ui_theme: String,
 }
 
 pub fn default_client_id() -> String {
@@ -173,6 +177,7 @@ impl Default for AppSettings {
             key_saved: false,
             synced_revision: 0,
             last_synced_at: None,
+            ui_theme: "dark".into(),
         }
     }
 }

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, errorText } from '#lib/api';
+  import { api, errorText, type ChatConfig, type ChatModel } from '#lib/api';
   import { app, changeAccount, lock, notify, setRememberKey, signIn, signOut, syncNow } from '#lib/state.svelte';
   import { applyTheme, setHomeQuickConnect, ui, type Theme } from '#lib/ui.svelte';
   import { isRestoreEnabled, setRestoreEnabled } from '#lib/scrollback';
@@ -21,6 +21,121 @@
 
   let version = $state('');
   let restoreScrollback = $state(isRestoreEnabled());
+
+  // BYOK AI chat. Rust only exposes key *status*, never the key itself.
+  let chatCfg = $state<ChatConfig>({ configured: false, model: '', allow_credentials: false });
+  let chatKeyInput = $state('');
+  let chatModelInput = $state('');
+  let chatAllow = $state(false);
+  let chatShowKey = $state(false);
+  let chatBusy = $state(false);
+  let chatStatus = $state('');
+  let chatModels = $state<ChatModel[]>([]);
+  let chatModelsLoading = $state(false);
+  let chatModelSearch = $state('');
+  let chatFreeOnly = $state(false);
+  let modelOpen = $state(false);
+  let modelBoxEl = $state<HTMLDivElement>();
+
+  const freeCount = $derived(chatModels.filter(model => model.id.endsWith(':free')).length);
+
+  // Keep the saved model selectable even if it is no longer in the catalog.
+  const modelOptions = $derived.by(() => {
+    const needle = chatModelSearch.trim().toLowerCase();
+    const options = chatModels
+      .filter(model => !chatFreeOnly || model.id.endsWith(':free'))
+      .filter(
+        model =>
+          !needle ||
+          model.id.toLowerCase().includes(needle) ||
+          model.name.toLowerCase().includes(needle),
+      )
+      .map(model => ({
+        id: model.id,
+        label: `${!chatFreeOnly && model.id.endsWith(':free') ? 'FREE · ' : ''}${model.name} — ${model.id}`,
+      }));
+    if (chatModelInput && !chatModels.some(model => model.id === chatModelInput)) {
+      options.unshift({ id: chatModelInput, label: `${chatModelInput} (saved)` });
+    }
+    return options;
+  });
+
+  const selectedModelLabel = $derived(
+    modelOptions.find(option => option.id === chatModelInput)?.label ||
+      chatModelInput ||
+      'Select a model…',
+  );
+
+  function closeModelMenu() {
+    modelOpen = false;
+  }
+
+  function chooseModel(id: string) {
+    chatModelInput = id;
+    closeModelMenu();
+  }
+
+  async function loadChatModels() {
+    chatModelsLoading = true;
+    try {
+      chatModels = await api.chatModels();
+    } catch (error) {
+      chatStatus = errorText(error);
+    } finally {
+      chatModelsLoading = false;
+    }
+  }
+
+  async function loadChatConfig() {
+    try {
+      chatCfg = await api.chatConfig();
+      chatModelInput = chatCfg.model;
+      chatAllow = chatCfg.allow_credentials;
+      await loadChatModels();
+    } catch (error) {
+      chatStatus = errorText(error);
+    }
+  }
+
+  async function saveChatConfig(clear = false) {
+    if (chatBusy) return;
+    if (!clear && !chatKeyInput.trim() && !chatCfg.configured) {
+      chatStatus = 'Enter your OpenRouter API key first.';
+      return;
+    }
+    chatBusy = true;
+    chatStatus = '';
+    try {
+      chatCfg = await api.chatSetKey(chatKeyInput, chatModelInput, chatAllow, clear);
+      chatKeyInput = '';
+      chatStatus = clear
+        ? 'API key removed.'
+        : chatCfg.configured
+          ? 'Saved. The key is encrypted in your vault.'
+          : '';
+      notify(clear ? 'API key removed' : 'RuTerm AI Chat settings saved');
+      window.dispatchEvent(new Event('rterm:chat-updated'));
+      if (clear) chatModels = [];
+      else await loadChatModels();
+    } catch (error) {
+      chatStatus = errorText(error);
+    } finally {
+      chatBusy = false;
+    }
+  }
+
+  async function testChatKey() {
+    if (chatBusy) return;
+    chatBusy = true;
+    chatStatus = 'Asking the model to reply…';
+    try {
+      chatStatus = await api.chatTestKey();
+    } catch (error) {
+      chatStatus = errorText(error);
+    } finally {
+      chatBusy = false;
+    }
+  }
 
   function toggleScrollback(enabled: boolean) {
     restoreScrollback = enabled;
@@ -54,6 +169,13 @@
     // (WebKit keeps ::selection painted until something replaces it).
     window.getSelection()?.removeAllRanges();
     void api.appVersion().then(value => (version = value));
+    void loadChatConfig();
+
+    const onPointerDown = (event: PointerEvent) => {
+      if (modelBoxEl && !modelBoxEl.contains(event.target as Node)) closeModelMenu();
+    };
+    window.addEventListener('pointerdown', onPointerDown);
+    return () => window.removeEventListener('pointerdown', onPointerDown);
   });
 
 </script>
@@ -201,6 +323,177 @@
             />
           </label>
         </div>
+      </section>
+
+      <section class="section chat-section">
+        <h2 class="section-title">RuTerm AI Chat (BYOK)</h2>
+        <div class="chat-card">
+          <div class="chat-field">
+            <div class="chat-label">
+              <div class="strong">OpenRouter API key</div>
+              <small>
+                {chatCfg.configured
+                  ? 'Saved and encrypted in your vault. Leave blank to keep the current key.'
+                  : 'Use your own key. Stored encrypted, never sent back to the renderer.'}
+              </small>
+            </div>
+            <div class="chat-control-row">
+              <input
+                class="chat-input"
+                type={chatShowKey ? 'text' : 'password'}
+                bind:value={chatKeyInput}
+                placeholder={chatCfg.configured ? '••••••••' : 'sk-or-…'}
+                autocomplete="off"
+                spellcheck="false"
+                aria-label="OpenRouter API key"
+              />
+              <button
+                class="btn sm ghost"
+                onclick={() => (chatShowKey = !chatShowKey)}
+                title={chatShowKey ? 'Hide key' : 'Show key'}
+              >
+                {chatShowKey ? 'Hide' : 'Show'}
+              </button>
+            </div>
+          </div>
+
+          <div class="chat-field">
+            <div class="chat-label">
+              <div class="strong">Model</div>
+              <small>Choose from the models available to your key.</small>
+            </div>
+            <div class="model-box" bind:this={modelBoxEl}>
+              <div class="model-tools">
+                <input
+                  class="chat-input"
+                  type="search"
+                  bind:value={chatModelSearch}
+                  placeholder={chatModels.length ? `Search ${chatModels.length} models…` : 'Search models…'}
+                  disabled={chatModelsLoading}
+                  aria-label="Search OpenRouter models"
+                  onkeydown={event => {
+                    if (event.key === 'Enter' && modelOptions.length) {
+                      event.preventDefault();
+                      chooseModel(modelOptions[0].id);
+                    }
+                    if (event.key === 'Escape') closeModelMenu();
+                  }}
+                />
+                <label class="compact-switch">
+                  <span>Free only</span>
+                  <input
+                    type="checkbox"
+                    class="switch"
+                    bind:checked={chatFreeOnly}
+                    aria-label="Show free models only"
+                  />
+                </label>
+                <button
+                  class="btn sm ghost"
+                  disabled={chatModelsLoading}
+                  onclick={() => void loadChatModels()}
+                  title="Reload models"
+                >
+                  <Icon name="refresh" size={15} />
+                </button>
+              </div>
+              <div class="model-select-shell">
+                <button
+                  type="button"
+                  class="chat-input chat-select mono"
+                  class:open={modelOpen}
+                  disabled={chatModelsLoading}
+                  aria-haspopup="listbox"
+                  aria-expanded={modelOpen}
+                  aria-label="OpenRouter model"
+                  onclick={() => (modelOpen = !modelOpen)}
+                  onkeydown={event => {
+                    if (event.key === 'Escape') closeModelMenu();
+                    if (event.key === 'ArrowDown' && !modelOpen) modelOpen = true;
+                  }}
+                >
+                  <span class="model-selected">{selectedModelLabel}</span>
+                  <Icon name="chevron-down" size={15} />
+                </button>
+
+                {#if modelOpen}
+                  <div class="model-menu" role="listbox" aria-label="OpenRouter models">
+                    {#if chatModelsLoading}
+                      <div class="model-empty">Loading models…</div>
+                    {:else if modelOptions.length === 0}
+                      <div class="model-empty">
+                        {chatModels.length ? 'No match' : 'No models found'}
+                      </div>
+                    {:else}
+                      {#each modelOptions as option (option.id)}
+                        <button
+                          type="button"
+                          class="model-option"
+                          class:selected={chatModelInput === option.id}
+                          role="option"
+                          aria-selected={chatModelInput === option.id}
+                          onclick={() => chooseModel(option.id)}
+                        >
+                          <span class="mono">{option.label}</span>
+                          {#if chatModelInput === option.id}
+                            <Icon name="check" size={14} />
+                          {/if}
+                        </button>
+                      {/each}
+                    {/if}
+                  </div>
+                {/if}
+              </div>
+
+              <small class="model-count">
+                {chatModels.length} models from OpenRouter · {freeCount} free
+              </small>
+            </div>
+          </div>
+
+          <label class="chat-field chat-switch-field">
+            <div class="chat-label">
+              <div class="strong">Allow credential requests</div>
+              <small>
+                Lets the chat ask for passwords or private keys — every access still needs approval.
+              </small>
+            </div>
+            <input
+              type="checkbox"
+              class="switch"
+              checked={chatAllow}
+              onchange={event => (chatAllow = event.currentTarget.checked)}
+              aria-label="Allow credential requests"
+            />
+          </label>
+
+          <div class="chat-actions">
+            <span
+              class="chat-status"
+              class:ok={chatStatus.startsWith('Connected') ||
+                chatStatus.startsWith('Saved') ||
+                chatStatus.startsWith('API key removed')}
+            >{chatStatus}</span>
+            <div class="chat-buttons">
+              <button class="btn sm ghost" disabled={chatBusy || !chatCfg.configured} onclick={() => void testChatKey()}>
+                Test connection
+              </button>
+              {#if chatCfg.configured}
+                <button class="btn sm danger" disabled={chatBusy} onclick={() => void saveChatConfig(true)}>
+                  Clear key
+                </button>
+              {/if}
+              <button class="btn sm primary" disabled={chatBusy} onclick={() => void saveChatConfig()}>
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+        <p class="hint chat-hint">
+          Once a key is saved, a floating chat button appears in the bottom-right corner. The key
+          syncs encrypted to D1 like the rest of your vault. Chat reads data and writes config only —
+          it never runs VPS commands.
+        </p>
       </section>
 
       <BackgroundSettings />
@@ -461,6 +754,210 @@
     color: var(--text-tertiary);
   }
 
+  /* BYOK chat -------------------------------------------------------------- */
+  .chat-card {
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+    padding: 18px;
+    border-radius: 12px;
+    background: var(--bg-elevated);
+  }
+  .chat-field {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .chat-label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .chat-label small {
+    font-size: 12px;
+    line-height: 1.55;
+    color: var(--text-tertiary);
+  }
+  .chat-control-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .chat-input {
+    flex: 1;
+    min-width: 0;
+    height: 36px;
+    padding: 0 12px;
+    font-size: 13px;
+  }
+  .model-box {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 12px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--bg) 45%, transparent);
+  }
+  .model-tools {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .compact-switch {
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    flex: 0 0 auto;
+    font-size: 12px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+    white-space: nowrap;
+  }
+  .model-select-shell {
+    position: relative;
+  }
+  .chat-select {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    width: 100%;
+    height: 46px;
+    padding: 0 14px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+    color: var(--text);
+    font-size: 13.5px;
+    text-align: left;
+    cursor: pointer;
+    transition: border-color 0.16s ease, box-shadow 0.16s ease;
+  }
+  .chat-select:hover {
+    border-color: var(--line-hover);
+  }
+  .chat-select.open,
+  .chat-select:focus-visible {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-dim);
+    outline: none;
+  }
+  .chat-select:disabled {
+    opacity: 0.55;
+    cursor: default;
+  }
+  .chat-select :global(svg) {
+    flex: 0 0 auto;
+    color: var(--text-tertiary);
+    transition: transform 0.16s ease;
+  }
+  .chat-select.open :global(svg) {
+    transform: rotate(180deg);
+    color: var(--accent);
+  }
+  .model-selected {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .model-menu {
+    position: absolute;
+    z-index: 60;
+    top: calc(100% + 6px);
+    left: 0;
+    right: 0;
+    max-height: 340px;
+    overflow-y: auto;
+    padding: 5px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--bg-elevated);
+    box-shadow: 0 14px 34px rgba(0, 0, 0, 0.3);
+  }
+  .model-option {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    width: 100%;
+    min-height: 40px;
+    padding: 9px 11px;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.45;
+    text-align: left;
+    cursor: pointer;
+  }
+  .model-option span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .model-option:hover {
+    background: var(--hover);
+    color: var(--text);
+  }
+  .model-option.selected {
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    color: var(--accent);
+  }
+  .model-option :global(svg) {
+    flex: 0 0 auto;
+  }
+  .model-empty {
+    padding: 14px 11px;
+    color: var(--text-tertiary);
+    font-size: 12px;
+    text-align: center;
+  }
+  .model-count {
+    font-size: 11px;
+    color: var(--text-tertiary);
+  }
+  .chat-switch-field {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 20px;
+    cursor: pointer;
+  }
+  .chat-switch-field .chat-label {
+    min-width: 0;
+  }
+  .chat-actions {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+    padding-top: 16px;
+    border-top: 1px solid var(--line);
+  }
+  .chat-status {
+    flex: 1;
+    min-width: 160px;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-tertiary);
+  }
+  .chat-status.ok {
+    color: var(--ok);
+  }
+  .chat-buttons {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .chat-hint {
+    margin-top: 12px;
+  }
+
   /* ---------------------------------------------------------- switch ------- */
   .switch-row {
     cursor: pointer;
@@ -591,6 +1088,19 @@
     .kv-label {
       flex-basis: 110px;
     }
-
+    .chat-card {
+      gap: 18px;
+      padding: 14px;
+    }
+    .model-tools {
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .model-tools .chat-input {
+      flex-basis: 100%;
+    }
+    .chat-switch-field {
+      align-items: flex-start;
+    }
   }
 </style>

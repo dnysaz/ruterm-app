@@ -213,6 +213,11 @@ fn redact_vault(vault: &Vault) -> Vault {
         };
     }
     out.identities = out.identities.iter().map(redact_identity).collect();
+    if !out.settings.openrouter_api_key.is_empty() {
+        // The renderer may echo this back unchanged; Rust restores the real
+        // value from unlocked state before saving.
+        out.settings.openrouter_api_key = SEALED_PLACEHOLDER.to_string();
+    }
     out
 }
 
@@ -386,6 +391,13 @@ async fn restore_secrets(state: &AppState, incoming: &mut Vault) {
         if identity.passphrase.as_deref().is_some_and(is_sealed) {
             identity.passphrase = old.and_then(|i| i.passphrase.clone());
         }
+    }
+
+    if is_sealed(&incoming.settings.openrouter_api_key) {
+        incoming.settings.openrouter_api_key = current
+            .as_ref()
+            .map(|v| v.settings.openrouter_api_key.clone())
+            .unwrap_or_default();
     }
 }
 
@@ -759,6 +771,28 @@ pub async fn vault_lock(state: tauri::State<'_, AppState>) -> Result<(), String>
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+    // Drop every in-memory chat conversation and pending approval so nothing
+    // from the previous unlock survives a lock (pending senders deny on drop).
+    state
+        .chat_sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    state
+        .chat_pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    state
+        .chat_always
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    state
+        .chat_cancel
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     Ok(())
 }
 
@@ -779,7 +813,10 @@ async fn mark_synced(state: &AppState, revision: i64) {
 }
 
 /// Seals `vault` into the on-disk file and keeps in-memory state in sync.
-async fn persist_vault(state: &AppState, mut vault: Vault) -> Result<VaultPayload, String> {
+pub(crate) async fn persist_vault(
+    state: &AppState,
+    mut vault: Vault,
+) -> Result<VaultPayload, String> {
     validate_vault(&vault)?;
     let key = state.unlocked_key().await?;
     vault.updated_at = Some(Utc::now());
@@ -1765,15 +1802,28 @@ pub fn app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
-/// Keeps the native title bar in step with the in-app theme.
+/// Keeps the native title bar in step with the in-app theme, and mirrors the
+/// choice into settings so RuTerm AI Chat can report the active theme.
 #[tauri::command]
-pub async fn ui_set_theme(window: tauri::WebviewWindow, theme: String) -> Result<(), String> {
-    let value = if theme == "ember-light" || theme == "light" {
+pub async fn ui_set_theme(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, AppState>,
+    theme: String,
+) -> Result<(), String> {
+    let light = theme == "ember-light" || theme == "light";
+    let value = if light {
         tauri::Theme::Light
     } else {
         tauri::Theme::Dark
     };
-    window.set_theme(Some(value)).map_err(|e| e.to_string())
+    window.set_theme(Some(value)).map_err(|e| e.to_string())?;
+    let normalized = if light { "light" } else { "dark" };
+    let mut settings = state.settings_rw.write().await;
+    if settings.ui_theme != normalized {
+        settings.ui_theme = normalized.into();
+        let _ = store::write_settings(&state.paths.settings, &settings);
+    }
+    Ok(())
 }
 
 /// Scales the whole webview natively (Cmd +/-), so terminals stay sharp.

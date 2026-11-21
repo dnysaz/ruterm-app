@@ -1349,16 +1349,20 @@ fn start_job(
 }
 
 fn job_view(job: &StreamJob, job_id: &str, bridge: &Bridge, offset: u64) -> JobView {
-    let start = offset.min(job.buffer.len() as u64) as usize;
+    // The PTY echoes the sentinel line we append for the exit status, often
+    // *after* the command's own output. Hide it from agents; the real marker
+    // was already cut off when the job completed.
+    let cleaned = strip_sentinel_echo(&job.buffer, &job.marker);
+    let start = offset.min(cleaned.len() as u64) as usize;
     JobView {
         job: job_id.to_string(),
         session: job.session.clone(),
         command: job.command.clone(),
         vps: bridge.display_name(&job.session),
         address: bridge.label(&job.session),
-        chunk: job.buffer[start..].to_vec(),
+        chunk: cleaned[start..].to_vec(),
         offset,
-        next_offset: job.buffer.len() as u64,
+        next_offset: cleaned.len() as u64,
         done: job.done,
         exit_status: job.exit_status.clone(),
         elapsed: job.created.elapsed(),
@@ -1571,6 +1575,32 @@ fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).rposition(|part| part == needle)
 }
 
+/// Remove the echoed `printf '\\n<marker>:%s\\n' "$?"` line from captured
+/// output. The terminal echoes everything we type, and because the shell
+/// processes our two-line script one line at a time, that echo frequently
+/// appears after the command's real output. Keeping it would leak internal
+/// plumbing into the agent's context.
+fn strip_sentinel_echo(raw: &[u8], marker: &str) -> Vec<u8> {
+    let needle = format!("printf '\\n{}:%s\\n' \"$?\"", marker);
+    let Some(pos) = raw.windows(needle.len()).position(|part| part == needle.as_bytes()) else {
+        return raw.to_vec();
+    };
+    // A shell prompt usually precedes the echo on the same line; drop the
+    // whole line, not just the sentinel text.
+    let start = raw[..pos]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let mut end = pos + needle.len();
+    while end < raw.len() && matches!(raw[end], b'\r' | b'\n') {
+        end += 1;
+    }
+    let mut out = raw[..start].to_vec();
+    out.extend_from_slice(&raw[end..]);
+    out
+}
+
 /// Minimal ANSI/osc stripper: enough to give an agent readable plain text
 /// without pulling a regex or terminal-emulator dependency into the app.
 fn strip_ansi(input: &[u8]) -> String {
@@ -1651,6 +1681,20 @@ mod tests {
         let pos = rfind_bytes(stream, needle).expect("marker");
         assert_eq!(&stream[pos + needle.len()..pos + needle.len() + 3], b":0\n");
         assert_eq!(rfind_bytes(stream, b"missing"), None);
+    }
+
+    #[test]
+    fn strips_echoed_exit_sentinel_from_output() {
+        let marker = "__RUTERM_DONE_abc__";
+        let raw = format!(
+            "echo hi\r\nhi\r\nroot@host:~# printf '\\n{}:%s\\n' \"$?\"\r\n",
+            marker
+        );
+        let cleaned = strip_sentinel_echo(raw.as_bytes(), marker);
+        assert_eq!(String::from_utf8_lossy(&cleaned), "echo hi\r\nhi\r\n");
+        // Output without a sentinel must pass through untouched.
+        let plain = b"echo hi\r\nhi\r\n";
+        assert_eq!(strip_sentinel_echo(plain, marker), plain.to_vec());
     }
 
     #[test]

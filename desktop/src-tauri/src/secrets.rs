@@ -23,7 +23,7 @@ pub fn kdf_epoch(kdf: Option<&KdfParams>) -> String {
         .to_string()
 }
 
-fn field_aad(epoch: &str, entity: &str, field: &str) -> Vec<u8> {
+pub(crate) fn field_aad(epoch: &str, entity: &str, field: &str) -> Vec<u8> {
     format!("rterm-field-v1\x1f{epoch}\x1f{entity}\x1f{field}").into_bytes()
 }
 
@@ -195,6 +195,13 @@ pub fn seal_vault(vault: &Vault, key: &SecretKey, epoch: &str) -> Result<Vault, 
             )?);
         }
     }
+    // BYOK chat key: same field-level encryption as credentials, bound to the
+    // settings entity so it can never be swapped into a host or identity.
+    out.settings.openrouter_api_key = seal_str(
+        key,
+        &out.settings.openrouter_api_key,
+        &field_aad(epoch, "settings", "openrouter_api_key"),
+    )?;
     Ok(out)
 }
 
@@ -278,6 +285,13 @@ fn open_vault_inner(
             )?);
         }
     }
+    out.settings.openrouter_api_key = open_field(
+        key,
+        &out.settings.openrouter_api_key,
+        &field_aad(epoch, "settings", "openrouter_api_key"),
+        allow_legacy,
+        &mut used_legacy,
+    )?;
     Ok((out, used_legacy))
 }
 
@@ -369,6 +383,43 @@ mod tests {
         let mut sealed = seal_vault(&sample(), &key, "epoch-1").unwrap();
         sealed.hosts[0].auth = AuthMethod::Password { password: "plain".into() };
         assert!(open_vault(&sealed, &key, "epoch-1").is_err());
+    }
+
+    #[test]
+    fn openrouter_key_is_sealed_and_context_bound() {
+        let key = SecretKey::generate();
+        let mut vault = Vault::default();
+        vault.settings.openrouter_api_key = "sk-or-demo-key".into();
+
+        let sealed = seal_vault(&vault, &key, "epoch-1").unwrap();
+        let json = serde_json::to_string(&sealed).unwrap();
+        assert!(!json.contains("sk-or-demo-key"));
+        assert!(sealed.settings.openrouter_api_key.starts_with(PREFIX));
+
+        let opened = open_vault(&sealed, &key, "epoch-1").unwrap();
+        assert_eq!(opened.settings.openrouter_api_key, "sk-or-demo-key");
+        // A different key epoch must not authenticate the field.
+        assert!(open_vault(&sealed, &key, "epoch-2").is_err());
+
+        // Empty means "no key configured" and stays empty (clear works).
+        let empty = seal_vault(&Vault::default(), &key, "epoch-1").unwrap();
+        assert!(empty.settings.openrouter_api_key.is_empty());
+    }
+
+    #[test]
+    fn legacy_openrouter_key_still_opens_and_reseals() {
+        let key = SecretKey::generate();
+        let mut vault = Vault::default();
+        vault.settings.openrouter_api_key = legacy_seal(&key, "sk-or-legacy");
+        assert!(open_vault(&vault, &key, "epoch-1").is_err());
+
+        let (opened, legacy) = open_vault_with_context(&vault, &key, "epoch-1").unwrap();
+        assert!(legacy);
+        assert_eq!(opened.settings.openrouter_api_key, "sk-or-legacy");
+
+        let migrated = seal_vault(&opened, &key, "epoch-1").unwrap();
+        let (_, still_legacy) = open_vault_with_context(&migrated, &key, "epoch-1").unwrap();
+        assert!(!still_legacy);
     }
 
     fn legacy_seal(key: &SecretKey, value: &str) -> String {

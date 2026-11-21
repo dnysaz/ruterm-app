@@ -1,0 +1,9 @@
+# RuTerm AI Chat: BYOK, tools that know your vault, and a real fullscreen tab
+
+RuTerm now ships its own AI chat panel with Bring Your Own OpenRouter key — no extra app, no server, and no agent install on your VPS.
+
+Paste your key in **Settings → RuTerm AI Chat (BYOK)**, pick a model from the live OpenRouter list (including `:free` models, with a **Free only** filter), and press **Test connection**. A working setup replies with `Connected — AI replied: Hello World!`. The key is sealed with the same field-level encryption as your SSH credentials and never sent back to the renderer in clear.
+
+The assistant can read your saved hosts, notes, snippets, groups, per-VPS work logs, app preferences and sync status — always on demand, never silently. It can also write chat configs and snippets, switch the theme, save a real SSH host from an IP/port/password you paste, and **launch an installed AI agent** from the sidebar (OpenCode, Freebuff, Kilo, Claude, Kiro, Command AI) into a local tab with the MCP bridge already attached. Credential reads and config writes stop at a **Deny / Allow / Always allow** dialog; "Always allow" applies only to that exact operation and only until RuTerm restarts. The chat never runs commands on your VPS.
+
+Chat history stays local per account in this browser profile, with pasted passwords redacted. The panel is now a real third column, the fullscreen button opens a dedicated **RuTerm AI Chat** tab, and the suggestion chips run immediately. Streaming replies are reconciled against the backend's final text so a dev reload can no longer leave a truncated or doubled answer.

@@ -3,6 +3,7 @@
 //! The frontend (Svelte) talks to these commands; SSH output is pushed as
 //! `ssh://<session_id>` events instead of polling.
 
+mod chat;
 mod commands;
 mod local;
 mod mcp;
@@ -211,6 +212,14 @@ pub fn run() {
             commands::local_resize,
             commands::local_close,
             commands::ai_agents_detect,
+            chat::chat_config,
+            chat::chat_models,
+            chat::chat_set_key,
+            chat::chat_send,
+            chat::chat_test_key,
+            chat::chat_approve,
+            chat::chat_cancel,
+            chat::chat_clear,
             mcp::agent_config,
             mcp::agent_launch,
             mcp::mcp_confirm,

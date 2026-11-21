@@ -28,6 +28,8 @@ portable-pty = "0.9.0"
 tauri-plugin-opener = "2.7.3"
 tauri-plugin-dialog = "2"
 zeroize = "1"
+# BYOK AI chat: OpenRouter client (rustls keeps the bundle self-contained).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # See https://tauri.app/concept/size/ for the release profile rationale.
 # R-09: no `panic = "abort"` — unwinding keeps a single bad IPC payload from

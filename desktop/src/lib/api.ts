@@ -127,6 +127,28 @@ export interface Group {
   deleted: boolean;
 }
 
+/** Public chat state — never contains the API key itself. */
+export interface ChatConfig {
+  configured: boolean;
+  model: string;
+  allow_credentials: boolean;
+}
+
+/** Model offered by OpenRouter for the Settings dropdown. */
+export interface ChatModel {
+  id: string;
+  name: string;
+}
+
+/** Approval payload emitted on `chat://approval`. */
+export interface ChatApproval {
+  id: string;
+  kind: 'credential' | 'write';
+  title: string;
+  detail: string;
+  preview: string;
+}
+
 export interface VaultSettings {
   theme?: string | null;
   default_term: string;
@@ -136,6 +158,10 @@ export interface VaultSettings {
   sync_interval_secs: number;
   lock_timeout_secs: number;
   copy_on_select: boolean;
+  /** `__RTERM_SEALED__` from the backend — never a plaintext key. */
+  openrouter_api_key?: string;
+  openrouter_model?: string;
+  chat_allow_credentials?: boolean;
   updated_at?: string | null;
 }
 
@@ -255,6 +281,19 @@ export const api = {
   vaultGet: () => invoke<VaultPayload | null>('vault_get'),
   vaultSave: (vault: Vault) => invoke<VaultPayload>('vault_save', { vault }),
   vaultSync: () => invoke<VaultPayload>('vault_sync'),
+
+  // BYOK AI chat — the key is written/read entirely inside Rust.
+  chatConfig: () => invoke<ChatConfig>('chat_config'),
+  chatModels: () => invoke<ChatModel[]>('chat_models'),
+  chatSetKey: (key: string, model: string, allowCredentials: boolean, clear = false) =>
+    invoke<ChatConfig>('chat_set_key', { key, model, allowCredentials, clear }),
+  chatTestKey: () => invoke<string>('chat_test_key'),
+  chatSend: (session: string, text: string) =>
+    invoke<void>('chat_send', { session, text }),
+  chatApprove: (id: string, choice: 'deny' | 'allow' | 'always') =>
+    invoke<void>('chat_approve', { id, choice }),
+  chatCancel: (session: string) => invoke<void>('chat_cancel', { session }),
+  chatClear: (session: string) => invoke<void>('chat_clear', { session }),
 
   /** Resolves to the Rust-issued capability required by every other command. */
   sshOpen: (sessionId: string, hostId: string, cols: number, rows: number) =>

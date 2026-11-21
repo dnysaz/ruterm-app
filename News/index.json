@@ -1,12 +1,18 @@
 {
   "version": 1,
-  "generated_at": "2026-11-21T05:35:28.730Z",
+  "generated_at": "2026-11-21T09:03:01.158Z",
   "entries": [
     {
       "file": "2026-11-21-streaming-command-output.md",
       "date": "2026-11-21",
       "title": "Long commands now stream progress — and can run without a timeout",
       "summary": "Agents no longer have to wait until apt-get, a build, or a kernel change finishes before they can see what is happening."
+    },
+    {
+      "file": "2026-11-21-built-in-ai-chat-byok.md",
+      "date": "2026-11-21",
+      "title": "RuTerm AI Chat: BYOK, tools that know your vault, and a real fullscreen tab",
+      "summary": "RuTerm now ships its own AI chat panel with Bring Your Own OpenRouter key — no extra app, no server, and no agent install on your VPS."
     },
     {
       "file": "2026-11-21-auto-reconnect-and-interactive-tools.md",

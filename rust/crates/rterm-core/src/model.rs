@@ -296,6 +296,17 @@ pub struct VaultSettings {
     pub lock_timeout_secs: u64,
     #[serde(default)]
     pub copy_on_select: bool,
+    /// OpenRouter API key for the in-app AI chat. Stored sealed by the
+    /// desktop app; the renderer only ever sees `SEALED_PLACEHOLDER`.
+    #[serde(default)]
+    pub openrouter_api_key: String,
+    /// Model id sent to OpenRouter. User-editable (BYOK).
+    #[serde(default = "default_openrouter_model")]
+    pub openrouter_model: String,
+    /// Allow the chat to *request* credential fields. Every such read still
+    /// needs an explicit per-call approval in the UI.
+    #[serde(default)]
+    pub chat_allow_credentials: bool,
     #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
 }
@@ -313,6 +324,10 @@ fn default_lock_timeout() -> u64 {
     300
 }
 
+fn default_openrouter_model() -> String {
+    "openai/gpt-4o-mini".into()
+}
+
 impl Default for VaultSettings {
     fn default() -> Self {
         Self {
@@ -324,6 +339,9 @@ impl Default for VaultSettings {
             sync_interval_secs: 60,
             lock_timeout_secs: default_lock_timeout(),
             copy_on_select: false,
+            openrouter_api_key: String::new(),
+            openrouter_model: default_openrouter_model(),
+            chat_allow_credentials: false,
             updated_at: None,
         }
     }

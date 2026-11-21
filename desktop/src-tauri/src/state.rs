@@ -5,7 +5,7 @@ use rterm_core::model::{Identity, Vault};
 use rterm_core::oauth::GoogleAccount;
 use rterm_core::sftp::SftpConnection;
 use rterm_core::ssh::{SshHandle, SshTarget};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tokio::sync::RwLock;
@@ -106,6 +106,15 @@ pub struct AppState {
     /// Newly generated/imported private keys awaiting the renderer's next
     /// `vault_save`. Kept in Rust so the plaintext key never crosses IPC.
     pub pending_identities: Mutex<HashMap<Uuid, Identity>>,
+    /// Conversations for the in-app BYOK chat, keyed by a renderer-chosen id.
+    /// Never persisted: locking the vault drops them.
+    pub chat_sessions: Mutex<HashMap<String, Vec<crate::chat::ChatMessage>>>,
+    /// Approval requests waiting on the UI. Dropping the sender denies it.
+    pub chat_pending: Mutex<HashMap<String, crate::chat::PendingApproval>>,
+    /// Exact operations the user chose "Always allow" for, current process only.
+    pub chat_always: Mutex<HashSet<String>>,
+    /// Sessions whose next loop iteration should stop.
+    pub chat_cancel: Mutex<HashSet<String>>,
 }
 
 impl AppState {
@@ -128,6 +137,10 @@ impl AppState {
             sftp_tokens: Mutex::new(HashMap::new()),
             local_file_tokens: Mutex::new(HashMap::new()),
             pending_identities: Mutex::new(HashMap::new()),
+            chat_sessions: Mutex::new(HashMap::new()),
+            chat_pending: Mutex::new(HashMap::new()),
+            chat_always: Mutex::new(HashSet::new()),
+            chat_cancel: Mutex::new(HashSet::new()),
         }
     }
 
