@@ -1,7 +1,13 @@
 {
   "version": 1,
-  "generated_at": "2026-11-21T04:07:36.698Z",
+  "generated_at": "2026-11-21T04:54:32.225Z",
   "entries": [
+    {
+      "file": "2026-11-21-agent-knows-your-vps-name.md",
+      "date": "2026-11-21",
+      "title": "Agents now know which VPS you mean — without a reload",
+      "summary": "Open a VPS tab while an agent is already running in a local shell, and it sees the new tab immediately. No restart, no re-initialisation."
+    },
     {
       "file": "2026-11-21-agent-bridge-for-every-agent.md",
       "date": "2026-11-21",

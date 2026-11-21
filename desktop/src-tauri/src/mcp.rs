@@ -50,8 +50,10 @@ pub struct Bridge {
     pub port: u16,
     pub token: String,
     recent: Arc<Mutex<Vec<String>>>,
-    /// Stable human label (`user@host:port`) per live SSH tab.
+    /// Stable address (`user@host:port`) per live SSH tab; also keys the memory file.
     labels: Arc<Mutex<HashMap<String, String>>>,
+    /// Friendly saved host name shown to agents (the internal session id stays hidden).
+    names: Arc<Mutex<HashMap<String, String>>>,
     target: Arc<Mutex<Option<String>>>,
     pending: Arc<Mutex<HashMap<String, Sender<ConfirmOutcome>>>>,
     /// Exact commands the user approved with "Always allow" (this launch only).
@@ -72,6 +74,7 @@ impl Bridge {
             token: Uuid::new_v4().simple().to_string(),
             recent: Arc::new(Mutex::new(Vec::new())),
             labels: Arc::new(Mutex::new(HashMap::new())),
+            names: Arc::new(Mutex::new(HashMap::new())),
             target: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             allowlist: Arc::new(Mutex::new(HashSet::new())),
@@ -94,24 +97,45 @@ impl Bridge {
         Ok(bridge)
     }
 
-    /// Remember the order in which SSH tabs were opened. Used as a tie-breaker
-    /// when several remote sessions are available and none was pinned.
-    pub fn note_open(&self, session_id: &str, label: &str) {
+    /// Remember the order in which SSH tabs were opened, their address (used
+    /// for the stable memory file) and their saved human name (shown to agents).
+    pub fn note_open(&self, session_id: &str, address: &str, name: &str) {
         if let Ok(mut recent) = self.recent.lock() {
             recent.retain(|id| id != session_id);
             recent.push(session_id.to_string());
         }
         if let Ok(mut labels) = self.labels.lock() {
-            labels.insert(session_id.to_string(), label.to_string());
+            labels.insert(session_id.to_string(), address.to_string());
+        }
+        if let Ok(mut names) = self.names.lock() {
+            let friendly = if name.trim().is_empty() {
+                address.to_string()
+            } else {
+                name.trim().to_string()
+            };
+            names.insert(session_id.to_string(), friendly);
         }
     }
 
+    /// Address (`user@host:port`), kept stable so the session memory filename
+    /// never changes when a host is renamed.
     fn label(&self, session_id: &str) -> String {
         self.labels
             .lock()
             .ok()
             .and_then(|map| map.get(session_id).cloned())
             .unwrap_or_else(|| session_id.to_string())
+    }
+
+    /// Saved host name, e.g. "VPS Murah". Falls back to the address for adhoc
+    /// quick-connect tabs that have no saved name.
+    fn display_name(&self, session_id: &str) -> String {
+        self.names
+            .lock()
+            .ok()
+            .and_then(|map| map.get(session_id).cloned())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| self.label(session_id))
     }
 
     /// Per-VPS markdown memory, stable across reconnects and app restarts.
@@ -594,7 +618,7 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "list_targets",
-            "description": "List SSH terminals currently open in RuTerm. The local agent terminal is never a target.",
+            "description": "List SSH terminals currently open in RuTerm with their saved names. Call this before every server task: tabs can change while you run, without reloading this local shell. The local agent terminal is never a target.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
         },
         {
@@ -604,7 +628,7 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "Shell command to run on the remote VPS." },
-                    "session": { "type": "string", "description": "Optional SSH tab id. Omit to use the active VPS tab." },
+                    "session": { "type": "string", "description": "Internal session id, VPS name, or address shown by list_targets. Omit to use the active VPS tab." },
                     "timeout_ms": { "type": "integer", "description": "Wait limit in milliseconds (default 180000)." }
                 },
                 "required": ["command"],
@@ -618,7 +642,7 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "keys": { "type": "string" },
-                    "session": { "type": "string" }
+                    "session": { "type": "string", "description": "Internal session id, VPS name, or address shown by list_targets. Omit to use the active VPS." }
                 },
                 "required": ["keys"],
                 "additionalProperties": false
@@ -630,7 +654,7 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "session": { "type": "string" },
+                    "session": { "type": "string", "description": "Internal session id, VPS name, or address shown by list_targets. Omit to use the active VPS." },
                     "max_bytes": { "type": "integer" }
                 },
                 "additionalProperties": false
@@ -641,7 +665,7 @@ fn tool_definitions() -> Value {
             "description": "Pin a specific SSH tab as the target for later commands.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "session": { "type": "string" } },
+                "properties": { "session": { "type": "string", "description": "Internal session id, VPS name, or address shown by list_targets. Omit to use the active VPS." } },
                 "required": ["session"],
                 "additionalProperties": false
             }
@@ -651,18 +675,18 @@ fn tool_definitions() -> Value {
             "description": "Read RuTerm's persistent work log and notes for this VPS. Call this at the start of a new session so you remember previous work and decisions.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "session": { "type": "string" } },
+                "properties": { "session": { "type": "string", "description": "Internal session id, VPS name, or address shown by list_targets. Omit to use the active VPS." } },
                 "additionalProperties": false
             }
         },
         {
             "name": "note_session",
-            "description": "Append an important fact, decision, or explanation to this VPS's session memory file so future OpenCode sessions remember it.",
+            "description": "Append an important fact, decision, or explanation to this VPS's session memory file so future agent sessions remember it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "text": { "type": "string", "description": "Note to remember." },
-                    "session": { "type": "string" }
+                    "session": { "type": "string", "description": "Internal session id, VPS name, or address shown by list_targets. Omit to use the active VPS." }
                 },
                 "required": ["text"],
                 "additionalProperties": false
@@ -672,24 +696,31 @@ fn tool_definitions() -> Value {
 }
 
 fn target_instructions(app: &tauri::AppHandle, bridge: &Bridge) -> String {
-    let ids = ssh_ids(app);
     match resolve_target(app, bridge, None) {
         Ok(id) => format!(
             "You are connected to RuTerm, an SSH client on the user's Mac. \
-             An OpenCode agent runs in a local RuTerm tab; your remote shell is the SSH tab `{id}`. \
-             Use ruterm_execute for ALL server/VPS work (SSL, setup, config). Commands appear visibly \
+             An AI agent runs in a local RuTerm tab; all server/VPS work must go through an SSH tab, \
+             never through this Mac's shell. \
+             VPS tabs can open or close WHILE YOU ARE RUNNING: call ruterm_list_targets before every \
+             server task to see the current tabs. No reload or restart of this local shell is needed — \
+             a tab opened a moment ago is already visible. \
+             Active VPS: {} ({}). \
+             Session ids are internal and hidden; omit `session` to use the active VPS, or pass the \
+             VPS name/address returned by ruterm_list_targets to choose a specific one. \
+             Use ruterm_execute for ALL server/VPS work (SSL, setup, config); commands appear visibly \
              in that terminal and run on the VPS, not on this Mac. Destructive commands require the \
              user to choose Deny / Allow / Always allow in a RuTerm dialog; wait for the tool result. \
-             At the start of every session call ruterm_read_session to recall previous work on this VPS, \
-             and call ruterm_note_session whenever you learn an important fact or decision so future \
-             sessions remember it. Memory file: {}. \
-             Available SSH tabs: {}.",
-            bridge.session_file(&id).display(),
-            ids.join(", ")
+             Call ruterm_read_session when you start or switch VPS, and ruterm_note_session whenever \
+             you learn an important fact or decision so future sessions remember it. \
+             Memory for the active VPS: {}.",
+            bridge.display_name(&id),
+            bridge.label(&id),
+            bridge.session_file(&id).display()
         ),
         Err(_) => [
             "You are connected to RuTerm, an SSH client on the user's Mac.",
             "No SSH session is open yet. Ask the user to open a VPS terminal tab, then call ruterm_list_targets.",
+            "Targets can change while you run; call ruterm_list_targets before every server task — no reload is needed.",
             "Use ruterm_execute (never local shell tools) for server/VPS work.",
             "Destructive commands require user approval (Deny / Allow / Always allow).",
             "Once a VPS tab is open, call ruterm_read_session to load previous work context.",
@@ -853,13 +884,29 @@ fn call_tool(app: &tauri::AppHandle, bridge: &Bridge, name: &str, args: &Value) 
         "list_targets" => {
             let ids = ssh_ids(app);
             if ids.is_empty() {
-                "No SSH session is open. Ask the user to open a VPS terminal tab in RuTerm."
+                "No SSH session is open. Ask the user to open a VPS terminal tab in RuTerm. \
+                 Call this tool again whenever you need server work — no reload is required."
                     .to_string()
             } else {
                 let active = resolve_target(app, bridge, None).unwrap_or_default();
+                let lines = ids
+                    .iter()
+                    .map(|id| {
+                        let marker = if id == &active { " (active)" } else { "" };
+                        format!(
+                            "- {} — {}{}",
+                            bridge.display_name(id),
+                            bridge.label(id),
+                            marker
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 format!(
-                    "Open SSH terminals: {}\nActive target: {active}\nSession memory: {}",
-                    ids.join(", "),
+                    "Open VPS tabs (saved names):\n{lines}\n\nSession ids are internal and hidden. \
+                     Omit `session` to use the active VPS, or pass the name/address above to pick one. \
+                     This list is live — call it again after the user opens another tab.\n\
+                     Session memory: {}",
                     bridge.session_file(&active).display()
                 )
             }
@@ -890,7 +937,11 @@ fn call_tool(app: &tauri::AppHandle, bridge: &Bridge, name: &str, args: &Value) 
                 &format!("sent keys `{}`", one_line(keys, 400)),
                 false,
             );
-            "Keys sent to the remote terminal.".to_string()
+            format!(
+                "Keys sent to {} ({}).",
+                bridge.display_name(&session),
+                bridge.label(&session)
+            )
         }
         "read_screen" => {
             let session = resolve_target(app, bridge, args.get("session").and_then(Value::as_str))
@@ -901,11 +952,17 @@ fn call_tool(app: &tauri::AppHandle, bridge: &Bridge, name: &str, args: &Value) 
                 .unwrap_or(20_000)
                 .clamp(1_000, 512_000) as usize;
             let bytes = output_tail(app, &session, max);
-            if bytes.is_empty() {
+            let body = if bytes.is_empty() {
                 "(no output captured yet)".to_string()
             } else {
                 strip_ansi(&bytes)
-            }
+            };
+            format!(
+                "VPS: {} ({})\n{}",
+                bridge.display_name(&session),
+                bridge.label(&session),
+                body
+            )
         }
         "switch_target" => {
             let session = args
@@ -916,7 +973,11 @@ fn call_tool(app: &tauri::AppHandle, bridge: &Bridge, name: &str, args: &Value) 
             if let Ok(mut target) = bridge.target.lock() {
                 *target = Some(resolved.clone());
             }
-            format!("Target switched to SSH tab `{resolved}`.")
+            format!(
+                "Target switched to {} ({}).",
+                bridge.display_name(&resolved),
+                bridge.label(&resolved)
+            )
         }
         "read_session" => {
             let session = resolve_target(app, bridge, args.get("session").and_then(Value::as_str))
@@ -924,7 +985,9 @@ fn call_tool(app: &tauri::AppHandle, bridge: &Bridge, name: &str, args: &Value) 
             let path = bridge.session_file(&session);
             let body = fs::read_to_string(&path).unwrap_or_default();
             format!(
-                "Session memory file: {}\n\n{}",
+                "VPS: {} ({})\nSession memory file: {}\n\n{}",
+                bridge.display_name(&session),
+                bridge.label(&session),
                 path.display(),
                 if body.trim().is_empty() {
                     "(still empty — use ruterm_note_session to record context)".to_string()
@@ -941,7 +1004,12 @@ fn call_tool(app: &tauri::AppHandle, bridge: &Bridge, name: &str, args: &Value) 
             let session = resolve_target(app, bridge, args.get("session").and_then(Value::as_str))
                 .map_err(|e| (-32000, e))?;
             let path = bridge.remember(&session, &one_line(text, 2000), true);
-            format!("Noted in {}", path.display())
+            format!(
+                "Noted in {} for {} ({}).",
+                path.display(),
+                bridge.display_name(&session),
+                bridge.label(&session)
+            )
         }
         _ => return Err((-32602, format!("unknown tool: {name}"))),
     };
@@ -965,14 +1033,43 @@ fn resolve_target(
     requested: Option<&str>,
 ) -> Result<String, String> {
     let ids = ssh_ids(app);
-    if let Some(id) = requested {
-        return if ids.iter().any(|candidate| candidate == id) {
-            if let Ok(mut target) = bridge.target.lock() {
-                *target = Some(id.to_string());
+    if let Some(query) = requested {
+        let query = query.trim();
+        // Exact internal id still works, but agents normally use the friendly
+        // name from `list_targets` instead.
+        let found = ids
+            .iter()
+            .find(|id| id.as_str() == query)
+            .or_else(|| {
+                ids.iter().find(|id| {
+                    bridge.display_name(id).eq_ignore_ascii_case(query)
+                        || bridge.label(id).eq_ignore_ascii_case(query)
+                })
+            })
+            .or_else(|| {
+                let needle = query.to_lowercase();
+                ids.iter().find(|id| {
+                    bridge.display_name(id).to_lowercase().contains(&needle)
+                        || bridge.label(id).to_lowercase().contains(&needle)
+                })
+            });
+        return match found {
+            Some(id) => {
+                if let Ok(mut target) = bridge.target.lock() {
+                    *target = Some(id.clone());
+                }
+                Ok(id.clone())
             }
-            Ok(id.to_string())
-        } else {
-            Err(format!("SSH session `{id}` is not open"))
+            None => {
+                let available = ids
+                    .iter()
+                    .map(|id| bridge.display_name(id))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(format!(
+                    "VPS `{query}` is not open. Open VPS tabs: {available}"
+                ))
+            }
         };
     }
     if let Ok(target) = bridge.target.lock() {
@@ -1038,7 +1135,9 @@ fn execute(
 
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
-        if let Some(pos) = find_bytes(&output_since(app, &session, since), marker.as_bytes()) {
+        // The terminal echoes the command we typed, including the marker text.
+        // Use the LAST occurrence so we read the real `printf` result, not the echo.
+        if let Some(pos) = rfind_bytes(&output_since(app, &session, since), marker.as_bytes()) {
             let raw = &output_since(app, &session, since)[..pos];
             let tail = &output_since(app, &session, since)[pos..];
             let code = tail
@@ -1065,7 +1164,11 @@ fn execute(
                 ),
                 false,
             );
-            return Ok(format!("{body}\n[exit status: {code}]"));
+            return Ok(format!(
+                "VPS: {} ({})\n{body}\n[exit status: {code}]",
+                bridge.display_name(&session),
+                bridge.label(&session)
+            ));
         }
         if Instant::now() >= deadline {
             let partial = strip_ansi(&output_since(app, &session, since));
@@ -1075,7 +1178,9 @@ fn execute(
                 false,
             );
             return Ok(format!(
-                "[timed out after {} ms; command may still be running]\n{}",
+                "VPS: {} ({})\n[timed out after {} ms; command may still be running]\n{}",
+                bridge.display_name(&session),
+                bridge.label(&session),
                 timeout_ms,
                 if partial.trim().is_empty() {
                     "(no output captured)".to_string()
@@ -1116,11 +1221,13 @@ fn output_tail(app: &tauri::AppHandle, session: &str, max: usize) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+/// Like `find_bytes`, but returns the last match. A PTY echoes the command we
+/// type, so the first marker hit is the echoed text, not the command's result.
+fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
         return None;
     }
-    haystack.windows(needle.len()).position(|part| part == needle)
+    haystack.windows(needle.len()).rposition(|part| part == needle)
 }
 
 /// Minimal ANSI/osc stripper: enough to give an agent readable plain text
@@ -1174,6 +1281,19 @@ fn strip_ansi(input: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn test_bridge() -> Bridge {
+        Bridge {
+            port: 19001,
+            token: "secret".into(),
+            recent: Arc::new(Mutex::new(Vec::new())),
+            labels: Arc::new(Mutex::new(HashMap::new())),
+            names: Arc::new(Mutex::new(HashMap::new())),
+            target: Arc::new(Mutex::new(None)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            allowlist: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
     #[test]
     fn strips_common_ansi_sequences() {
         let raw = b"\x1b[2J\x1b[1;32mhello\x1b[0m\r\nworld\x1b]0;title\x07\n";
@@ -1181,10 +1301,24 @@ mod tests {
     }
 
     #[test]
-    fn finds_marker_in_stream() {
-        let stream = b"output\n__RUTERM_DONE_abc__:0\n";
-        assert_eq!(find_bytes(stream, b"__RUTERM_DONE_abc__"), Some(7));
-        assert_eq!(find_bytes(stream, b"missing"), None);
+    fn finds_last_marker_in_echoed_stream() {
+        // The PTY echoes the command containing the marker before the real
+        // printf result, so the last match is the one that matters.
+        let stream = b"echo __RUTERM_DONE_abc__\noutput\n__RUTERM_DONE_abc__:0\n";
+        let needle = b"__RUTERM_DONE_abc__";
+        let pos = rfind_bytes(stream, needle).expect("marker");
+        assert_eq!(&stream[pos + needle.len()..pos + needle.len() + 3], b":0\n");
+        assert_eq!(rfind_bytes(stream, b"missing"), None);
+    }
+
+    #[test]
+    fn display_name_prefers_saved_host_name() {
+        let bridge = test_bridge();
+        bridge.note_open("s1", "root@10.0.0.1:22", "VPS Murah");
+        assert_eq!(bridge.display_name("s1"), "VPS Murah");
+        assert_eq!(bridge.label("s1"), "root@10.0.0.1:22");
+        bridge.note_open("s2", "root@10.0.0.2:22", "");
+        assert_eq!(bridge.display_name("s2"), "root@10.0.0.2:22");
     }
 
     #[test]
@@ -1215,15 +1349,7 @@ mod tests {
 
     #[test]
     fn agent_config_contains_loopback_endpoint() {
-        let bridge = Bridge {
-            port: 19001,
-            token: "secret".into(),
-            recent: Arc::new(Mutex::new(Vec::new())),
-            labels: Arc::new(Mutex::new(HashMap::new())),
-            target: Arc::new(Mutex::new(None)),
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            allowlist: Arc::new(Mutex::new(HashSet::new())),
-        };
+        let bridge = test_bridge();
         let value: Value = serde_json::from_str(&agent_config_state(&bridge)).unwrap();
         assert_eq!(value["mcp"]["servers"]["ruterm"]["url"], "http://127.0.0.1:19001/mcp");
     }

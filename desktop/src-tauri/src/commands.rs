@@ -946,7 +946,14 @@ pub async fn ssh_open(
     }
 
     let target = SshTarget::from_host(&host, identity.as_ref());
-    open_shell_session(app, state.inner(), target, session_id, cols, rows).await
+    // Agents see the saved host name, not the internal session id or address.
+    // Fall back to `user@host:port` if the user never named this host.
+    let display_name = if host.label.trim().is_empty() {
+        format!("{}@{}:{}", target.username, target.host, target.port)
+    } else {
+        host.label.trim().to_string()
+    };
+    open_shell_session(app, state.inner(), target, session_id, cols, rows, display_name).await
 }
 
 /// Hands an SSH target to the session machinery: registers the handle and the
@@ -958,6 +965,7 @@ async fn open_shell_session(
     session_id: String,
     cols: u32,
     rows: u32,
+    display_name: String,
 ) -> Result<String, String> {
     let policy = target.host_key_policy.clone();
     let host_key = tofu_host_key(&target.username, &target.host, target.port);
@@ -987,9 +995,10 @@ async fn open_shell_session(
     if let Ok(mut output) = state.output.lock() {
         output.insert(session_id.clone(), StreamEntry::new());
     }
-    // Let the AI bridge know which SSH tab was opened most recently.
+    // Let the AI bridge know which SSH tab was opened most recently, including
+    // the friendly name so agents can talk about "VPS Murah" instead of a UUID.
     if let Some(bridge) = app.try_state::<crate::mcp::Bridge>() {
-        bridge.note_open(&session_id, &target_label);
+        bridge.note_open(&session_id, &target_label, &display_name);
     }
 
     let channel = format!("ssh://{session_id}");
@@ -1077,6 +1086,7 @@ pub async fn ssh_open_adhoc(
         _ => return Err("Unknown auth method".into()),
     };
     let policy = tofu_policy(state.inner(), &username, &address, port);
+    let display_name = format!("{username}@{address}:{port}");
     let target = SshTarget {
         host: address,
         port,
@@ -1089,7 +1099,7 @@ pub async fn ssh_open_adhoc(
         host_key_policy: policy,
         env: Vec::new(),
     };
-    open_shell_session(app, state.inner(), target, session_id, cols, rows).await
+    open_shell_session(app, state.inner(), target, session_id, cols, rows, display_name).await
 }
 
 #[tauri::command]
