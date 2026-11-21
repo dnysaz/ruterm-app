@@ -104,6 +104,8 @@
   let observer: ResizeObserver | null = null;
   let flushSave: (() => void) | null = null;
   let status = $state<SessionStatus>('connecting');
+  /** >0 while the SSH supervisor is reopening a dropped connection. */
+  let reconnectAttempt = $state(0);
   /** Rust-issued capability for this PTY; never persisted outside sessionStorage. */
   // svelte-ignore state_referenced_locally
   const tokenKey = `rterm.session-token.${sessionId}`;
@@ -356,6 +358,22 @@
         case 'closed':
           status = 'closed';
           break;
+        case 'reconnecting':
+          // VPS rebooted / network blip: show the connecting overlay again
+          // without the user having to open a new tab.
+          status = 'connecting';
+          reconnectAttempt = Math.max(1, Number(payload.attempt) || 1);
+          if (reconnectAttempt === 1) {
+            terminal.writeln(
+              `\r\n\x1b[2m[connection lost — reconnecting${payload.reason ? `: ${payload.reason}` : ''}]\x1b[0m`,
+            );
+          }
+          break;
+        case 'reconnected':
+          reconnectAttempt = 0;
+          status = 'connected';
+          terminal.writeln('\r\n\x1b[2m[reconnected]\x1b[0m');
+          break;
       }
     };
 
@@ -432,7 +450,11 @@
           }
           for (const frame of queuedFrames.splice(0)) applyFrame(frame);
           booted = true;
-          status = info.status === 'closed' ? 'closed' : 'connected';
+          status =
+            info.status === 'closed' || info.status === 'connecting'
+              ? info.status
+              : 'connected';
+          reconnectAttempt = status === 'connecting' ? 1 : 0;
           scheduleSave();
           return;
         }
@@ -574,8 +596,8 @@
           <span></span><span></span><span></span>
         </div>
         <div class="connect-text">
-          <strong>{command ? `Launching ${title}` : kind === 'local' ? 'Starting shell' : 'Connecting'}<span class="ellipsis"><i>.</i><i>.</i><i>.</i></span></strong>
-          <span class="connect-addr">{command && cwd ? `${command} · ${cwd}` : address || title}</span>
+          <strong>{reconnectAttempt > 0 ? 'Reconnecting' : command ? `Launching ${title}` : kind === 'local' ? 'Starting shell' : 'Connecting'}<span class="ellipsis"><i>.</i><i>.</i><i>.</i></span></strong>
+          <span class="connect-addr">{reconnectAttempt > 0 ? `${address || title} · attempt ${reconnectAttempt}` : command && cwd ? `${command} · ${cwd}` : address || title}</span>
         </div>
       </div>
       <div class="track"><span class="bar"></span></div>

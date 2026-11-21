@@ -4,7 +4,7 @@ use rterm_core::crypto::{KdfParams, SecretKey};
 use rterm_core::model::{Identity, Vault};
 use rterm_core::oauth::GoogleAccount;
 use rterm_core::sftp::SftpConnection;
-use rterm_core::ssh::SshHandle;
+use rterm_core::ssh::{SshHandle, SshTarget};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -57,6 +57,23 @@ impl StreamEntry {
     }
 }
 
+/// A live SSH tab's recipe for reconnecting after an unexpected drop (e.g. a
+/// VPS reboot). Kept in memory only; the vault stays the source of truth for
+/// saved hosts, while quick-connect tabs reuse the cached one-shot target.
+pub struct ReconnectEntry {
+    pub target: SshTarget,
+    /// `Some` for saved hosts so credentials can be refreshed from the vault.
+    pub host_id: Option<String>,
+    pub cols: u32,
+    pub rows: u32,
+    pub display_name: String,
+    /// False once the user closes the tab; the supervisor checks this before
+    /// every retry so a close always wins over an in-flight reconnect.
+    pub enabled: bool,
+    /// True while a reconnect attempt is in progress (drives the UI overlay).
+    pub in_progress: bool,
+}
+
 pub struct AppState {
     pub paths: Paths,
     pub settings: AppSettings,
@@ -74,6 +91,9 @@ pub struct AppState {
     pub sftp: tokio::sync::Mutex<HashMap<String, SftpConnection>>,
     /// Output buffers for every session, keyed by session id (tab id).
     pub output: Mutex<HashMap<String, StreamEntry>>,
+    /// Everything needed to reopen an SSH tab after the connection drops.
+    /// Removed on a deliberate tab close so closing never reconnects.
+    pub reconnect: Mutex<HashMap<String, ReconnectEntry>>,
     /// Opaque, Rust-issued capability per terminal session. Every write,
     /// resize, close and replay must present the token returned by `*_open`.
     pub session_tokens: Mutex<HashMap<String, String>>,
@@ -103,6 +123,7 @@ impl AppState {
             local: Mutex::new(HashMap::new()),
             sftp: tokio::sync::Mutex::new(HashMap::new()),
             output: Mutex::new(HashMap::new()),
+            reconnect: Mutex::new(HashMap::new()),
             session_tokens: Mutex::new(HashMap::new()),
             sftp_tokens: Mutex::new(HashMap::new()),
             local_file_tokens: Mutex::new(HashMap::new()),

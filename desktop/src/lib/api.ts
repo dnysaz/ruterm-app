@@ -181,7 +181,8 @@ export interface VaultPayload {
 /** Returned by `session_attach` when a session is still alive (or recently finished). */
 export interface SessionAttach {
   found: boolean;
-  status: 'connected' | 'closed';
+  /** `connecting` while an auto-reconnect is in progress. */
+  status: 'connected' | 'connecting' | 'closed';
   data_b64: string;
   /** Number of replay bytes, used to drop overlap with the live stream. */
   bytes: number;

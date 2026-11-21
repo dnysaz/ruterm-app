@@ -25,6 +25,15 @@ use uuid::Uuid;
 
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// `timeout_ms: 0` means "no limit"; positive values are capped at one hour.
+fn normalize_timeout(timeout_ms: u64) -> Option<Duration> {
+    if timeout_ms == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(timeout_ms.clamp(1_000, 3_600_000)))
+    }
+}
+
 /// User's answer to a risky-command prompt.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ConfirmOutcome {
@@ -43,6 +52,35 @@ pub struct ConfirmRequest {
     pub reason: String,
 }
 
+/// One long-running remote command being streamed to an agent.
+struct StreamJob {
+    session: String,
+    command: String,
+    marker: String,
+    since: u64,
+    consumed: u64,
+    buffer: Vec<u8>,
+    done: bool,
+    exit_status: String,
+    deadline: Option<Instant>,
+    created: Instant,
+}
+
+/// What `read_stream` returns to the agent at one poll.
+struct JobView {
+    job: String,
+    session: String,
+    command: String,
+    vps: String,
+    address: String,
+    chunk: Vec<u8>,
+    offset: u64,
+    next_offset: u64,
+    done: bool,
+    exit_status: String,
+    elapsed: Duration,
+}
+
 /// Shared handle to the running bridge. Stored in Tauri state so the frontend
 /// can fetch the OpenCode config and so SSH creation can update target order.
 #[derive(Clone)]
@@ -56,6 +94,8 @@ pub struct Bridge {
     names: Arc<Mutex<HashMap<String, String>>>,
     target: Arc<Mutex<Option<String>>>,
     pending: Arc<Mutex<HashMap<String, Sender<ConfirmOutcome>>>>,
+    /// Live/streaming command jobs, so output can be read while it is produced.
+    jobs: Arc<Mutex<HashMap<String, StreamJob>>>,
     /// Exact commands the user approved with "Always allow" (this launch only).
     allowlist: Arc<Mutex<HashSet<String>>>,
 }
@@ -77,6 +117,7 @@ impl Bridge {
             names: Arc::new(Mutex::new(HashMap::new())),
             target: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            jobs: Arc::new(Mutex::new(HashMap::new())),
             allowlist: Arc::new(Mutex::new(HashSet::new())),
         };
 
@@ -127,8 +168,8 @@ impl Bridge {
             .unwrap_or_else(|| session_id.to_string())
     }
 
-    /// Saved host name, e.g. "VPS Murah". Falls back to the address for adhoc
-    /// quick-connect tabs that have no saved name.
+    /// Saved host name, e.g. "production-api". Falls back to the address for
+    /// adhoc quick-connect tabs that have no saved name.
     fn display_name(&self, session_id: &str) -> String {
         self.names
             .lock()
@@ -629,9 +670,64 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "command": { "type": "string", "description": "Shell command to run on the remote VPS." },
                     "session": { "type": "string", "description": "Internal session id, VPS name, or address shown by list_targets. Omit to use the active VPS tab." },
-                    "timeout_ms": { "type": "integer", "description": "Wait limit in milliseconds (default 180000)." }
+                    "timeout_ms": { "type": "integer", "description": "Wait limit in ms: 0 = no limit, default 180000, max 3600000. Prefer start_execute + read_stream for long commands." }
                 },
                 "required": ["command"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "start_execute",
+            "description": "Type a command into the VPS and return a job id immediately. Output is available as it is produced via read_stream — use this for apt-get, builds, and other long commands instead of blocking in execute.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "Shell command to run on the remote VPS." },
+                    "session": { "type": "string", "description": "Internal session id, VPS name, or address shown by list_targets. Omit to use the active VPS tab." },
+                    "timeout_ms": { "type": "integer", "description": "Job deadline in ms: 0 = no limit (default), max 3600000." }
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "read_stream",
+            "description": "Read newly produced output from a start_execute job. Long-polls until data arrives or wait_ms elapses, so agents can follow progress in real time.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Job id returned by start_execute." },
+                    "offset": { "type": "integer", "description": "Byte offset returned by the previous read_stream call (default 0)." },
+                    "wait_ms": { "type": "integer", "description": "Long-poll wait: 0 = return immediately, default 1000, max 60000." },
+                    "session": { "type": "string", "description": "Internal session id, VPS name, or address shown by list_targets. Omit to use the active VPS." }
+                },
+                "required": ["job"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "cancel_stream",
+            "description": "Cancel a running start_execute job by sending Ctrl-C to that VPS and marking the job finished.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Job id returned by start_execute." }
+                },
+                "required": ["job"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "execute_batch",
+            "description": "Run several short VPS commands one after another in the same tab and return all results at once. Each command still goes through the risky-command check; use start_execute for long-running commands.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "commands": { "type": "array", "items": { "type": "string" }, "description": "Commands to run in order." },
+                    "session": { "type": "string", "description": "Internal session id, VPS name, or address shown by list_targets. Omit to use the active VPS." },
+                    "timeout_ms": { "type": "integer", "description": "Wait limit per command: 0 = no limit, default 180000." }
+                },
+                "required": ["commands"],
                 "additionalProperties": false
             }
         },
@@ -641,7 +737,8 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "keys": { "type": "string" },
+                    "keys": { "type": "string", "description": "Raw keystrokes. Use \\n to launch a TUI and arrow/escape sequences to navigate it." },
+                    "include_screen": { "type": "boolean", "description": "Also return the latest screen after sending — handy for vim/btop/mc." },
                     "session": { "type": "string", "description": "Internal session id, VPS name, or address shown by list_targets. Omit to use the active VPS." }
                 },
                 "required": ["keys"],
@@ -707,8 +804,14 @@ fn target_instructions(app: &tauri::AppHandle, bridge: &Bridge) -> String {
              Active VPS: {} ({}). \
              Session ids are internal and hidden; omit `session` to use the active VPS, or pass the \
              VPS name/address returned by ruterm_list_targets to choose a specific one. \
-             Use ruterm_execute for ALL server/VPS work (SSL, setup, config); commands appear visibly \
-             in that terminal and run on the VPS, not on this Mac. Destructive commands require the \
+             Use ruterm_execute for short server/VPS work (SSL, setup, config); commands appear visibly \
+             in that terminal and run on the VPS, not on this Mac. For long commands (apt-get, builds, \
+             kernel changes) use ruterm_start_execute + ruterm_read_stream: output arrives in chunks as \
+             it is produced, and timeout_ms: 0 means no limit. Use ruterm_execute_batch for several \
+             short commands in a row. Use ruterm_send_keys (with include_screen: true) + \
+             ruterm_read_screen for interactive TUIs such as vim, btop or mc; the tab reconnects \
+             automatically with a Connecting overlay if the VPS reboots, so just retry your tool call \
+             after a moment. Destructive commands require the \
              user to choose Deny / Allow / Always allow in a RuTerm dialog; wait for the tool result. \
              Call ruterm_read_session when you start or switch VPS, and ruterm_note_session whenever \
              you learn an important fact or decision so future sessions remember it. \
@@ -916,12 +1019,83 @@ fn call_tool(app: &tauri::AppHandle, bridge: &Bridge, name: &str, args: &Value) 
                 .get("command")
                 .and_then(Value::as_str)
                 .ok_or((-32602, "command is required".into()))?;
-            let timeout_ms = args
-                .get("timeout_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or(180_000)
-                .clamp(1_000, 3_600_000);
+            let timeout_ms = args.get("timeout_ms").and_then(Value::as_u64).unwrap_or(180_000);
             execute(app, bridge, command, args.get("session").and_then(Value::as_str), timeout_ms)?
+        }
+        "start_execute" => {
+            let command = args
+                .get("command")
+                .and_then(Value::as_str)
+                .ok_or((-32602, "command is required".into()))?;
+            let timeout_ms = args.get("timeout_ms").and_then(Value::as_u64).unwrap_or(0);
+            let job = start_job(
+                app,
+                bridge,
+                command,
+                args.get("session").and_then(Value::as_str),
+                timeout_ms,
+            )?;
+            let session = resolve_target(app, bridge, args.get("session").and_then(Value::as_str))
+                .unwrap_or_default();
+            format!(
+                "VPS: {} ({})\njob: {job}\nstarted. Call ruterm_read_stream with this job id to follow output.",
+                bridge.display_name(&session),
+                bridge.label(&session)
+            )
+        }
+        "read_stream" => {
+            let job = args
+                .get("job")
+                .and_then(Value::as_str)
+                .ok_or((-32602, "job is required".into()))?;
+            let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
+            let wait_ms = args.get("wait_ms").and_then(Value::as_u64).unwrap_or(1_000);
+            let view = poll_job(app, bridge, job, offset, wait_ms)?;
+            let chunk = strip_ansi(&view.chunk);
+            let status = if view.done {
+                format!("exit {}", if view.exit_status.is_empty() { "unknown" } else { &view.exit_status })
+            } else {
+                "running".to_string()
+            };
+            format!(
+                "VPS: {} ({})\njob: {}\noffset: {}\nnext_offset: {}\ndone: {}\nstatus: {}\nelapsed_s: {}\n--- chunk ---\n{}",
+                view.vps,
+                view.address,
+                view.job,
+                view.offset,
+                view.next_offset,
+                view.done,
+                status,
+                view.elapsed.as_secs(),
+                if chunk.trim().is_empty() { "(no new output)".to_string() } else { chunk }
+            )
+        }
+        "cancel_stream" => {
+            let job = args
+                .get("job")
+                .and_then(Value::as_str)
+                .ok_or((-32602, "job is required".into()))?;
+            cancel_job(app, bridge, job)?
+        }
+        "execute_batch" => {
+            let commands = args
+                .get("commands")
+                .and_then(Value::as_array)
+                .ok_or((-32602, "commands must be an array".into()))?;
+            if commands.is_empty() {
+                return Err((-32602, "commands must not be empty".into()));
+            }
+            let timeout_ms = args.get("timeout_ms").and_then(Value::as_u64).unwrap_or(180_000);
+            let requested = args.get("session").and_then(Value::as_str);
+            let mut parts = Vec::new();
+            for (index, value) in commands.iter().enumerate() {
+                let command = value
+                    .as_str()
+                    .ok_or((-32602, format!("commands[{index}] must be a string")))?;
+                let result = execute(app, bridge, command, requested, timeout_ms)?;
+                parts.push(format!("--- {}/{} ---\n{}", index + 1, commands.len(), result));
+            }
+            parts.join("\n")
         }
         "send_keys" => {
             let keys = args
@@ -937,11 +1111,23 @@ fn call_tool(app: &tauri::AppHandle, bridge: &Bridge, name: &str, args: &Value) 
                 &format!("sent keys `{}`", one_line(keys, 400)),
                 false,
             );
-            format!(
+            let mut message = format!(
                 "Keys sent to {} ({}).",
                 bridge.display_name(&session),
                 bridge.label(&session)
-            )
+            );
+            if args
+                .get("include_screen")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                // Give a TUI a moment to repaint before sampling the screen.
+                std::thread::sleep(Duration::from_millis(300));
+                let screen = output_tail(app, &session, 20_000);
+                message.push_str("\n--- screen ---\n");
+                message.push_str(&strip_ansi(&screen));
+            }
+            message
         }
         "read_screen" => {
             let session = resolve_target(app, bridge, args.get("session").and_then(Value::as_str))
@@ -1108,7 +1294,9 @@ fn write_target(
     Ok(())
 }
 
-fn execute(
+/// Start a remote command and return a job id immediately. The command is
+/// typed into the user's SSH tab, but the caller does not block waiting for it.
+fn start_job(
     app: &tauri::AppHandle,
     bridge: &Bridge,
     command: &str,
@@ -1125,6 +1313,8 @@ fn execute(
         .and_then(|map| map.get(&session).map(|entry| entry.total))
         .unwrap_or(0);
 
+    // The PTY echoes what we type. A unique marker plus "last occurrence" wins
+    // over the echoed command text when we later parse the real exit status.
     let marker = format!("__RUTERM_DONE_{}__", &Uuid::new_v4().simple().to_string()[..10]);
     let script = format!(
         "{}\nprintf '\\n{}:%s\\n' \"$?\"\n",
@@ -1133,63 +1323,214 @@ fn execute(
     );
     write_target(app, bridge, Some(&session), &script).map_err(|e| (-32000, e))?;
 
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let id = Uuid::new_v4().simple().to_string()[..10].to_string();
+    let now = Instant::now();
+    let deadline = normalize_timeout(timeout_ms).map(|d| now + d);
+    if let Ok(mut jobs) = bridge.jobs.lock() {
+        // Finished jobs stay readable for an hour; no unbounded growth.
+        jobs.retain(|_, job| job.created.elapsed() < Duration::from_secs(3_600));
+        jobs.insert(
+            id.clone(),
+            StreamJob {
+                session,
+                command: command.to_string(),
+                marker,
+                since,
+                consumed: 0,
+                buffer: Vec::new(),
+                done: false,
+                exit_status: String::new(),
+                deadline,
+                created: now,
+            },
+        );
+    }
+    Ok(id)
+}
+
+fn job_view(job: &StreamJob, job_id: &str, bridge: &Bridge, offset: u64) -> JobView {
+    let start = offset.min(job.buffer.len() as u64) as usize;
+    JobView {
+        job: job_id.to_string(),
+        session: job.session.clone(),
+        command: job.command.clone(),
+        vps: bridge.display_name(&job.session),
+        address: bridge.label(&job.session),
+        chunk: job.buffer[start..].to_vec(),
+        offset,
+        next_offset: job.buffer.len() as u64,
+        done: job.done,
+        exit_status: job.exit_status.clone(),
+        elapsed: job.created.elapsed(),
+    }
+}
+
+/// Poll one streaming job. With `wait_ms > 0` this long-polls, returning as
+/// soon as new bytes arrive (or the job finishes), so agents can follow apt or
+/// build progress chunk by chunk instead of waiting for the final result.
+fn poll_job(
+    app: &tauri::AppHandle,
+    bridge: &Bridge,
+    job_id: &str,
+    offset: u64,
+    wait_ms: u64,
+) -> Result<JobView, (i64, String)> {
+    let wait_until = Instant::now() + Duration::from_millis(wait_ms.min(60_000));
     loop {
-        // The terminal echoes the command we typed, including the marker text.
-        // Use the LAST occurrence so we read the real `printf` result, not the echo.
-        if let Some(pos) = rfind_bytes(&output_since(app, &session, since), marker.as_bytes()) {
-            let raw = &output_since(app, &session, since)[..pos];
-            let tail = &output_since(app, &session, since)[pos..];
-            let code = tail
-                .get(marker.len()..)
-                .and_then(|rest| {
-                    let text = String::from_utf8_lossy(rest);
-                    let line = text.lines().next().unwrap_or("");
-                    line.strip_prefix(':').map(str::trim).map(str::to_string)
-                })
-                .unwrap_or_default();
-            let text = strip_ansi(raw);
+        let (view, just_completed) = {
+            let mut jobs = bridge
+                .jobs
+                .lock()
+                .map_err(|_| (-32000, "stream job lock failed".into()))?;
+            let job = jobs
+                .get_mut(job_id)
+                .ok_or_else(|| (-32000, format!("stream job `{job_id}` is not available")))?;
+
+            if job.done {
+                (job_view(job, job_id, bridge, offset), false)
+            } else {
+                let session = job.session.clone();
+                let marker = job.marker.clone();
+                let bytes = output_since(app, &session, job.since);
+                if bytes.len() as u64 > job.consumed {
+                    let fresh = &bytes[job.consumed as usize..];
+                    // Use the LAST marker: the first one is in the echoed command.
+                    if let Some(pos) = rfind_bytes(fresh, marker.as_bytes()) {
+                        job.buffer.extend_from_slice(&fresh[..pos]);
+                        let tail = &fresh[pos..];
+                        job.exit_status = tail
+                            .get(marker.len()..)
+                            .and_then(|rest| {
+                                let text = String::from_utf8_lossy(rest);
+                                let line = text.lines().next().unwrap_or("");
+                                line.strip_prefix(':').map(str::trim).map(str::to_string)
+                            })
+                            .unwrap_or_default();
+                        job.done = true;
+                    } else {
+                        job.buffer.extend_from_slice(fresh);
+                    }
+                    job.consumed = bytes.len() as u64;
+                }
+                if !job.done {
+                    if let Some(deadline) = job.deadline {
+                        if Instant::now() >= deadline {
+                            job.done = true;
+                            job.exit_status = "timeout".into();
+                        }
+                    }
+                }
+                let completed = job.done;
+                (job_view(job, job_id, bridge, offset), completed)
+            }
+        };
+
+        if just_completed {
+            // One extra poll at offset 0 gives the full body for the work log.
+            let full = poll_job(app, bridge, job_id, 0, 0)?;
+            let body = strip_ansi(&full.chunk);
+            let status = if full.exit_status.is_empty() {
+                "unknown".to_string()
+            } else {
+                full.exit_status.clone()
+            };
+            bridge.remember(
+                &full.session,
+                &format!(
+                    "`{}` → exit {} — {}",
+                    one_line(&full.command, 400),
+                    status,
+                    one_line(&body, 1200)
+                ),
+                false,
+            );
+            return Ok(view);
+        }
+        if view.next_offset > offset || view.done || Instant::now() >= wait_until {
+            return Ok(view);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Stop a streaming job by sending Ctrl-C to the same VPS tab.
+fn cancel_job(
+    app: &tauri::AppHandle,
+    bridge: &Bridge,
+    job_id: &str,
+) -> Result<String, (i64, String)> {
+    let (session, command) = {
+        let jobs = bridge
+            .jobs
+            .lock()
+            .map_err(|_| (-32000, "stream job lock failed".into()))?;
+        let job = jobs
+            .get(job_id)
+            .ok_or_else(|| (-32000, format!("stream job `{job_id}` is not available")))?;
+        (job.session.clone(), job.command.clone())
+    };
+    write_target(app, bridge, Some(&session), "\u{3}").map_err(|e| (-32000, e))?;
+    let view = {
+        let mut jobs = bridge
+            .jobs
+            .lock()
+            .map_err(|_| (-32000, "stream job lock failed".into()))?;
+        let job = jobs
+            .get_mut(job_id)
+            .ok_or_else(|| (-32000, format!("stream job `{job_id}` is not available")))?;
+        if !job.done {
+            job.done = true;
+            job.exit_status = "cancelled".into();
+            job.buffer.extend_from_slice(b"\n[cancelled by user]\n");
+        }
+        job_view(job, job_id, bridge, 0)
+    };
+    bridge.remember(
+        &session,
+        &format!("`{}` → cancelled by user", one_line(&command, 400)),
+        false,
+    );
+    Ok(format!(
+        "VPS: {} ({})\njob: {job_id}\ncancelled. Final output is available via ruterm_read_stream.",
+        view.vps, view.address
+    ))
+}
+
+/// Blocking wrapper for short commands; long commands should use
+/// `start_execute` + `read_stream` instead.
+fn execute(
+    app: &tauri::AppHandle,
+    bridge: &Bridge,
+    command: &str,
+    requested: Option<&str>,
+    timeout_ms: u64,
+) -> Result<String, (i64, String)> {
+    let job_id = start_job(app, bridge, command, requested, timeout_ms)?;
+    let mut offset = 0;
+    loop {
+        let view = poll_job(app, bridge, &job_id, offset, 1_000)?;
+        offset = view.next_offset;
+        if view.done {
+            let full = poll_job(app, bridge, &job_id, 0, 0)?;
+            let text = strip_ansi(&full.chunk);
             let body = if text.trim().is_empty() {
                 "(command produced no output)".to_string()
             } else {
                 text
             };
-            bridge.remember(
-                &session,
-                &format!(
-                    "`{}` → exit {} — {}",
-                    one_line(command, 400),
-                    code,
-                    one_line(&body, 1200)
-                ),
-                false,
-            );
-            return Ok(format!(
-                "VPS: {} ({})\n{body}\n[exit status: {code}]",
-                bridge.display_name(&session),
-                bridge.label(&session)
-            ));
+            let header = format!("VPS: {} ({})", full.vps, full.address);
+            if full.exit_status == "timeout" {
+                return Ok(format!(
+                    "{header}\n[timed out after {timeout_ms} ms; command may still be running]\n{body}"
+                ));
+            }
+            let status = if full.exit_status.is_empty() {
+                "unknown".to_string()
+            } else {
+                full.exit_status.clone()
+            };
+            return Ok(format!("{header}\n{body}\n[exit status: {status}]"));
         }
-        if Instant::now() >= deadline {
-            let partial = strip_ansi(&output_since(app, &session, since));
-            bridge.remember(
-                &session,
-                &format!("`{}` → timed out after {} ms", one_line(command, 400), timeout_ms),
-                false,
-            );
-            return Ok(format!(
-                "VPS: {} ({})\n[timed out after {} ms; command may still be running]\n{}",
-                bridge.display_name(&session),
-                bridge.label(&session),
-                timeout_ms,
-                if partial.trim().is_empty() {
-                    "(no output captured)".to_string()
-                } else {
-                    partial
-                }
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -1290,6 +1631,7 @@ mod tests {
             names: Arc::new(Mutex::new(HashMap::new())),
             target: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            jobs: Arc::new(Mutex::new(HashMap::new())),
             allowlist: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -1312,10 +1654,17 @@ mod tests {
     }
 
     #[test]
+    fn timeout_zero_means_no_limit() {
+        assert_eq!(normalize_timeout(0), None);
+        assert_eq!(normalize_timeout(500), Some(Duration::from_millis(1_000)));
+        assert_eq!(normalize_timeout(5_000_000), Some(Duration::from_secs(3_600)));
+    }
+
+    #[test]
     fn display_name_prefers_saved_host_name() {
         let bridge = test_bridge();
-        bridge.note_open("s1", "root@10.0.0.1:22", "VPS Murah");
-        assert_eq!(bridge.display_name("s1"), "VPS Murah");
+        bridge.note_open("s1", "root@10.0.0.1:22", "production-api");
+        assert_eq!(bridge.display_name("s1"), "production-api");
         assert_eq!(bridge.label("s1"), "root@10.0.0.1:22");
         bridge.note_open("s2", "root@10.0.0.2:22", "");
         assert_eq!(bridge.display_name("s2"), "root@10.0.0.2:22");

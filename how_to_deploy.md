@@ -178,6 +178,10 @@ Konfigurasi MCP ditulis RuTerm ke folder privat (tidak menyentuh config asli age
 
 Memory per-VPS: `~/.ruterm/sessions/<user>-<host>-<port>.md`, diakses lewat `ruterm_read_session` / `ruterm_note_session`.
 
+Untuk perintah lama: `ruterm_start_execute` → `ruterm_read_stream` (chunk real-time) → `ruterm_cancel_stream` jika perlu. `timeout_ms: 0` = tanpa batas; untuk TUI interaktif pakai `ruterm_send_keys` dengan `include_screen: true` + `ruterm_read_screen`. `ruterm_execute_batch` menjalankan beberapa perintah pendek berurutan.
+
+SSH yang putus (misalnya VPS reboot) di-reconnect otomatis pada tab yang sama: muncul overlay "Connecting…" dengan nomor percobaan, lalu kembali live tanpa buka tab baru. Menutup tab secara manual atau mengetik `exit` tidak memicu reconnect. Host-key pin tetap diverifikasi di setiap percobaan.
+
 Verifikasi cepat setelah klik agen di sidebar:
 
 ```bash

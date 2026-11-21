@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::secrets;
 use crate::state::{
-    keyring_delete, keyring_get, keyring_set, AppState, Session, StreamEntry,
+    keyring_delete, keyring_get, keyring_set, AppState, ReconnectEntry, Session, StreamEntry,
     KEY_OAUTH, KEY_SYNC, KEY_VAULT,
 };
 use crate::store::{self, AppSettings, VaultFile};
@@ -953,11 +953,114 @@ pub async fn ssh_open(
     } else {
         host.label.trim().to_string()
     };
-    open_shell_session(app, state.inner(), target, session_id, cols, rows, display_name).await
+    open_shell_session(
+        app,
+        state.inner(),
+        target,
+        session_id,
+        cols,
+        rows,
+        display_name,
+        Some(host_id),
+    )
+    .await
+}
+
+/// Control frame pushed on `ssh://<session_id>` while a dropped connection is
+/// reopened. `event` matches the `SshEvent` tag so the frontend reuses its one
+/// listener and can flip the tab back to the "Connecting…" overlay.
+#[derive(Serialize)]
+struct ReconnectEvent {
+    event: &'static str,
+    attempt: u32,
+    delay_ms: u64,
+    reason: String,
+}
+
+/// Backoff for auto-reconnect. A VPS reboot is usually tens of seconds, so we
+/// start at 1s and settle at 10s instead of hammering the host.
+fn reconnect_delay(attempt: u32) -> u64 {
+    match attempt {
+        0 => 1_000,
+        1 => 2_000,
+        2 => 4_000,
+        3 => 8_000,
+        _ => 10_000,
+    }
+}
+
+fn reconnect_enabled(app: &tauri::AppHandle, id: &str) -> bool {
+    app.state::<AppState>()
+        .reconnect
+        .lock()
+        .ok()
+        .and_then(|map| map.get(id).map(|entry| entry.enabled))
+        .unwrap_or(false)
+}
+
+fn mark_reconnect_progress(app: &tauri::AppHandle, id: &str, active: bool) -> bool {
+    match app.state::<AppState>().reconnect.lock() {
+        Ok(mut map) => match map.get_mut(id) {
+            Some(entry) if entry.enabled => {
+                entry.in_progress = active;
+                true
+            }
+            _ => false,
+        },
+        Err(_) => false,
+    }
+}
+
+/// Snapshot the reconnect recipe so no lock is held across an `await`.
+fn reconnect_snapshot(app: &tauri::AppHandle, id: &str) -> Option<(Option<String>, String, TermSize)> {
+    app.state::<AppState>().reconnect.lock().ok().and_then(|map| {
+        map.get(id).map(|entry| {
+            (
+                entry.host_id.clone(),
+                entry.display_name.clone(),
+                TermSize {
+                    cols: entry.cols,
+                    rows: entry.rows,
+                },
+            )
+        })
+    })
+}
+
+/// Rebuild a saved-host target from the vault so a reconnect picks up changed
+/// credentials or a new address. Quick-connect tabs reuse the cached target.
+async fn reconnect_target(state: &AppState, host_id: Option<&str>, cached: &SshTarget) -> SshTarget {
+    let Some(host_id) = host_id else {
+        return cached.clone();
+    };
+    let Ok(id) = host_id.parse::<Uuid>() else {
+        return cached.clone();
+    };
+    let Some(vault) = state.vault.read().await.clone() else {
+        return cached.clone();
+    };
+    let Some(host) = vault.host(&id) else {
+        return cached.clone();
+    };
+    let identity = match &host.auth {
+        AuthMethod::Key { identity_id, .. } => vault.identity(identity_id).cloned(),
+        _ => None,
+    };
+    if matches!(host.auth, AuthMethod::Key { .. }) && identity.is_none() {
+        return cached.clone();
+    }
+    let mut target = SshTarget::from_host(host, identity.as_ref());
+    // Prefer the persisted TOFU pin over the vault copy so reconnects never
+    // silently re-trust a different host key.
+    target.host_key_policy = tofu_policy(state, &target.username, &target.host, target.port);
+    target
 }
 
 /// Hands an SSH target to the session machinery: registers the handle and the
-/// output ring buffer, then streams `ssh://<session_id>` in a background task.
+/// output ring buffer, then supervises `ssh://<session_id>` in a background
+/// task. If the transport drops unexpectedly (a reboot, network blip), the
+/// supervisor reopens the same tab with backoff and tells the UI to show
+/// "Connecting…" again — no manual "open new tab" needed.
 async fn open_shell_session(
     app: tauri::AppHandle,
     state: &AppState,
@@ -966,19 +1069,18 @@ async fn open_shell_session(
     cols: u32,
     rows: u32,
     display_name: String,
+    host_id: Option<String>,
 ) -> Result<String, String> {
     let policy = target.host_key_policy.clone();
     let host_key = tofu_host_key(&target.username, &target.host, target.port);
     let target_label = format!("{}@{}:{}", target.username, target.host, target.port);
-    let session = ssh::open_shell(
-        target,
-        TermSize {
-            cols: cols.clamp(20, 500),
-            rows: rows.clamp(5, 300),
-        },
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let size = TermSize {
+        cols: cols.clamp(20, 500),
+        rows: rows.clamp(5, 300),
+    };
+    let session = ssh::open_shell(target.clone(), size.clone())
+        .await
+        .map_err(|e| e.to_string())?;
     // F-46: persist the pin observed on first contact so future sessions are
     // strictly pinned instead of silently re-trusting a new key.
     persist_tofu(state, &host_key, &policy, &session.fingerprint)?;
@@ -995,8 +1097,22 @@ async fn open_shell_session(
     if let Ok(mut output) = state.output.lock() {
         output.insert(session_id.clone(), StreamEntry::new());
     }
+    if let Ok(mut map) = state.reconnect.lock() {
+        map.insert(
+            session_id.clone(),
+            ReconnectEntry {
+                target: target.clone(),
+                host_id: host_id.clone(),
+                cols,
+                rows,
+                display_name: display_name.clone(),
+                enabled: true,
+                in_progress: false,
+            },
+        );
+    }
     // Let the AI bridge know which SSH tab was opened most recently, including
-    // the friendly name so agents can talk about "VPS Murah" instead of a UUID.
+    // the friendly name so agents can talk about a named VPS instead of a UUID.
     if let Some(bridge) = app.try_state::<crate::mcp::Bridge>() {
         bridge.note_open(&session_id, &target_label, &display_name);
     }
@@ -1004,35 +1120,181 @@ async fn open_shell_session(
     let channel = format!("ssh://{session_id}");
     let channel_id = session_id.clone();
     tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
         let mut session = session;
-        while let Some(event) = session.next_event().await {
-            let terminal = matches!(
-                event,
-                SshEvent::Closed { .. } | SshEvent::ExitStatus { .. } | SshEvent::Error { .. }
-            );
-            match &event {
-                SshEvent::Data { data_b64 } | SshEvent::Stderr { data_b64 } => {
-                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data_b64) {
-                        if let Ok(mut output) = app.state::<AppState>().output.lock() {
-                            if let Some(entry) = output.get_mut(&channel_id) {
-                                entry.push(&bytes);
+        let mut target = target;
+        let mut attempts = 0u32;
+
+        'supervise: loop {
+            let mut reason = String::new();
+            let mut unexpected = false;
+            while let Some(event) = session.next_event().await {
+                let terminal = matches!(
+                    event,
+                    SshEvent::Closed { .. } | SshEvent::ExitStatus { .. } | SshEvent::Error { .. }
+                );
+                match &event {
+                    SshEvent::Data { data_b64 } | SshEvent::Stderr { data_b64 } => {
+                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data_b64) {
+                            if let Ok(mut output) = state.output.lock() {
+                                if let Some(entry) = output.get_mut(&channel_id) {
+                                    entry.push(&bytes);
+                                }
                             }
                         }
                     }
+                    SshEvent::Closed { reason: r } | SshEvent::Error { message: r } => {
+                        reason = r.clone();
+                    }
+                    _ => {}
                 }
-                _ => {}
+                if terminal {
+                    if let Ok(mut output) = state.output.lock() {
+                        if let Some(entry) = output.get_mut(&channel_id) {
+                            entry.closed = true;
+                        }
+                    }
+                }
+                let _ = app.emit(&channel, &event);
+                if terminal {
+                    // `exit 0` is a deliberate logout. A transport drop, an
+                    // error, or a non-zero exit (sshd killed during a reboot)
+                    // all deserve an automatic reconnect.
+                    unexpected = match event {
+                        SshEvent::ExitStatus { code } => code != 0,
+                        _ => true,
+                    };
+                    break;
+                }
             }
-            if terminal {
-                if let Ok(mut output) = app.state::<AppState>().output.lock() {
-                    if let Some(entry) = output.get_mut(&channel_id) {
-                        entry.closed = true;
+            if reason.is_empty() {
+                reason = "connection lost".into();
+            }
+            if !unexpected || !reconnect_enabled(&app, &channel_id) {
+                mark_reconnect_progress(&app, &channel_id, false);
+                break 'supervise;
+            }
+
+            // Retry until success or until the tab is closed. Each attempt
+            // emits a control frame so the UI shows the animated overlay.
+            'retry: loop {
+                let delay = reconnect_delay(attempts);
+                if !mark_reconnect_progress(&app, &channel_id, true) {
+                    break 'supervise;
+                }
+                let _ = app.emit(
+                    &channel,
+                    &ReconnectEvent {
+                        event: "reconnecting",
+                        attempt: attempts + 1,
+                        delay_ms: delay,
+                        reason: reason.clone(),
+                    },
+                );
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                if !mark_reconnect_progress(&app, &channel_id, true) {
+                    break 'supervise;
+                }
+
+                let Some((stored_host, stored_name, stored_size)) =
+                    reconnect_snapshot(&app, &channel_id)
+                else {
+                    break 'supervise;
+                };
+                let next_target = reconnect_target(state.inner(), stored_host.as_deref(), &target).await;
+                match ssh::open_shell(next_target.clone(), stored_size).await {
+                    Ok(new_session) => {
+                        let key = tofu_host_key(
+                            &next_target.username,
+                            &next_target.host,
+                            next_target.port,
+                        );
+                        let next_policy = next_target.host_key_policy.clone();
+                        if let Err(error) =
+                            persist_tofu(state.inner(), &key, &next_policy, &new_session.fingerprint)
+                        {
+                            attempts += 1;
+                            let _ = app.emit(
+                                &channel,
+                                &ReconnectEvent {
+                                    event: "reconnecting",
+                                    attempt: attempts + 1,
+                                    delay_ms: reconnect_delay(attempts),
+                                    reason: error,
+                                },
+                            );
+                            continue 'retry;
+                        }
+                        let new_handle = new_session.handle();
+                        match state.ssh.lock() {
+                            Ok(mut handles) => {
+                                handles.remove(&channel_id);
+                                handles.insert(channel_id.clone(), new_handle);
+                            }
+                            Err(_) => continue 'retry,
+                        }
+                        if let Ok(mut output) = state.output.lock() {
+                            if let Some(entry) = output.get_mut(&channel_id) {
+                                entry.closed = false;
+                            }
+                        }
+                        // If the user closed the tab while we were connecting,
+                        // drop the fresh session instead of resurrecting it.
+                        let survived = match state.reconnect.lock() {
+                            Ok(mut map) => match map.get_mut(&channel_id) {
+                                Some(entry) if entry.enabled => {
+                                    entry.target = next_target.clone();
+                                    entry.in_progress = false;
+                                    true
+                                }
+                                _ => false,
+                            },
+                            Err(_) => false,
+                        };
+                        if !survived {
+                            new_session.handle().close();
+                            break 'supervise;
+                        }
+                        if let Some(bridge) = app.try_state::<crate::mcp::Bridge>() {
+                            let address = format!(
+                                "{}@{}:{}",
+                                next_target.username, next_target.host, next_target.port
+                            );
+                            bridge.note_open(&channel_id, &address, &stored_name);
+                        }
+                        attempts = 0;
+                        target = next_target;
+                        session = new_session;
+                        let _ = app.emit(
+                            &channel,
+                            &ReconnectEvent {
+                                event: "reconnected",
+                                attempt: 0,
+                                delay_ms: 0,
+                                reason: String::new(),
+                            },
+                        );
+                        break 'retry;
+                    }
+                    Err(error) => {
+                        attempts += 1;
+                        let _ = app.emit(
+                            &channel,
+                            &ReconnectEvent {
+                                event: "reconnecting",
+                                attempt: attempts + 1,
+                                delay_ms: reconnect_delay(attempts),
+                                reason: error.to_string(),
+                            },
+                        );
                     }
                 }
             }
-            let _ = app.emit(&channel, &event);
-            if terminal {
-                break;
-            }
+        }
+
+        // Final cleanup: only reached on a clean exit or a deliberate close.
+        if let Ok(mut map) = state.reconnect.lock() {
+            map.remove(&channel_id);
         }
         let _ = app.emit(
             &channel,
@@ -1042,9 +1304,9 @@ async fn open_shell_session(
         );
         // Drop the dead handle so `ssh_write` fails fast instead of queueing
         // bytes into a closed channel.
-        if let Ok(mut handles) = app.state::<AppState>().ssh.lock() {
+        if let Ok(mut handles) = state.ssh.lock() {
             handles.remove(&channel_id);
-        }
+        };
     });
 
     Ok(issue_session_token(state, &session_id))
@@ -1099,7 +1361,17 @@ pub async fn ssh_open_adhoc(
         host_key_policy: policy,
         env: Vec::new(),
     };
-    open_shell_session(app, state.inner(), target, session_id, cols, rows, display_name).await
+    open_shell_session(
+        app,
+        state.inner(),
+        target,
+        session_id,
+        cols,
+        rows,
+        display_name,
+        None,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1131,6 +1403,14 @@ pub async fn ssh_resize(
     rows: u32,
 ) -> Result<(), String> {
     let session_id = require_session_token(&state, &session_id, &token)?;
+    // Keep the reconnect recipe in sync so a reopened shell matches the pane
+    // the user is actually looking at.
+    if let Ok(mut map) = state.reconnect.lock() {
+        if let Some(entry) = map.get_mut(&session_id) {
+            entry.cols = cols;
+            entry.rows = rows;
+        }
+    }
     let handles = state.ssh.lock().map_err(|_| "state lock".to_string())?;
     if let Some(handle) = handles.get(&session_id) {
         handle.resize(cols, rows);
@@ -1145,6 +1425,14 @@ pub async fn ssh_close(
     token: String,
 ) -> Result<(), String> {
     let session_id = require_session_token(&state, &session_id, &token)?;
+    // A deliberate close must win over an in-flight reconnect. Disable the
+    // supervisor first; it will close any fresh session it just opened.
+    if let Ok(mut map) = state.reconnect.lock() {
+        if let Some(entry) = map.get_mut(&session_id) {
+            entry.enabled = false;
+            entry.in_progress = false;
+        }
+    }
     let mut handles = state.ssh.lock().map_err(|_| "state lock".to_string())?;
     if let Some(handle) = handles.remove(&session_id) {
         handle.close();
@@ -1184,9 +1472,24 @@ pub fn session_attach(
     let Some(entry) = map.get(&session_id) else {
         return Ok(None);
     };
+    // A webview reload mid-reconnect should come back to the overlay, not a
+    // dead terminal with a stale "closed" status.
+    let reconnecting = state
+        .reconnect
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&session_id).map(|e| e.enabled && e.in_progress))
+        .unwrap_or(false);
+    let status = if reconnecting {
+        "connecting"
+    } else if entry.closed {
+        "closed"
+    } else {
+        "connected"
+    };
     Ok(Some(AttachPayload {
         found: true,
-        status: if entry.closed { "closed".into() } else { "connected".into() },
+        status: status.into(),
         data_b64: base64::engine::general_purpose::STANDARD.encode(&entry.buf),
         bytes: entry.buf.len() as u64,
     }))

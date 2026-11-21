@@ -1,7 +1,19 @@
 {
   "version": 1,
-  "generated_at": "2026-11-21T04:54:32.225Z",
+  "generated_at": "2026-11-21T05:35:28.730Z",
   "entries": [
+    {
+      "file": "2026-11-21-streaming-command-output.md",
+      "date": "2026-11-21",
+      "title": "Long commands now stream progress — and can run without a timeout",
+      "summary": "Agents no longer have to wait until apt-get, a build, or a kernel change finishes before they can see what is happening."
+    },
+    {
+      "file": "2026-11-21-auto-reconnect-and-interactive-tools.md",
+      "date": "2026-11-21",
+      "title": "Dropped SSH sessions reconnect by themselves",
+      "summary": "When a VPS reboots or the network blips, RuTerm now reopens the same tab automatically. You do not need to open a new terminal or tell your agent to reconnect: "
+    },
     {
       "file": "2026-11-21-agent-knows-your-vps-name.md",
       "date": "2026-11-21",
