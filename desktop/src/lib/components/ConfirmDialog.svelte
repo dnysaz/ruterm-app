@@ -10,6 +10,11 @@
     children?: Snippet;
     confirmLabel?: string;
     cancelLabel?: string;
+    /** Optional third action, e.g. "Always allow" for AI approvals. */
+    alwaysLabel?: string;
+    onalways?: () => void;
+    /** Destructive dialogs stay red; approval dialogs use the blue primary. */
+    tone?: 'danger' | 'primary';
     onconfirm: () => void;
     oncancel: () => void;
   }
@@ -19,6 +24,9 @@
     children,
     confirmLabel = 'Delete',
     cancelLabel = 'Cancel',
+    alwaysLabel,
+    onalways,
+    tone = 'danger',
     onconfirm,
     oncancel,
   }: Props = $props();
@@ -62,8 +70,13 @@
       <button class="btn ghost" type="button" bind:this={cancelBtn} onclick={oncancel}>
         {cancelLabel}
       </button>
-      <button class="btn danger-solid" type="button" onclick={onconfirm}>
-        <Icon name="trash" size={15} />
+      {#if onalways && alwaysLabel}
+        <button class="btn ghost" type="button" onclick={onalways}>
+          {alwaysLabel}
+        </button>
+      {/if}
+      <button class="btn confirm-action" class:primary={tone === 'primary'} type="button" onclick={onconfirm}>
+        <Icon name={tone === 'primary' ? 'check' : 'trash'} size={15} />
         {confirmLabel}
       </button>
     </div>
@@ -153,16 +166,22 @@
     height: 38px;
   }
 
-  .danger-solid {
+  .confirm-action {
     color: #fff;
     border-color: transparent;
     background: var(--bad);
   }
-  .danger-solid:hover {
+  .confirm-action:hover {
     filter: brightness(1.08);
     background: var(--bad);
   }
-  .danger-solid:active {
+  .confirm-action:active {
     filter: brightness(0.94);
+  }
+  .confirm-action.primary {
+    background: var(--accent, #4b8cff);
+  }
+  .confirm-action.primary:hover {
+    background: var(--accent, #4b8cff);
   }
 </style>

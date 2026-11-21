@@ -23,6 +23,8 @@
     adhoc,
     cwd,
     command,
+    env,
+    agentId,
     onfingerprint,
     onstatus,
   }: {
@@ -39,6 +41,10 @@
     cwd?: string;
     /** Local PTY only: command typed into the shell right after spawn. */
     command?: string;
+    /** Local PTY only: extra environment variables for the shell (AI agents). */
+    env?: Record<string, string>;
+    /** Local PTY only: agent id, used to regenerate MCP config on restore. */
+    agentId?: string;
     onfingerprint?: (fingerprint: string) => void;
     onstatus?: (status: SessionStatus) => void;
   } = $props();
@@ -447,19 +453,60 @@
         for (const raw of queuedBytes.splice(0)) terminal.write(raw);
         booted = true;
 
+        const openLocal = async () => {
+          let vars = env;
+          let startCwd = cwd;
+          let startCommand = command;
+          // Restored tabs do not persist `env` (the bridge token is per-launch),
+          // so regenerate the private MCP launch config for every agent type.
+          if (!vars && agentId) {
+            try {
+              const launch = await api.agentLaunch(agentId);
+              vars = launch.env ?? undefined;
+              startCwd = launch.cwd;
+              startCommand = launch.command;
+            } catch (error) {
+              // Backwards compatibility with tabs saved before other agents
+              // were supported: OpenCode used an env-only virtual config.
+              if (agentId === 'opencode') {
+                try {
+                  vars = { OPENCODE_CONFIG_CONTENT: await api.mcpAgentConfig() };
+                } catch (fallbackError) {
+                  console.warn('RuTerm MCP config unavailable on restore', fallbackError);
+                }
+              } else {
+                console.warn('RuTerm MCP config unavailable on restore', error);
+              }
+            }
+          } else if (!vars && command === 'opencode --standalone') {
+            // Tabs saved before `agentId` existed still need the env injection.
+            try {
+              vars = { OPENCODE_CONFIG_CONTENT: await api.mcpAgentConfig() };
+            } catch (error) {
+              console.warn('RuTerm MCP config unavailable on restore', error);
+            }
+          }
+          const token = await api.localOpen(
+            sessionId,
+            terminal.cols,
+            terminal.rows,
+            startCwd,
+            vars,
+          );
+          rememberToken(token);
+          // AI-agent tabs: type the agent command once the PTY is up.
+          // The kernel buffers the write until the login shell reads
+          // it, so no timing hack is needed.
+          if (startCommand) {
+            const payload = toBase64(new TextEncoder().encode(`${startCommand}\n`));
+            commandSentAt = Date.now();
+            void api.localWrite(sessionId, token, payload).catch(() => {});
+          }
+        };
+
         const openRequest =
           kind === 'local'
-            ? api.localOpen(sessionId, terminal.cols, terminal.rows, cwd).then(token => {
-                rememberToken(token);
-                // AI-agent tabs: type the agent command once the PTY is up.
-                // The kernel buffers the write until the login shell reads
-                // it, so no timing hack is needed.
-                if (command) {
-                  const payload = toBase64(new TextEncoder().encode(`${command}\n`));
-                  commandSentAt = Date.now();
-                  void api.localWrite(sessionId, token, payload).catch(() => {});
-                }
-              })
+            ? openLocal()
             : kind === 'adhoc'
               ? openAdhoc()
               : api.sshOpen(sessionId, hostId, terminal.cols, terminal.rows).then(rememberToken);

@@ -9,7 +9,7 @@ use rterm_core::oauth::{self, GoogleAccount};
 use rterm_core::sftp;
 use rterm_core::ssh::{self, SshEvent, SshTarget, TermSize};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -961,6 +961,7 @@ async fn open_shell_session(
 ) -> Result<String, String> {
     let policy = target.host_key_policy.clone();
     let host_key = tofu_host_key(&target.username, &target.host, target.port);
+    let target_label = format!("{}@{}:{}", target.username, target.host, target.port);
     let session = ssh::open_shell(
         target,
         TermSize {
@@ -985,6 +986,10 @@ async fn open_shell_session(
     drop(ssh_guard);
     if let Ok(mut output) = state.output.lock() {
         output.insert(session_id.clone(), StreamEntry::new());
+    }
+    // Let the AI bridge know which SSH tab was opened most recently.
+    if let Some(bridge) = app.try_state::<crate::mcp::Bridge>() {
+        bridge.note_open(&session_id, &target_label);
     }
 
     let channel = format!("ssh://{session_id}");
@@ -1228,12 +1233,13 @@ pub async fn local_open(
     cols: u32,
     rows: u32,
     cwd: Option<String>,
+    env: Option<HashMap<String, String>>,
 ) -> Result<String, String> {
     // A local shell is at least as privileged as the vault itself: never let
     // an IPC caller spawn one while the vault is locked.
     state.unlocked_key().await?;
     let session_id = checked_session_id(&session_id)?;
-    crate::local::open(app, &state.local, session_id.clone(), cols, rows, expand_cwd(cwd))?;
+    crate::local::open(app, &state.local, session_id.clone(), cols, rows, expand_cwd(cwd), env)?;
     Ok(issue_session_token(&state, &session_id))
 }
 
@@ -1278,6 +1284,7 @@ const AI_AGENTS: &[(&str, &str, &str)] = &[
     ("kilo", "Kilo Code", "kilo"),
     ("claude", "Claude", "claude"),
     ("kiro", "Kiro", "kiro-cli"),
+    ("commandai", "Command AI", "cmd"),
 ];
 
 /// Detects AI-agent CLIs on the user's machine with a *single* interactive

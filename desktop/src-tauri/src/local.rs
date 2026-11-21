@@ -48,6 +48,7 @@ pub fn open(
     cols: u32,
     rows: u32,
     cwd: Option<String>,
+    env: Option<HashMap<String, String>>,
 ) -> Result<(), String> {
     let id = session_id.trim().to_string();
     if id.is_empty() {
@@ -71,6 +72,16 @@ pub fn open(
     cmd.env("COLORTERM", "truecolor");
     cmd.env("TERM_PROGRAM", "RuTerm");
     cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+    // Per-tab environment for AI agents (e.g. OPENCODE_CONFIG_CONTENT). The
+    // variables belong to the login shell, so any command typed into it
+    // inherits them — without touching the user's global config files.
+    if let Some(vars) = env {
+        for (name, value) in vars {
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                cmd.env(name, value);
+            }
+        }
+    }
     if let Some(dir) = cwd.or_else(|| std::env::var("HOME").ok()) {
         cmd.cwd(dir);
     }

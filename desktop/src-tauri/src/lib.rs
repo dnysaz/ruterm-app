@@ -5,6 +5,7 @@
 
 mod commands;
 mod local;
+mod mcp;
 mod secrets;
 mod state;
 mod store;
@@ -170,6 +171,10 @@ pub fn run() {
                 tofu: dir.join("tofu.json"),
             };
             app.manage(state::AppState::new(paths, settings));
+            // Loopback MCP bridge for AI agents launched in local PTY tabs.
+            let bridge = mcp::Bridge::start(app.handle().clone())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            app.manage(bridge);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -206,6 +211,9 @@ pub fn run() {
             commands::local_resize,
             commands::local_close,
             commands::ai_agents_detect,
+            mcp::agent_config,
+            mcp::agent_launch,
+            mcp::mcp_confirm,
             commands::sftp_open_host,
             commands::sftp_open_adhoc,
             commands::sftp_list,

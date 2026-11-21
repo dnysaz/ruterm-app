@@ -1,7 +1,13 @@
 {
   "version": 1,
-  "generated_at": "2026-11-20T07:57:56.416Z",
+  "generated_at": "2026-11-21T04:07:36.698Z",
   "entries": [
+    {
+      "file": "2026-11-21-agent-bridge-for-every-agent.md",
+      "date": "2026-11-21",
+      "title": "Your SSH tab is now a tool every AI agent can use",
+      "summary": "RuTerm now embeds the MCP bridge itself, so a local agent can type commands into your VPS tab — no agent install, no config editing, no extra server."
+    },
     {
       "file": "2026-11-20-vault-recovery-and-workspace.md",
       "date": "2026-11-20",
