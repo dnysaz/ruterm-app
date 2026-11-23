@@ -132,6 +132,13 @@ export interface ChatConfig {
   configured: boolean;
   model: string;
   allow_credentials: boolean;
+  allow_vps: boolean;
+}
+
+/** Friendly VPS name/address currently pinned as the chat's command target. */
+export interface ChatTarget {
+  name: string;
+  address: string;
 }
 
 /** Model offered by OpenRouter for the Settings dropdown. */
@@ -284,9 +291,15 @@ export const api = {
 
   // BYOK AI chat — the key is written/read entirely inside Rust.
   chatConfig: () => invoke<ChatConfig>('chat_config'),
+  chatTarget: () => invoke<ChatTarget | null>('chat_target'),
   chatModels: () => invoke<ChatModel[]>('chat_models'),
-  chatSetKey: (key: string, model: string, allowCredentials: boolean, clear = false) =>
-    invoke<ChatConfig>('chat_set_key', { key, model, allowCredentials, clear }),
+  chatSetKey: (
+    key: string,
+    model: string,
+    allowCredentials: boolean,
+    allowVps: boolean,
+    clear = false,
+  ) => invoke<ChatConfig>('chat_set_key', { key, model, allowCredentials, allowVps, clear }),
   chatTestKey: () => invoke<string>('chat_test_key'),
   chatSend: (session: string, text: string) =>
     invoke<void>('chat_send', { session, text }),
@@ -333,6 +346,8 @@ export const api = {
   /// Answer a risky-command prompt from the embedded MCP bridge.
   mcpConfirm: (id: string, choice: 'deny' | 'allow' | 'always') =>
     invoke<void>('mcp_confirm', { id, choice }),
+  /// Pin the AI Chat target to the SSH tab currently in focus.
+  mcpSetTarget: (session: string) => invoke<void>('mcp_set_target', { session }),
   aiAgentsDetect: () => invoke<AiAgent[]>('ai_agents_detect'),
   localWrite: (sessionId: string, token: string, dataB64: string) =>
     invoke<void>('local_write', { sessionId, token, dataB64 }),

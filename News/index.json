@@ -1,7 +1,13 @@
 {
   "version": 1,
-  "generated_at": "2026-11-21T09:03:01.158Z",
+  "generated_at": "2026-11-23T05:09:25.913Z",
   "entries": [
+    {
+      "file": "2026-11-23-agents-share-vault-tools.md",
+      "date": "2026-11-23",
+      "title": "AI agents now share your vault — and chat got smarter",
+      "summary": "Local agents (OpenCode, Kilo, Freebuff, Claude, Kiro and Command AI) now get the same vault tools as RuTerm's built-in AI chat through the embedded MCP bridge. "
+    },
     {
       "file": "2026-11-21-streaming-command-output.md",
       "date": "2026-11-21",

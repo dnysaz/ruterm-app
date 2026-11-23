@@ -136,7 +136,7 @@
   let query = $state('');
   let filter = $state<'all' | 'favorite' | 'note'>('all');
   let noteToDelete = $state<Note | null>(null);
-  /** Pending risky-command approval requested by OpenCode through the MCP bridge. */
+  /** Pending risky-command approval from an agent or the built-in AI Chat. */
   interface McpConfirmRequest {
     id: string;
     session: string;
@@ -209,6 +209,26 @@
     const inserted = insertIntoPane(stripped, paneId, tabId, index);
     focusedPaneId = paneId as 'a' | 'b';
     applyPanes(inserted);
+    void syncMcpTarget(tabId);
+  }
+
+  /**
+   * Keep the embedded bridge pointed at the SSH tab the user is looking at.
+   * A new tab is not in Rust's session registry yet, so this call may fail;
+   * `setStatus('connected')` retries once the handle is live.
+   */
+  async function syncMcpTarget(tabId: string | null) {
+    if (!tabId) return;
+    const tab = tabs.find(candidate => candidate.id === tabId);
+    if (tab?.kind !== 'ssh' && tab?.kind !== 'adhoc') return;
+    const pane = panes.find(candidate => candidate.id === focusedPaneId);
+    if (pane?.active !== tabId) return;
+    // A chat tab can be focused while the SSH tab stays the command target.
+    try {
+      await api.mcpSetTarget(tabId);
+    } catch {
+      /* session not ready (or already closed) — harmless */
+    }
   }
 
   function paneIdOf(tabId: string): 'a' | 'b' | null {
@@ -840,6 +860,7 @@
   function setPaneActive(paneId: 'a' | 'b', tabId: string | null) {
     panes = panes.map(p => (p.id === paneId ? { ...p, active: tabId } : p));
     focusedPaneId = paneId;
+    void syncMcpTarget(tabId);
   }
 
   function openCount(hostId: string) {
@@ -1389,7 +1410,10 @@
     const tab = tabs.find(t => t.id === id);
     if (!tab || tab.status === status) return;
     tabs = tabs.map(t => (t.id === id ? { ...t, status } : t));
-    if (status === 'connected' && tab.kind === 'ssh') void maybeProbe(tab.hostId);
+    if (status === 'connected' && (tab.kind === 'ssh' || tab.kind === 'adhoc')) {
+      if (tab.kind === 'ssh') void maybeProbe(tab.hostId);
+      void syncMcpTarget(id);
+    }
   }
 
   function startBlank() {
@@ -1442,6 +1466,9 @@
     // the agent tab is focused and the SSH tab is in another pane.
     let unlistenConfirm: UnlistenFn | undefined;
     let unlistenHost: UnlistenFn | undefined;
+    let unlistenOpenHost: UnlistenFn | undefined;
+    let unlistenNote: UnlistenFn | undefined;
+    let unlistenNoteUpdated: UnlistenFn | undefined;
     let unlistenAgent: UnlistenFn | undefined;
     let disposed = false;
     void listen<Omit<McpConfirmRequest, 'target'>>('ruterm://mcp-confirm', event => {
@@ -1464,6 +1491,47 @@
       notify(`Host '${host.label || host.address}' saved and opened`);
     })
       .then(fn => (disposed ? fn() : (unlistenHost = fn)))
+      .catch(() => {});
+
+    // Chat's `vps_open_host` asks us to open an existing saved host in a new
+    // tab — same path as clicking it in the sidebar.
+    void listen<{ id: string }>('rterm:open-host', event => {
+      if (disposed) return;
+      const host = hosts().find(candidate => candidate.id === event.payload.id);
+      if (!host) return;
+      connect(host);
+      notify(`Opening '${host.label || host.address}' in a new tab`);
+    })
+      .then(fn => (disposed ? fn() : (unlistenOpenHost = fn)))
+      .catch(() => {});
+
+    // The AI chat's `create_note` tool writes directly to the encrypted vault.
+    // Adopt the payload, then open the new note in a tab just like the + button.
+    void listen<{ id: string; payload: VaultPayload }>('rterm:note-created', event => {
+      if (disposed) return;
+      applyVaultPayload(event.payload.payload);
+      const note = notes().find(candidate => candidate.id === event.payload.id);
+      if (!note) return;
+      filter = 'note';
+      openNote(note);
+      notify(`Note '${noteTitle(note)}' saved and opened`);
+    })
+      .then(fn => (disposed ? fn() : (unlistenNote = fn)))
+      .catch(() => {});
+
+    // Local AI agents can edit notes through the MCP bridge. Adopt the payload
+    // and focus the note so the change is visible immediately, like chat's
+    // `create_note`.
+    void listen<{ id: string; payload: VaultPayload }>('rterm:note-updated', event => {
+      if (disposed) return;
+      applyVaultPayload(event.payload.payload);
+      const note = notes().find(candidate => candidate.id === event.payload.id);
+      if (!note) return;
+      filter = 'note';
+      openNote(note);
+      notify(`Note '${noteTitle(note)}' updated`);
+    })
+      .then(fn => (disposed ? fn() : (unlistenNoteUpdated = fn)))
       .catch(() => {});
 
     // AI chat's `launch_agent` tool uses the same local-tab path as the dock.
@@ -1508,6 +1576,7 @@
       focusedPaneId = PANE_A;
     }
     tabsReady = true;
+    void syncMcpTarget(panes.find(p => p.id === focusedPaneId)?.active ?? null);
     void initNews();
 
     const onNext = () => cycleTab(1);
@@ -1526,6 +1595,9 @@
       disposed = true;
       unlistenConfirm?.();
       unlistenHost?.();
+      unlistenOpenHost?.();
+      unlistenNote?.();
+      unlistenNoteUpdated?.();
       unlistenAgent?.();
       window.removeEventListener('rterm:next-tab', onNext);
       window.removeEventListener('rterm:prev-tab', onPrev);
@@ -2448,7 +2520,7 @@
       onalways={() => void answerMcp('always')}
     >
       <p>
-        OpenCode wants to <strong>{mcpConfirm.reason}</strong> in <strong>{mcpConfirm.target}</strong>.
+        An AI assistant wants to <strong>{mcpConfirm.reason}</strong> in <strong>{mcpConfirm.target}</strong>.
         The command will be typed into that SSH tab.
       </p>
       <pre class="mcp-command">{mcpConfirm.command}</pre>

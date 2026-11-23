@@ -307,6 +307,10 @@ pub struct VaultSettings {
     /// needs an explicit per-call approval in the UI.
     #[serde(default)]
     pub chat_allow_credentials: bool,
+    /// Let the in-app AI Chat drive the focused SSH tab through the embedded MCP bridge.
+    /// Off by default; risky commands still need the MCP confirmation dialog.
+    #[serde(default)]
+    pub chat_allow_vps: bool,
     #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
 }
@@ -342,6 +346,7 @@ impl Default for VaultSettings {
             openrouter_api_key: String::new(),
             openrouter_model: default_openrouter_model(),
             chat_allow_credentials: false,
+            chat_allow_vps: false,
             updated_at: None,
         }
     }

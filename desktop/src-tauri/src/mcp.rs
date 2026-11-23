@@ -11,9 +11,11 @@
 
 use crate::state::AppState;
 use chrono::Utc;
+use rterm_core::model::{now, Note};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -59,11 +61,16 @@ struct StreamJob {
     marker: String,
     since: u64,
     consumed: u64,
+    /// Last `next_offset` handed out, used when a caller omits `offset`.
+    last_offset: u64,
     buffer: Vec<u8>,
     done: bool,
     exit_status: String,
     deadline: Option<Instant>,
     created: Instant,
+    /// Last time new PTY bytes arrived. A finished command whose marker was
+    /// missed must not keep the shell marked busy forever.
+    last_activity: Instant,
 }
 
 /// What `read_stream` returns to the agent at one poll.
@@ -98,6 +105,11 @@ pub struct Bridge {
     jobs: Arc<Mutex<HashMap<String, StreamJob>>>,
     /// Exact commands the user approved with "Always allow" (this launch only).
     allowlist: Arc<Mutex<HashSet<String>>>,
+    /// Serializes keystrokes so the chat, an agent and the user can never
+    /// interleave half-commands into the same SSH PTY.
+    write_lock: Arc<Mutex<()>>,
+    /// SSH tabs currently showing a TUI. Any new command closes it first.
+    tui: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Bridge {
@@ -119,6 +131,8 @@ impl Bridge {
             pending: Arc::new(Mutex::new(HashMap::new())),
             jobs: Arc::new(Mutex::new(HashMap::new())),
             allowlist: Arc::new(Mutex::new(HashSet::new())),
+            write_lock: Arc::new(Mutex::new(())),
+            tui: Arc::new(Mutex::new(HashSet::new())),
         };
 
         let runner = bridge.clone();
@@ -156,6 +170,33 @@ impl Bridge {
             };
             names.insert(session_id.to_string(), friendly);
         }
+        // The first available SSH tab is a sensible default until the webview
+        // pins the one the user is actually looking at.
+        if let Ok(mut target) = self.target.lock() {
+            if target.is_none() {
+                *target = Some(session_id.to_string());
+            }
+        }
+    }
+
+    /// Pin the SSH tab RuTerm AI Chat should drive. Only live SSH sessions are
+    /// accepted here; a local agent tab can never become a target.
+    pub fn set_target(&self, session_id: &str) {
+        if let Ok(mut target) = self.target.lock() {
+            *target = Some(session_id.to_string());
+        }
+    }
+
+    /// Friendly name/address of the pinned target, safe to show in the UI.
+    /// Internal session ids are never exposed.
+    pub fn target_view(&self) -> Option<(String, String)> {
+        let id = self.target.lock().ok()?.clone()?;
+        Some((self.display_name(&id), self.label(&id)))
+    }
+
+    /// Internal id, only for Rust-side liveness checks — never sent to the UI.
+    pub fn target_id(&self) -> Option<String> {
+        self.target.lock().ok()?.clone()
     }
 
     /// Address (`user@host:port`), kept stable so the session memory filename
@@ -195,7 +236,7 @@ impl Bridge {
 
     /// Append either a work-log entry or an agent note. Work-log entries are
     /// inserted before the Notes section so the file stays readable.
-    fn remember(&self, session_id: &str, entry: &str, note: bool) -> PathBuf {
+    pub(crate) fn remember(&self, session_id: &str, entry: &str, note: bool) -> PathBuf {
         let path = self.session_file(session_id);
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
@@ -292,6 +333,24 @@ pub fn mcp_confirm(
         .remove(&id)
         .ok_or("confirmation request expired")?;
     tx.send(outcome).map_err(|_| "request already closed".into())
+}
+
+/// Keep the bridge target in step with the SSH tab the user is looking at.
+/// Called from the webview on tab focus, so RuTerm AI Chat can omit `session`
+/// and naturally act on "the terminal that currently has the host open".
+#[tauri::command]
+pub fn mcp_set_target(
+    app: tauri::AppHandle,
+    bridge: tauri::State<'_, Bridge>,
+    session: String,
+) -> Result<(), String> {
+    if !ssh_ids(&app).contains(&session) {
+        return Err("SSH session is not active".into());
+    }
+    bridge.set_target(&session);
+    let (name, address) = bridge.target_view().unwrap_or((session, String::new()));
+    app.emit("rterm:mcp-target", json!({ "name": name, "address": address }))
+        .map_err(|error| error.to_string())
 }
 
 /// Config snippet injected into the agent's local shell. OpenCode merges this
@@ -732,12 +791,37 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "open_tui",
+            "description": "Launch an interactive terminal program (htop, vim, nano, less, tail -f) in the active VPS tab. The command is typed with a real Enter keystroke; no sentinel is appended.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "TUI command to launch, e.g. `htop` or `sudo htop`." },
+                    "session": { "type": "string", "description": "Internal session id, VPS name, or address shown by list_targets. Omit to use the active VPS." }
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "close_tui",
+            "description": "Exit an open interactive program (htop, vim, nano, less, tail -f) and return to the shell prompt. Send this before running any command if a TUI is open.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "keys": { "type": "string", "description": "Exit keys. Defaults to Ctrl-C (\\u0003); use `q` for htop/less or `:q\\n` for vim." },
+                    "session": { "type": "string", "description": "Omit to use the active VPS." }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
             "name": "send_keys",
             "description": "Send raw keystrokes to the remote terminal (for interactive programs such as vim or htop).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "keys": { "type": "string", "description": "Raw keystrokes. Use \\n to launch a TUI and arrow/escape sequences to navigate it." },
+                    "keys": { "type": "string", "description": "Raw keystrokes. Use \\n for Enter; never type the word 'Enter'. Ctrl-C is \\u0003." },
                     "include_screen": { "type": "boolean", "description": "Also return the latest screen after sending — handy for vim/btop/mc." },
                     "session": { "type": "string", "description": "Internal session id, VPS name, or address shown by list_targets. Omit to use the active VPS." }
                 },
@@ -752,7 +836,33 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "session": { "type": "string", "description": "Internal session id, VPS name, or address shown by list_targets. Omit to use the active VPS." },
-                    "max_bytes": { "type": "integer" }
+                    "max_bytes": { "type": "integer" },
+                    "lines": { "type": "integer", "description": "Return only the last N clean lines (default 40)." }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "inspect_terminal",
+            "description": "Snapshot the active SSH terminal BEFORE typing: host, clean recent screen, detected prompt, whether the shell is idle, and any running jobs. Use this instead of guessing what is on screen.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": { "type": "string", "description": "Omit to inspect the focused SSH tab." },
+                    "lines": { "type": "integer", "description": "Recent screen lines to return (default 30, max 120)." }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "verify_screen",
+            "description": "Read the actual VPS screen AFTER an action and report objective evidence: whether the expected command is visible, whether new output appeared, and whether the shell is back at a clean prompt. Use this to confirm done/not done instead of trusting a tool status.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "The command that should be visible on screen. Omit for a general screen check." },
+                    "lines": { "type": "integer", "description": "Screen tail lines to include (default 20)." },
+                    "session": { "type": "string", "description": "Omit to use the focused SSH tab." }
                 },
                 "additionalProperties": false
             }
@@ -788,9 +898,78 @@ fn tool_definitions() -> Value {
                 "required": ["text"],
                 "additionalProperties": false
             }
+        },
+        {
+            "name": "list_hosts",
+            "description": "List ALL SAVED SSH hosts in the encrypted RuTerm vault with label, address, port, user, group, tags and notes. Use this for 'which VPS hosts do I have?' — list_targets only shows currently OPEN tabs. Passwords, keys and env values are never returned.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+        },
+        {
+            "name": "get_host",
+            "description": "Get full details for ONE saved host by label, address, username or id. Credentials are never returned.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "name": { "type": "string", "description": "Saved host label, address or user." } },
+                "required": ["name"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "list_notes",
+            "description": "List notes in the encrypted vault with their id and opening words. Call this before read_note or update_note to find the right note.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+        },
+        {
+            "name": "read_note",
+            "description": "Read a note by id, or find up to 5 notes containing a query string. Use list_notes first if you do not know the id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Note id from list_notes." },
+                    "query": { "type": "string", "description": "Text to search for in note bodies." }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "create_note",
+            "description": "Create a new note in the encrypted RuTerm vault and open it in a new tab — exactly like RuTerm's native AI chat. Use this immediately when the user asks to record, recap or save a result into a note. No approval dialog is needed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Short title; becomes the first line of the note." },
+                    "body": { "type": "string", "description": "Full note content written from facts just verified." },
+                    "favorite": { "type": "boolean" }
+                },
+                "required": ["body"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "update_note",
+            "description": "Edit an existing note by id (from list_notes), replacing or appending to its body, then refresh its open tab. Use this when the user asks to edit, update or add to a note.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Note id from list_notes or read_note." },
+                    "body": { "type": "string", "description": "New text to write or append." },
+                    "append": { "type": "boolean", "description": "true = add to the end instead of replacing (default false)." },
+                    "favorite": { "type": "boolean", "description": "Optionally change the favorite flag." }
+                },
+                "required": ["id", "body"],
+                "additionalProperties": false
+            }
         }
     ])
 }
+
+/// Sent with MCP `initialize` so agents know the vault tools exist even before
+/// they call `tools/list`. Keeps host/note questions on the native tools.
+const VAULT_TOOLS_HINT: &str = "RuTerm vault tools: ruterm_list_hosts lists every SAVED SSH host \
+ (ruterm_list_targets only shows currently OPEN tabs); ruterm_get_host details one host. \
+ ruterm_list_notes + ruterm_read_note find notes; ruterm_create_note writes a note and opens it in \
+ a new tab, ruterm_update_note edits one by id and refreshes its tab. Use these whenever the user \
+ asks which hosts they have, or asks to save, recap or edit a note — no local file writing is needed.";
 
 fn target_instructions(app: &tauri::AppHandle, bridge: &Bridge) -> String {
     match resolve_target(app, bridge, None) {
@@ -815,10 +994,11 @@ fn target_instructions(app: &tauri::AppHandle, bridge: &Bridge) -> String {
              user to choose Deny / Allow / Always allow in a RuTerm dialog; wait for the tool result. \
              Call ruterm_read_session when you start or switch VPS, and ruterm_note_session whenever \
              you learn an important fact or decision so future sessions remember it. \
-             Memory for the active VPS: {}.",
+             Memory for the active VPS: {}. {}",
             bridge.display_name(&id),
             bridge.label(&id),
-            bridge.session_file(&id).display()
+            bridge.session_file(&id).display(),
+            VAULT_TOOLS_HINT
         ),
         Err(_) => [
             "You are connected to RuTerm, an SSH client on the user's Mac.",
@@ -827,6 +1007,7 @@ fn target_instructions(app: &tauri::AppHandle, bridge: &Bridge) -> String {
             "Use ruterm_execute (never local shell tools) for server/VPS work.",
             "Destructive commands require user approval (Deny / Allow / Always allow).",
             "Once a VPS tab is open, call ruterm_read_session to load previous work context.",
+            VAULT_TOOLS_HINT,
         ]
         .join(" "),
     }
@@ -850,6 +1031,86 @@ fn one_line(text: &str, max: usize) -> String {
 
 fn trim_word(word: &str) -> &str {
     word.trim_matches(|c: char| matches!(c, '\'' | '"' | '`' | '(' | ')' | '{' | '}' | '[' | ']'))
+}
+
+/// Models often write `htopEnter` or `htop<Enter>` instead of a real newline.
+/// Translate those conventions into actual terminal keystrokes so nothing is
+/// ever typed as the literal word "Enter".
+pub fn terminal_keys(keys: &str) -> String {
+    let mut text = keys
+        .replace("\\r\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\r", "\n");
+    for marker in [
+        "<enter>", "[enter]", "<return>", "[return]", "<cr>", "<Enter>", "[Enter]", "<Return>",
+        "[Return]", "<CR>",
+    ] {
+        text = text.replace(marker, "\n");
+    }
+    let trimmed = text.trim_end().to_string();
+    let lower = trimmed.to_ascii_lowercase();
+    for suffix in ["enter", "return"] {
+        if lower.ends_with(suffix) {
+            let prefix = &trimmed[..trimmed.len() - suffix.len()];
+            // `htopEnter` (model-style) and `htop Enter` are both requests to
+            // press Enter; a lowercase `center` is just a command name.
+            let capitalized = format!("{}{}", suffix[..1].to_uppercase(), &suffix[1..]);
+            if prefix.is_empty()
+                || prefix.ends_with(char::is_whitespace)
+                || trimmed.ends_with(&capitalized)
+            {
+                return format!("{}\n", prefix.trim_end());
+            }
+        }
+    }
+    text
+}
+
+/// A command that tries to SSH again from inside an already-open SSH tab.
+/// Models produce this when they want "a shell on the server" without realising
+/// the tab is already that shell. It must never be typed into the VPS.
+pub fn nested_ssh_command(command: &str) -> bool {
+    let mut words = command.trim().split_whitespace();
+    let first = words.next().unwrap_or("").trim_matches(|c: char| !c.is_alphanumeric());
+    if first.eq_ignore_ascii_case("ssh") {
+        return true;
+    }
+    if first.eq_ignore_ascii_case("sudo") {
+        return words
+            .find(|word| !word.starts_with('-'))
+            .is_some_and(|word| word.eq_ignore_ascii_case("ssh"));
+    }
+    false
+}
+
+/// Detect a `send_keys` payload that is really a request to launch a TUI
+/// (`htop`, `htopEnter`, `sudo htop`, `tail -f …`). Navigation keys such as `q`
+/// are deliberately not matched.
+pub fn looks_like_tui_launch(keys: &str) -> bool {
+    let normalized = terminal_keys(keys);
+    let mut words = normalized.split_whitespace();
+    let clean = |word: &str| {
+        word.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '/')
+            .to_ascii_lowercase()
+    };
+    let mut first = clean(words.next().unwrap_or(""));
+    if first == "sudo" {
+        first = words
+            .find(|word| !word.starts_with('-'))
+            .map(clean)
+            .unwrap_or_default();
+    }
+    const TUIS: &[&str] = &[
+        "htop", "top", "btop", "atop", "vim", "nvim", "vi", "nano", "micro", "less", "more", "man",
+        "mc", "ranger", "tmux", "screen", "watch", "ping", "ssh",
+    ];
+    if TUIS.contains(&first.as_str()) {
+        return true;
+    }
+    (first == "tail" || first == "journalctl")
+        && normalized
+            .split_whitespace()
+            .any(|word| word == "-f" || word == "--follow")
 }
 
 /// Heuristic guard for commands that can destroy data or take a server down.
@@ -982,7 +1243,30 @@ fn gate(
     }
 }
 
-fn call_tool(app: &tauri::AppHandle, bridge: &Bridge, name: &str, args: &Value) -> RpcResult {
+/// Run an async vault operation off the MCP listener's plain std thread.
+/// `spawn` + a channel (instead of `block_on`) also keeps this safe when a
+/// caller is already on Tauri's async runtime, e.g. chat's `invoke_tool`.
+fn vault_call<F, Fut, T>(app: &tauri::AppHandle, task: F) -> Result<T, String>
+where
+    F: FnOnce(tauri::AppHandle) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, String>> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = channel();
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = tx.send(task(handle).await);
+    });
+    rx.recv()
+        .map_err(|_| "vault operation was interrupted".to_string())?
+}
+
+pub(crate) fn call_tool(
+    app: &tauri::AppHandle,
+    bridge: &Bridge,
+    name: &str,
+    args: &Value,
+) -> RpcResult {
     let result = match name {
         "list_targets" => {
             let ids = ssh_ids(app);
@@ -1007,7 +1291,9 @@ fn call_tool(app: &tauri::AppHandle, bridge: &Bridge, name: &str, args: &Value) 
                     .join("\n");
                 format!(
                     "Open VPS tabs (saved names):\n{lines}\n\nSession ids are internal and hidden. \
-                     Omit `session` to use the active VPS, or pass the name/address above to pick one. \
+                     Omit `session` to use the active VPS. Only name another tab if the user \
+                     explicitly asks for it. Next step: run the requested command with `execute` \
+                     (or `open_tui` for interactive programs) — do not just list targets again. \
                      This list is live — call it again after the user opens another tab.\n\
                      Session memory: {}",
                     bridge.session_file(&active).display()
@@ -1019,7 +1305,16 @@ fn call_tool(app: &tauri::AppHandle, bridge: &Bridge, name: &str, args: &Value) 
                 .get("command")
                 .and_then(Value::as_str)
                 .ok_or((-32602, "command is required".into()))?;
-            let timeout_ms = args.get("timeout_ms").and_then(Value::as_u64).unwrap_or(180_000);
+            // A TUI must never get an exit sentinel appended — route it to
+            // open_tui even when the caller asked for a normal execute.
+            if looks_like_tui_launch(command) {
+                let mut tui = json!({ "command": command });
+                if let Some(session) = args.get("session") {
+                    tui["session"] = session.clone();
+                }
+                return call_tool(app, bridge, "open_tui", &tui);
+            }
+            let timeout_ms = args.get("timeout_ms").and_then(Value::as_u64).unwrap_or(60_000);
             execute(app, bridge, command, args.get("session").and_then(Value::as_str), timeout_ms)?
         }
         "start_execute" => {
@@ -1027,6 +1322,13 @@ fn call_tool(app: &tauri::AppHandle, bridge: &Bridge, name: &str, args: &Value) 
                 .get("command")
                 .and_then(Value::as_str)
                 .ok_or((-32602, "command is required".into()))?;
+            if looks_like_tui_launch(command) {
+                let mut tui = json!({ "command": command });
+                if let Some(session) = args.get("session") {
+                    tui["session"] = session.clone();
+                }
+                return call_tool(app, bridge, "open_tui", &tui);
+            }
             let timeout_ms = args.get("timeout_ms").and_then(Value::as_u64).unwrap_or(0);
             let job = start_job(
                 app,
@@ -1034,6 +1336,7 @@ fn call_tool(app: &tauri::AppHandle, bridge: &Bridge, name: &str, args: &Value) 
                 command,
                 args.get("session").and_then(Value::as_str),
                 timeout_ms,
+                true,
             )?;
             let session = resolve_target(app, bridge, args.get("session").and_then(Value::as_str))
                 .unwrap_or_default();
@@ -1048,9 +1351,26 @@ fn call_tool(app: &tauri::AppHandle, bridge: &Bridge, name: &str, args: &Value) 
                 .get("job")
                 .and_then(Value::as_str)
                 .ok_or((-32602, "job is required".into()))?;
-            let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
+            let job = resolve_job_id(bridge, job)?;
             let wait_ms = args.get("wait_ms").and_then(Value::as_u64).unwrap_or(1_000);
-            let view = poll_job(app, bridge, job, offset, wait_ms)?;
+            // Models almost never remember to pass `offset`. Continue from the
+            // last chunk instead of replaying the whole job on every poll.
+            let offset = if let Some(explicit) = args.get("offset").and_then(Value::as_u64) {
+                explicit
+            } else {
+                bridge
+                    .jobs
+                    .lock()
+                    .ok()
+                    .and_then(|jobs| jobs.get(&job).map(|entry| entry.last_offset))
+                    .unwrap_or(0)
+            };
+            let view = poll_job(app, bridge, &job, offset, wait_ms)?;
+            if let Ok(mut jobs) = bridge.jobs.lock() {
+                if let Some(entry) = jobs.get_mut(&job) {
+                    entry.last_offset = view.next_offset;
+                }
+            }
             let chunk = strip_ansi(&view.chunk);
             let status = if view.done {
                 format!("exit {}", if view.exit_status.is_empty() { "unknown" } else { &view.exit_status })
@@ -1075,7 +1395,7 @@ fn call_tool(app: &tauri::AppHandle, bridge: &Bridge, name: &str, args: &Value) 
                 .get("job")
                 .and_then(Value::as_str)
                 .ok_or((-32602, "job is required".into()))?;
-            cancel_job(app, bridge, job)?
+            cancel_job(app, bridge, &resolve_job_id(bridge, job)?)?
         }
         "execute_batch" => {
             let commands = args
@@ -1085,7 +1405,7 @@ fn call_tool(app: &tauri::AppHandle, bridge: &Bridge, name: &str, args: &Value) 
             if commands.is_empty() {
                 return Err((-32602, "commands must not be empty".into()));
             }
-            let timeout_ms = args.get("timeout_ms").and_then(Value::as_u64).unwrap_or(180_000);
+            let timeout_ms = args.get("timeout_ms").and_then(Value::as_u64).unwrap_or(60_000);
             let requested = args.get("session").and_then(Value::as_str);
             let mut parts = Vec::new();
             for (index, value) in commands.iter().enumerate() {
@@ -1097,18 +1417,85 @@ fn call_tool(app: &tauri::AppHandle, bridge: &Bridge, name: &str, args: &Value) 
             }
             parts.join("\n")
         }
+        "open_tui" => {
+            let command = args
+                .get("command")
+                .and_then(Value::as_str)
+                .ok_or((-32602, "command is required".into()))?;
+            // Models often append a textual `Enter`; normalize it to a real
+            // newline so the literal word never reaches the shell.
+            let command = terminal_keys(command);
+            let command = command.trim();
+            if command.is_empty() {
+                return Err((-32602, "command cannot be empty".into()));
+            }
+            if nested_ssh_command(command) {
+                return Err((
+                    -32600,
+                    "Already inside the SSH tab — do not run a nested `ssh` command.".into(),
+                ));
+            }
+            let session = resolve_target(app, bridge, args.get("session").and_then(Value::as_str))
+                .map_err(|e| (-32000, e))?;
+            gate(app, bridge, &session, command)?;
+            // A real newline is required. No exit sentinel: TUIs stay open.
+            let (_, ready) = write_command(app, bridge, &format!("{command}\n"), Some(&session))?;
+            if let Ok(mut open) = bridge.tui.lock() {
+                open.insert(session.clone());
+            }
+            bridge.remember(
+                &session,
+                &format!("opened interactive `{}`", one_line(command, 400)),
+                false,
+            );
+            format!(
+                "Opened {} in {} ({}). Use send_keys for navigation and Ctrl-C (\\u0003) to exit.{}",
+                one_line(command, 200),
+                bridge.display_name(&session),
+                bridge.label(&session),
+                prompt_warning(ready)
+            )
+        }
+        "close_tui" => {
+            let session = resolve_target(app, bridge, args.get("session").and_then(Value::as_str))
+                .map_err(|e| (-32000, e))?;
+            let keys = args
+                .get("keys")
+                .and_then(Value::as_str)
+                .unwrap_or("\u{3}");
+            let keys = terminal_keys(keys);
+            write_target(app, bridge, Some(&session), &keys).map_err(|e| (-32000, e))?;
+            if let Ok(mut open) = bridge.tui.lock() {
+                open.remove(&session);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            format!(
+                "Closed the interactive program in {} ({}). Shell prompt should be ready now.",
+                bridge.display_name(&session),
+                bridge.label(&session)
+            )
+        }
         "send_keys" => {
             let keys = args
                 .get("keys")
                 .and_then(Value::as_str)
                 .ok_or((-32602, "keys is required".into()))?;
+            let keys = terminal_keys(keys);
             let session = resolve_target(app, bridge, args.get("session").and_then(Value::as_str))
                 .map_err(|e| (-32000, e))?;
-            gate(app, bridge, &session, keys)?;
-            write_target(app, bridge, Some(&session), keys).map_err(|e| (-32000, e))?;
+            gate(app, bridge, &session, &keys)?;
+            write_target(app, bridge, Some(&session), &keys).map_err(|e| (-32000, e))?;
+            if keys.contains('\u{3}')
+                || keys.trim().eq_ignore_ascii_case("q")
+                || keys.trim_start().starts_with(":q")
+            {
+                if let Ok(mut open) = bridge.tui.lock() {
+                    open.remove(&session);
+                }
+            }
             bridge.remember(
                 &session,
-                &format!("sent keys `{}`", one_line(keys, 400)),
+                &format!("sent keys `{}`", one_line(&keys, 400)),
                 false,
             );
             let mut message = format!(
@@ -1125,7 +1512,7 @@ fn call_tool(app: &tauri::AppHandle, bridge: &Bridge, name: &str, args: &Value) 
                 std::thread::sleep(Duration::from_millis(300));
                 let screen = output_tail(app, &session, 20_000);
                 message.push_str("\n--- screen ---\n");
-                message.push_str(&strip_ansi(&screen));
+                message.push_str(&clean_screen(&screen));
             }
             message
         }
@@ -1138,16 +1525,92 @@ fn call_tool(app: &tauri::AppHandle, bridge: &Bridge, name: &str, args: &Value) 
                 .unwrap_or(20_000)
                 .clamp(1_000, 512_000) as usize;
             let bytes = output_tail(app, &session, max);
-            let body = if bytes.is_empty() {
+            let cleaned = clean_screen(&bytes);
+            let body = if cleaned.trim().is_empty() {
                 "(no output captured yet)".to_string()
             } else {
-                strip_ansi(&bytes)
+                let lines: Vec<&str> = cleaned.lines().collect();
+                let take = args
+                    .get("lines")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .clamp(1, 200) as usize;
+                if take == 0 || lines.len() <= take {
+                    cleaned
+                } else {
+                    lines[lines.len() - take..].join("\n")
+                }
             };
             format!(
                 "VPS: {} ({})\n{}",
                 bridge.display_name(&session),
                 bridge.label(&session),
                 body
+            )
+        }
+        "verify_screen" => {
+            let session = resolve_target(app, bridge, args.get("session").and_then(Value::as_str))
+                .map_err(|e| (-32000, e))?;
+            let lines = args
+                .get("lines")
+                .and_then(Value::as_u64)
+                .unwrap_or(20)
+                .clamp(5, 120) as usize;
+            screen_verification(
+                app,
+                bridge,
+                &session,
+                args.get("command").and_then(Value::as_str),
+                None,
+                lines,
+            )
+        }
+        "inspect_terminal" => {
+            let session = resolve_target(app, bridge, args.get("session").and_then(Value::as_str))
+                .map_err(|e| (-32000, e))?;
+            let take = args
+                .get("lines")
+                .and_then(Value::as_u64)
+                .unwrap_or(30)
+                .clamp(1, 120) as usize;
+            // A just-opened tab often has no captured output yet. Give the
+            // shell a short chance to print its prompt before we report it as
+            // busy — otherwise the model stops instead of running the command.
+            // This checks the screen only, so a stale job cannot block the AI.
+            let idle = wait_for_shell_prompt(app, &session);
+            let screen = clean_screen(&output_tail(app, &session, 200_000));
+            let recent: Vec<&str> = screen.lines().collect();
+            let shown = if recent.len() > take {
+                recent[recent.len() - take..].join("\n")
+            } else {
+                screen.clone()
+            };
+            let prompt = screen.lines().last().unwrap_or("").trim().to_string();
+            let running: Vec<String> = bridge
+                .jobs
+                .lock()
+                .map(|jobs| {
+                    jobs.values()
+                        .filter(|job| job.session == session && !job.done)
+                        .map(|job| format!("{} (elapsed {:?})", one_line(&job.command, 160), job.created.elapsed()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let tui_open = bridge
+                .tui
+                .lock()
+                .map(|open| open.contains(&session))
+                .unwrap_or(false);
+            format!(
+                "VPS: {} ({})\nShell: {}\nTUI open: {}\nIdle at prompt: {}\nRunning jobs: {}\nMemory file: {}\n--- recent screen ---\n{}",
+                bridge.display_name(&session),
+                bridge.label(&session),
+                if prompt.is_empty() { "(unknown)" } else { &prompt },
+                if tui_open { "yes — close it before running a command" } else { "no" },
+                if idle { "yes" } else { "no — do not inject a new command yet" },
+                if running.is_empty() { "none".to_string() } else { running.join("; ") },
+                bridge.session_file(&session).display(),
+                if shown.trim().is_empty() { "(no output captured yet)" } else { &shown }
             )
         }
         "switch_target" => {
@@ -1159,6 +1622,13 @@ fn call_tool(app: &tauri::AppHandle, bridge: &Bridge, name: &str, args: &Value) 
             if let Ok(mut target) = bridge.target.lock() {
                 *target = Some(resolved.clone());
             }
+            let _ = app.emit(
+                "rterm:mcp-target",
+                json!({
+                    "name": bridge.display_name(&resolved),
+                    "address": bridge.label(&resolved),
+                }),
+            );
             format!(
                 "Target switched to {} ({}).",
                 bridge.display_name(&resolved),
@@ -1197,12 +1667,246 @@ fn call_tool(app: &tauri::AppHandle, bridge: &Bridge, name: &str, args: &Value) 
                 bridge.label(&session)
             )
         }
+        // Vault-backed tools give local agents the same reach as the built-in
+        // chat. Credentials are deliberately never included: an agent only
+        // needs labels/addresses to work on a VPS, and no secret is echoed
+        // into a terminal or model transcript.
+        "list_hosts" => vault_call(app, |app| async move {
+            let state = app.state::<AppState>();
+            let vault = state.unlocked_vault().await?;
+            let hosts: Vec<Value> = vault
+                .hosts
+                .iter()
+                .filter(|host| !host.deleted)
+                .map(|host| crate::chat::host_view(host, false))
+                .collect();
+            Ok(format!(
+                "{} saved host(s). Credentials are never returned.\n{}",
+                hosts.len(),
+                serde_json::to_string_pretty(&hosts).unwrap_or_default()
+            ))
+        })
+        .map_err(|error| (-32000, error))?,
+        "get_host" => {
+            let query = args
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or((-32602, "name is required".into()))?
+                .to_string();
+            vault_call(app, move |app| async move {
+                let state = app.state::<AppState>();
+                let vault = state.unlocked_vault().await?;
+                let host = crate::chat::find_host(&vault, &query).ok_or_else(|| {
+                    format!(
+                        "No saved host matches '{query}'. Available: {}",
+                        vault
+                            .hosts
+                            .iter()
+                            .filter(|host| !host.deleted)
+                            .map(|host| host.label.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?;
+                Ok(format!(
+                    "Host details (credentials omitted):\n{}",
+                    serde_json::to_string_pretty(&crate::chat::host_view(host, false))
+                        .unwrap_or_default()
+                ))
+            })
+            .map_err(|error| (-32000, error))?
+        }
+        "list_notes" => vault_call(app, |app| async move {
+            let state = app.state::<AppState>();
+            let vault = state.unlocked_vault().await?;
+            let notes: Vec<Value> = vault
+                .notes
+                .iter()
+                .filter(|note| !note.deleted)
+                .map(|note| {
+                    json!({
+                        "id": note.id,
+                        "favorite": note.favorite,
+                        "updated_at": note.updated_at,
+                        "preview": note.body.chars().take(140).collect::<String>(),
+                    })
+                })
+                .collect();
+            Ok(format!(
+                "{} note(s).\n{}",
+                notes.len(),
+                serde_json::to_string_pretty(&notes).unwrap_or_default()
+            ))
+        })
+        .map_err(|error| (-32000, error))?,
+        "read_note" => {
+            let id = args.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            let query = args
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if id.is_empty() && query.is_empty() {
+                return Err((-32602, "id or query is required".into()));
+            }
+            vault_call(app, move |app| async move {
+                let state = app.state::<AppState>();
+                let vault = state.unlocked_vault().await?;
+                let wanted = query.to_lowercase();
+                let matches: Vec<&Note> = vault
+                    .notes
+                    .iter()
+                    .filter(|note| !note.deleted)
+                    .filter(|note| {
+                        (!id.is_empty() && note.id.to_string() == id)
+                            || (!wanted.is_empty()
+                                && note.body.to_lowercase().contains(&wanted))
+                    })
+                    .take(5)
+                    .collect();
+                if matches.is_empty() {
+                    return Ok("No matching note.".to_string());
+                }
+                Ok(matches
+                    .iter()
+                    .map(|note| format!("--- note {} ---\n{}", note.id, note.body))
+                    .collect::<Vec<_>>()
+                    .join("\n\n"))
+            })
+            .map_err(|error| (-32000, error))?
+        }
+        "create_note" => {
+            let title = args
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(80)
+                .collect::<String>();
+            let content = args
+                .get("body")
+                .and_then(Value::as_str)
+                .ok_or((-32602, "body is required".into()))?
+                .trim()
+                .chars()
+                .take(50_000)
+                .collect::<String>();
+            if content.is_empty() {
+                return Err((-32602, "body must not be empty".into()));
+            }
+            let favorite = args.get("favorite").and_then(Value::as_bool).unwrap_or(false);
+            vault_call(app, move |app| async move {
+                let state = app.state::<AppState>();
+                let body = if title.is_empty() {
+                    content
+                } else {
+                    format!("# {title}\n\n{content}")
+                };
+                let label = if title.is_empty() {
+                    crate::chat::note_preview(&body)
+                } else {
+                    title.clone()
+                };
+                let id = uuid::Uuid::new_v4();
+                let note_id = id.to_string();
+                let stamp = now();
+                let mut vault = state.unlocked_vault().await?;
+                vault.notes.push(Note {
+                    id,
+                    body,
+                    favorite,
+                    created_at: stamp,
+                    updated_at: stamp,
+                    deleted: false,
+                });
+                let payload = crate::commands::persist_vault(&state, vault).await?;
+                let _ = app.emit("rterm:note-created", json!({ "id": note_id, "payload": payload }));
+                Ok(format!(
+                    "Note '{label}' saved in your encrypted vault and opened in a new tab."
+                ))
+            })
+            .map_err(|error| (-32000, error))?
+        }
+        "update_note" => {
+            let id = args
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or((-32602, "id is required".into()))?
+                .trim()
+                .to_string();
+            let body = args
+                .get("body")
+                .and_then(Value::as_str)
+                .ok_or((-32602, "body is required".into()))?
+                .chars()
+                .take(50_000)
+                .collect::<String>();
+            if body.is_empty() {
+                return Err((-32602, "body must not be empty".into()));
+            }
+            let append = args.get("append").and_then(Value::as_bool).unwrap_or(false);
+            let favorite = args.get("favorite").and_then(Value::as_bool);
+            vault_call(app, move |app| async move {
+                let state = app.state::<AppState>();
+                let mut vault = state.unlocked_vault().await?;
+                let note = vault
+                    .notes
+                    .iter_mut()
+                    .find(|note| !note.deleted && note.id.to_string() == id)
+                    .ok_or_else(|| {
+                        format!("No note with id '{id}'. Use list_notes to find it.")
+                    })?;
+                if append {
+                    if !note.body.is_empty() && !note.body.ends_with('\n') {
+                        note.body.push('\n');
+                    }
+                    note.body.push_str(&body);
+                } else {
+                    note.body = body;
+                }
+                if let Some(favorite) = favorite {
+                    note.favorite = favorite;
+                }
+                note.updated_at = now();
+                let note_id = note.id.to_string();
+                let label = crate::chat::note_preview(&note.body);
+                let payload = crate::commands::persist_vault(&state, vault).await?;
+                let _ = app.emit("rterm:note-updated", json!({ "id": note_id, "payload": payload }));
+                Ok(format!(
+                    "Note '{label}' updated in your encrypted vault. Its tab has been refreshed."
+                ))
+            })
+            .map_err(|error| (-32000, error))?
+        }
         _ => return Err((-32602, format!("unknown tool: {name}"))),
     };
     Ok(json!({
         "content": [{ "type": "text", "text": result }],
         "isError": false
     }))
+}
+
+/// Call one MCP tool from another Rust module (RuTerm AI Chat). Returns the
+/// same plain text an external agent would see, or a clean error message.
+pub(crate) fn invoke_tool(
+    app: &tauri::AppHandle,
+    bridge: &Bridge,
+    name: &str,
+    args: &Value,
+) -> Result<String, String> {
+    let response = call_tool(app, bridge, name, args).map_err(|(_, message)| message)?;
+    let text = response
+        .get("content")
+        .and_then(|content| content.get(0))
+        .and_then(|item| item.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if response.get("isError").and_then(Value::as_bool).unwrap_or(false) {
+        return Err(text);
+    }
+    Ok(text)
 }
 
 fn ssh_ids(app: &tauri::AppHandle) -> Vec<String> {
@@ -1282,6 +1986,10 @@ fn write_target(
     text: &str,
 ) -> Result<(), String> {
     let session = resolve_target(app, bridge, requested)?;
+    let _guard = bridge
+        .write_lock
+        .lock()
+        .map_err(|_| "terminal write lock is poisoned".to_string())?;
     let handle = app
         .state::<AppState>()
         .ssh
@@ -1294,6 +2002,58 @@ fn write_target(
     Ok(())
 }
 
+/// Write a whole command only after the shell looks idle. Navigation keys in a
+/// TUI keep using `write_target` directly — they must not wait for a prompt.
+fn write_command(
+    app: &tauri::AppHandle,
+    bridge: &Bridge,
+    text: &str,
+    requested: Option<&str>,
+) -> Result<(String, bool), (i64, String)> {
+    let session = resolve_target(app, bridge, requested).map_err(|e| (-32000, e))?;
+    let tui_open = bridge
+        .tui
+        .lock()
+        .map(|open| open.contains(&session))
+        .unwrap_or(false);
+    if tui_open {
+        // A command typed into htop/vim never reaches the shell. Exit the TUI
+        // first — this is enforced by the runtime, not left to the model.
+        write_target(app, bridge, Some(&session), "\u{3}").map_err(|e| (-32000, e))?;
+        if let Ok(mut open) = bridge.tui.lock() {
+            open.remove(&session);
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let mut ready = wait_for_prompt(app, bridge, &session);
+    if !ready {
+        let screen = clean_screen(&output_tail(app, &session, 8_000));
+        // A visible prompt with trailing text is the user's partial input.
+        // Clear that line (Ctrl-U) before typing so commands never get glued
+        // to it and silently fail.
+        if screen.lines().last().is_some_and(|line| {
+            let line = line.trim();
+            (line.contains("$ ") || line.contains("# ") || line.contains("❯") || line.contains("➜"))
+                && line.len() < 200
+        }) {
+            write_target(app, bridge, Some(&session), "\u{15}")
+                .map_err(|e| (-32000, e))?;
+            std::thread::sleep(Duration::from_millis(150));
+            ready = wait_for_prompt(app, bridge, &session);
+        }
+    }
+    write_target(app, bridge, Some(&session), text).map_err(|e| (-32000, e))?;
+    Ok((session, ready))
+}
+
+fn prompt_warning(ready: bool) -> &'static str {
+    if ready {
+        ""
+    } else {
+        "\nWarning: the shell prompt was not detected before typing; verify the command reached the prompt."
+    }
+}
+
 /// Start a remote command and return a job id immediately. The command is
 /// typed into the user's SSH tab, but the caller does not block waiting for it.
 fn start_job(
@@ -1302,7 +2062,15 @@ fn start_job(
     command: &str,
     requested: Option<&str>,
     timeout_ms: u64,
+    use_marker: bool,
 ) -> Result<String, (i64, String)> {
+    if nested_ssh_command(command) {
+        return Err((
+            -32600,
+            "Already inside the SSH tab — do not run a nested `ssh` command. Run the command directly in this VPS."
+                .into(),
+        ));
+    }
     let session = resolve_target(app, bridge, requested).map_err(|e| (-32000, e))?;
     gate(app, bridge, &session, command)?;
     let since = app
@@ -1315,13 +2083,26 @@ fn start_job(
 
     // The PTY echoes what we type. A unique marker plus "last occurrence" wins
     // over the echoed command text when we later parse the real exit status.
-    let marker = format!("__RUTERM_DONE_{}__", &Uuid::new_v4().simple().to_string()[..10]);
-    let script = format!(
-        "{}\nprintf '\\n{}:%s\\n' \"$?\"\n",
-        command.trim_end(),
-        marker
-    );
-    write_target(app, bridge, Some(&session), &script).map_err(|e| (-32000, e))?;
+    // Short chat commands finish by watching the prompt return, so no status
+    // marker is written to the user's terminal. Long streaming jobs still use
+    // a marker to capture the exact exit code.
+    let marker = if use_marker {
+        format!("__RUTERM_DONE_{}__", &Uuid::new_v4().simple().to_string()[..10])
+    } else {
+        String::new()
+    };
+    // A trailing `&&`/`;`/backslash would produce a shell syntax error once
+    // we append the exit-status line. Strip it before building the script.
+    let base = command
+        .trim_end()
+        .trim_end_matches(|c: char| matches!(c, '&' | ';' | '|' | '\\'))
+        .trim_end();
+    let script = if use_marker {
+        format!("{base}\nprintf '\\n{}:%s\\n' \"$?\"\n", marker)
+    } else {
+        format!("{base}\n")
+    };
+    let (session, ready) = write_command(app, bridge, &script, Some(&session))?;
 
     let id = Uuid::new_v4().simple().to_string()[..10].to_string();
     let now = Instant::now();
@@ -1337,11 +2118,17 @@ fn start_job(
                 marker,
                 since,
                 consumed: 0,
-                buffer: Vec::new(),
+                last_offset: 0,
+                buffer: if ready {
+                    Vec::new()
+                } else {
+                    b"[RuTerm] shell prompt was not detected before typing; verify the command reached the prompt.\n".to_vec()
+                },
                 done: false,
                 exit_status: String::new(),
                 deadline,
                 created: now,
+                last_activity: now,
             },
         );
     }
@@ -1367,6 +2154,55 @@ fn job_view(job: &StreamJob, job_id: &str, bridge: &Bridge, offset: u64) -> JobV
         exit_status: job.exit_status.clone(),
         elapsed: job.created.elapsed(),
     }
+}
+
+/// Models often pass the command text instead of the short job id returned by
+/// `start_execute`. Accept both, plus the newest job for the active tab, and
+/// list what is actually available when nothing matches.
+fn resolve_job_id(bridge: &Bridge, query: &str) -> Result<String, (i64, String)> {
+    let jobs = bridge
+        .jobs
+        .lock()
+        .map_err(|_| (-32000, "stream job lock failed".into()))?;
+    let q = query.trim();
+    if jobs.contains_key(q) {
+        return Ok(q.to_string());
+    }
+    if let Some((id, _)) = jobs.iter().find(|(_, job)| job.command.trim() == q) {
+        return Ok(id.clone());
+    }
+    let mut all: Vec<(&String, &StreamJob)> = jobs.iter().collect();
+    all.sort_by(|a, b| b.1.created.cmp(&a.1.created));
+    let needle = q.to_lowercase();
+    if let Some((id, _)) = all.iter().find(|(_, job)| {
+        let command = job.command.to_lowercase();
+        command.contains(&needle) || needle.contains(command.as_str())
+    }) {
+        return Ok((*id).clone());
+    }
+    // The query looks like a shell command, so the newest job on the focused
+    // tab is almost certainly what the model meant.
+    if q.contains(' ') || q.contains('/') || q.contains('-') {
+        let active = bridge.target_id();
+        if let Some((id, _)) = all
+            .iter()
+            .find(|(_, job)| active.as_deref() == Some(job.session.as_str()))
+        {
+            return Ok((*id).clone());
+        }
+    }
+    let available = all
+        .iter()
+        .map(|(id, job)| format!("{} ({})", id, one_line(&job.command, 80)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err((
+        -32000,
+        format!(
+            "stream job `{query}` is not available. Available jobs: {}",
+            if available.is_empty() { "none" } else { &available }
+        ),
+    ))
 }
 
 /// Poll one streaming job. With `wait_ms > 0` this long-polls, returning as
@@ -1396,9 +2232,15 @@ fn poll_job(
                 let session = job.session.clone();
                 let marker = job.marker.clone();
                 let bytes = output_since(app, &session, job.since);
-                if bytes.len() as u64 > job.consumed {
-                    let fresh = &bytes[job.consumed as usize..];
+                let consumed = job.consumed as usize;
+                let fresh = if bytes.len() > consumed {
+                    &bytes[consumed..]
+                } else {
+                    &bytes[bytes.len()..]
+                };
+                if !fresh.is_empty() {
                     // Use the LAST marker: the first one is in the echoed command.
+                    // Short jobs have no marker; rfind_bytes ignores empty needles.
                     if let Some(pos) = rfind_bytes(fresh, marker.as_bytes()) {
                         job.buffer.extend_from_slice(&fresh[..pos]);
                         let tail = &fresh[pos..];
@@ -1415,6 +2257,17 @@ fn poll_job(
                         job.buffer.extend_from_slice(fresh);
                     }
                     job.consumed = bytes.len() as u64;
+                    job.last_activity = Instant::now();
+                }
+                // Short commands use no marker: a fresh prompt after the
+                // echoed command is the proof that the command finished.
+                if !job.done
+                    && marker.is_empty()
+                    && job.consumed > 0
+                    && prompt_ready(&clean_screen(fresh))
+                {
+                    job.done = true;
+                    job.exit_status = "prompt returned".into();
                 }
                 if !job.done {
                     if let Some(deadline) = job.deadline {
@@ -1423,6 +2276,20 @@ fn poll_job(
                             job.exit_status = "timeout".into();
                         }
                     }
+                }
+                // If the shell is visibly back at its prompt and no new bytes
+                // have arrived, the command is over even when the exit marker
+                // was lost. Otherwise one missed marker leaves the tab marked
+                // busy forever and the model refuses to run anything else.
+                if !job.done
+                    && job.consumed > 0
+                    && job.last_activity.elapsed() > Duration::from_secs(3)
+                    && prompt_ready(&clean_screen(&output_tail(app, &session, 8_000)))
+                {
+                    job.done = true;
+                    job.exit_status = "prompt returned".into();
+                    job.buffer
+                        .extend_from_slice(b"\n[prompt returned; exit status not captured]\n");
                 }
                 let completed = job.done;
                 (job_view(job, job_id, bridge, offset), completed)
@@ -1500,6 +2367,73 @@ fn cancel_job(
     ))
 }
 
+/// Read the real terminal screen and report objective evidence that an action
+/// happened. This is what lets the AI say "sudah/belum" from the VPS itself.
+fn screen_verification(
+    app: &tauri::AppHandle,
+    bridge: &Bridge,
+    session: &str,
+    command: Option<&str>,
+    since: Option<u64>,
+    lines: usize,
+) -> String {
+    let cleaned = clean_screen(&output_tail(app, session, 30_000));
+    let all: Vec<&str> = cleaned.lines().collect();
+    let shown = if all.len() > lines {
+        all[all.len() - lines..].join("\n")
+    } else {
+        cleaned.clone()
+    };
+    let prompt = prompt_ready(&cleaned);
+    let fresh = since.map(|value| output_since(app, session, value)).unwrap_or_default();
+    let new_text = strip_ansi(&fresh);
+    let typed = command
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| cleaned.contains(value.trim()))
+        .unwrap_or(false);
+    let output_seen = since.is_some() && new_text.trim().lines().count() > 1;
+    let tui_open = bridge
+        .tui
+        .lock()
+        .map(|open| open.contains(session))
+        .unwrap_or(false);
+    let verdict = if let Some(expected) = command {
+        if typed && output_seen && prompt && !tui_open {
+            "VERIFIED: the command is visible on the VPS screen, new output was captured, \
+             and the shell is back at its prompt."
+                .to_string()
+        } else {
+            let mut reasons = Vec::new();
+            if !typed {
+                reasons.push(format!("expected command `{}` is not on screen", one_line(expected, 120)));
+            }
+            if !output_seen {
+                reasons.push("no new output beyond the echoed command".to_string());
+            }
+            if !prompt {
+                reasons.push("shell is not at a clean prompt".to_string());
+            }
+            if tui_open {
+                reasons.push("a TUI is still open".to_string());
+            }
+            format!("NOT VERIFIED: {}.", reasons.join("; "))
+        }
+    } else if prompt && !tui_open {
+        "Screen read: shell is at a clean prompt. No expected command was supplied, so execution \
+         cannot be confirmed."
+            .to_string()
+    } else {
+        "Screen read: shell is busy or a TUI is open. Do not inject a command yet.".to_string()
+    };
+    format!(
+        "--- screen check ---\nverdict: {verdict}\ncommand visible: {typed}\n\
+         new output bytes: {}\nprompt ready: {prompt}\nTUI open: {tui_open}\n\
+         --- screen tail ---\n{}",
+        fresh.len(),
+        if shown.trim().is_empty() { "(no output captured)".to_string() } else { shown }
+    )
+}
+
 /// Blocking wrapper for short commands; long commands should use
 /// `start_execute` + `read_stream` instead.
 fn execute(
@@ -1509,7 +2443,16 @@ fn execute(
     requested: Option<&str>,
     timeout_ms: u64,
 ) -> Result<String, (i64, String)> {
-    let job_id = start_job(app, bridge, command, requested, timeout_ms)?;
+    let job_id = start_job(app, bridge, command, requested, timeout_ms, false)?;
+    let (job_session, job_since) = bridge
+        .jobs
+        .lock()
+        .ok()
+        .and_then(|jobs| {
+            jobs.get(&job_id)
+                .map(|job| (job.session.clone(), job.since))
+        })
+        .unwrap_or_default();
     let mut offset = 0;
     loop {
         let view = poll_job(app, bridge, &job_id, offset, 1_000)?;
@@ -1523,9 +2466,17 @@ fn execute(
                 text
             };
             let header = format!("VPS: {} ({})", full.vps, full.address);
+            let check = screen_verification(
+                app,
+                bridge,
+                &job_session,
+                Some(command),
+                Some(job_since),
+                12,
+            );
             if full.exit_status == "timeout" {
                 return Ok(format!(
-                    "{header}\n[timed out after {timeout_ms} ms; command may still be running]\n{body}"
+                    "{header}\n[timed out after {timeout_ms} ms; command may still be running]\n{body}\n{check}"
                 ));
             }
             let status = if full.exit_status.is_empty() {
@@ -1533,7 +2484,7 @@ fn execute(
             } else {
                 full.exit_status.clone()
             };
-            return Ok(format!("{header}\n{body}\n[exit status: {status}]"));
+            return Ok(format!("{header}\n{body}\n[exit status: {status}]\n{check}"));
         }
     }
 }
@@ -1564,6 +2515,45 @@ fn output_tail(app: &tauri::AppHandle, session: &str, max: usize) -> Vec<u8> {
             buf[start..].to_vec()
         })
         .unwrap_or_default()
+}
+
+/// Screen-only idle check. Used for reporting: a stale job entry must not make
+/// a shell that is clearly back at its prompt look busy to the model.
+fn wait_for_shell_prompt(app: &tauri::AppHandle, session: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        if prompt_ready(&clean_screen(&output_tail(app, session, 8_000))) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+/// Wait briefly until the shell is idle at a prompt before injecting a new
+/// command. Returns false on an unusual prompt — callers then still proceed
+/// but warn the model, so a non-standard shell never blocks the chat.
+fn wait_for_prompt(app: &tauri::AppHandle, bridge: &Bridge, session: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let busy_job = bridge
+            .jobs
+            .lock()
+            .map(|jobs| {
+                jobs.values()
+                    .any(|job| job.session == session && !job.done)
+            })
+            .unwrap_or(false);
+        if !busy_job && prompt_ready(&clean_screen(&output_tail(app, session, 8_000))) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
 }
 
 /// Like `find_bytes`, but returns the last match. A PTY echoes the command we
@@ -1603,7 +2593,9 @@ fn strip_sentinel_echo(raw: &[u8], marker: &str) -> Vec<u8> {
 
 /// Minimal ANSI/osc stripper: enough to give an agent readable plain text
 /// without pulling a regex or terminal-emulator dependency into the app.
-fn strip_ansi(input: &[u8]) -> String {
+/// Keeps carriage returns so `clean_screen` can resolve redraws; plain callers
+/// use `strip_ansi` below.
+fn strip_ansi_raw(input: &[u8]) -> String {
     let mut out = Vec::with_capacity(input.len());
     let mut i = 0;
     while i < input.len() {
@@ -1642,10 +2634,58 @@ fn strip_ansi(input: &[u8]) -> String {
             i += 1;
         }
     }
-    String::from_utf8_lossy(&out)
-        .replace('\r', "")
-        .trim_end()
-        .to_string()
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn strip_ansi(input: &[u8]) -> String {
+    strip_ansi_raw(input).replace('\r', "").trim_end().to_string()
+}
+
+/// Readable snapshot of what is on screen right now. Resolves carriage-return
+/// redraws (progress bars, status lines) instead of concatenating every frame,
+/// and drops leftover control characters so the model sees clean text.
+fn clean_screen(raw: &[u8]) -> String {
+    let text = strip_ansi_raw(raw).replace("\r\n", "\n");
+    let mut lines: Vec<String> = text
+        .split('\n')
+        .map(|line| {
+            let frame = line.rsplit('\r').next().unwrap_or("");
+            frame
+                .chars()
+                .filter(|c| !c.is_control() || *c == '\t')
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect();
+    while lines.first().is_some_and(|line| line.is_empty()) {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+/// Heuristic: is the shell sitting at a prompt and ready for a command?
+fn prompt_ready(screen: &str) -> bool {
+    screen.lines().last().is_some_and(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.len() > 160 {
+            return false;
+        }
+        let lower = line.to_ascii_lowercase();
+        // The prompt must be the LAST thing on the line. A loose `contains`
+        // check mistakes `root@host:~# half-typed-text` for an idle shell and
+        // appends our command to the user's partial input.
+        let looks_prompt = line.ends_with('$')
+            || line.ends_with('#')
+            || line.ends_with('❯')
+            || line.ends_with('➜')
+            || line.ends_with('>')
+            || (line.contains('➜') && line.ends_with('~'));
+        looks_prompt && !lower.contains("password:")
+    })
 }
 
 #[cfg(test)]
@@ -1663,7 +2703,40 @@ mod tests {
             pending: Arc::new(Mutex::new(HashMap::new())),
             jobs: Arc::new(Mutex::new(HashMap::new())),
             allowlist: Arc::new(Mutex::new(HashSet::new())),
+            write_lock: Arc::new(Mutex::new(())),
+            tui: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    #[test]
+    fn stream_jobs_can_be_found_by_command_text() {
+        let bridge = test_bridge();
+        let now = Instant::now();
+        bridge.jobs.lock().unwrap().insert(
+            "abc123".into(),
+            StreamJob {
+                session: "s1".into(),
+                command: "grep -rhnE \"server_name|listen \" /etc/nginx".into(),
+                marker: "m".into(),
+                since: 0,
+                consumed: 0,
+                last_offset: 0,
+                buffer: Vec::new(),
+                done: false,
+                exit_status: String::new(),
+                deadline: None,
+                created: now,
+                last_activity: now,
+            },
+        );
+        assert_eq!(resolve_job_id(&bridge, "abc123").unwrap(), "abc123");
+        assert_eq!(
+            resolve_job_id(&bridge, "grep -rhnE \"server_name|listen \" /etc/nginx").unwrap(),
+            "abc123"
+        );
+        assert_eq!(resolve_job_id(&bridge, "server_name").unwrap(), "abc123");
+        let error = resolve_job_id(&bridge, "totally other").unwrap_err().1;
+        assert!(error.contains("Available jobs"), "{error}");
     }
 
     #[test]
@@ -1721,6 +2794,39 @@ mod tests {
     }
 
     #[test]
+    fn terminal_keys_turns_model_phrases_into_real_enter() {
+        assert_eq!(terminal_keys("htopEnter"), "htop\n");
+        assert_eq!(terminal_keys("htop Enter"), "htop\n");
+        assert_eq!(terminal_keys("htop<Enter>"), "htop\n");
+        assert_eq!(terminal_keys("htop\\n"), "htop\n");
+        assert_eq!(terminal_keys("q"), "q");
+    }
+
+    #[test]
+    fn clean_screen_resolves_redraws_and_detects_prompts() {
+        let raw = b"\x1b[32mroot@vps:~#\x1b[0m uptime\r\n 10:01:02 up 1 day\r 10:01:03 up 2 days\n";
+        let clean = clean_screen(raw);
+        assert!(clean.contains("root@vps:~#"));
+        assert!(clean.contains("10:01:03 up 2 days"), "last CR frame must win");
+        assert!(!clean.contains("10:01:02"), "stale frame must be dropped");
+        assert!(prompt_ready("root@vps:~#"));
+        assert!(prompt_ready("user@host:~$"));
+        assert!(!prompt_ready("Password: "));
+        assert!(!prompt_ready("apt update"));
+        assert!(!prompt_ready("root@vps:~# kalsdalskdma"));
+    }
+
+    #[test]
+    fn tui_launches_are_distinguished_from_navigation() {
+        for keys in ["htop", "htopEnter", "htop<Enter>", "sudo htop", "tail -f /var/log/syslog"] {
+            assert!(looks_like_tui_launch(keys), "missed {keys}");
+        }
+        for keys in ["q", "j", "k", "ctrl-c", ":wq", "", "echo htop"] {
+            assert!(!looks_like_tui_launch(keys), "false positive: {keys}");
+        }
+    }
+
+    #[test]
     fn risky_commands_are_detected_but_normal_ones_are_not() {
         for command in [
             "rm -rf /var/www",
@@ -1745,5 +2851,42 @@ mod tests {
         let bridge = test_bridge();
         let value: Value = serde_json::from_str(&agent_config_state(&bridge)).unwrap();
         assert_eq!(value["mcp"]["servers"]["ruterm"]["url"], "http://127.0.0.1:19001/mcp");
+    }
+
+    #[test]
+    fn agents_get_saved_host_and_note_tools() {
+        let tools = tool_definitions();
+        let names: Vec<&str> = tools
+            .as_array()
+            .expect("tool list")
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap_or(""))
+            .collect();
+        for expected in [
+            "list_targets",
+            "list_hosts",
+            "get_host",
+            "list_notes",
+            "read_note",
+            "create_note",
+            "update_note",
+        ] {
+            assert!(names.contains(&expected), "missing tool: {expected}");
+        }
+        // Saved hosts must not be confused with open tabs, or agents repeat
+        // the "no VPS is open" mistake when asked for the host list.
+        let description = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "list_hosts")
+            .unwrap()["description"]
+            .as_str()
+            .unwrap();
+        assert!(description.contains("SAVED"));
+        assert!(description.contains("list_targets"));
+        assert!(VAULT_TOOLS_HINT.contains("ruterm_list_hosts"));
+        assert!(VAULT_TOOLS_HINT.contains("ruterm_create_note"));
+        assert!(VAULT_TOOLS_HINT.contains("ruterm_update_note"));
     }
 }

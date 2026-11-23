@@ -7,20 +7,23 @@
 
 use crate::{commands, state::AppState};
 use chrono::Utc;
-use rterm_core::model::{now, AuthMethod, Host, Snippet};
+use rterm_core::model::{now, AuthMethod, Host, Note, Snippet};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
 const OPENROUTER_CHAT: &str = "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_MODELS: &str = "https://openrouter.ai/api/v1/models";
-const MAX_TURNS: usize = 6;
+const MAX_TURNS: usize = 12;
 const BEGIN_MARKER: &str = "# BEGIN RUTERM AI CHAT";
 const END_MARKER: &str = "# END RUTERM AI CHAT";
 /// Agent names must never be mistaken for SSH hosts by `create_host`.
@@ -31,6 +34,175 @@ const AGENT_NAMES: &[&str] = &[
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+/// The drawer's watchdog must not kill a turn that is still doing real work.
+/// A tool can legitimately wait up to 60 seconds, and recovery can make two
+/// more model calls, so emit a silent heartbeat for the whole turn.
+struct ActivityBeat {
+    alive: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ActivityBeat {
+    fn start(app: AppHandle) -> Self {
+        let _ = app.emit("chat://activity", json!({}));
+        let alive = Arc::new(AtomicBool::new(true));
+        let flag = alive.clone();
+        let handle = std::thread::spawn(move || {
+            while flag.load(Ordering::Relaxed) {
+                std::thread::park_timeout(Duration::from_secs(8));
+                if !flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                let _ = app.emit("chat://activity", json!({}));
+            }
+        });
+        Self {
+            alive,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for ActivityBeat {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Tool output can be very large (log tails, directory trees). Keep the last
+/// model turn inside a predictable context budget without losing the beginning
+/// of a short command result.
+fn cap_tool_text(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(limit / 2).collect();
+    let tail: String = text.chars().rev().take(limit / 2).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("{head}\n... truncated ...\n{tail}")
+}
+
+/// A reply that only announces an action is not an answer. Detect the shape of
+/// the sentence (not its topic) so RuTerm can continue the work automatically.
+fn looks_unfinished(text: &str) -> bool {
+    let value = text.trim().to_lowercase();
+    if value.is_empty() {
+        return true;
+    }
+    const INTENT: &[&str] = &[
+        "saya akan",
+        "akan saya",
+        "sekarang saya",
+        "saya cek",
+        "saya coba",
+        "saya buka",
+        "saya jalankan",
+        "mari kita",
+        "baik, saya",
+        "i'll",
+        "i will",
+        "let me",
+        "now i",
+        "i'm going to",
+        "sure, i",
+    ];
+    if INTENT.iter().any(|phrase| value.contains(phrase)) {
+        return true;
+    }
+    value.ends_with("...")
+        || value.ends_with('…')
+        || value.ends_with(':')
+        || value.ends_with('—')
+}
+
+fn last_user_text(messages: &[ChatMessage]) -> &str {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content.as_str())
+        .unwrap_or("")
+}
+
+fn fallback_after_tools(last_result: &str) -> String {
+    if last_result.trim().is_empty() {
+        "Tool selesai, tetapi model tidak menghasilkan ringkasan. Coba ulangi dengan pertanyaan lebih spesifik.".into()
+    } else {
+        format!(
+            "Tool selesai — ini hasilnya:\n{}",
+            cap_tool_text(last_result, 1_500)
+        )
+    }
+}
+
+/// Lowercased command words with a leading `sudo` (and its flags) removed.
+fn command_words(command: &str) -> Vec<String> {
+    let lower = command.trim().to_ascii_lowercase();
+    let tokens: Vec<String> = lower.split_whitespace().map(str::to_string).collect();
+    let mut index = 0;
+    if tokens.first().map(String::as_str) == Some("sudo") {
+        index = 1;
+        while tokens.get(index).is_some_and(|token| token.starts_with('-')) {
+            index += 1;
+        }
+    }
+    tokens[index..].to_vec()
+}
+
+/// Commands that eventually finish but commonly take minutes. `vps_execute`
+/// waits for its result, so these are auto-started as streaming jobs instead
+/// of blocking the chat for the full timeout.
+fn long_running_command(command: &str) -> bool {
+    let words = command_words(command);
+    let first = words.first().map(String::as_str).unwrap_or("");
+    let second = words.get(1).map(String::as_str).unwrap_or("");
+
+    // `nginx -T` dumps every config file and can stall behind a pipe; `nginx -t`
+    // alone is fast and must stay synchronous.
+    if first == "nginx" && command.contains("-T") {
+        return true;
+    }
+    const PACKAGE: &[&str] = &["apt", "apt-get", "yum", "dnf", "pacman", "zypper", "apk"];
+    if PACKAGE.contains(&first) {
+        return matches!(
+            second,
+            "update" | "upgrade" | "install" | "dist-upgrade" | "full-upgrade" | "autoremove"
+        );
+    }
+    let long = match first {
+        "brew" => matches!(second, "update" | "upgrade" | "install" | "reinstall"),
+        "npm" | "pnpm" | "yarn" => matches!(second, "install" | "i" | "ci" | "add" | "run"),
+        "cargo" => matches!(second, "build" | "test" | "check" | "clippy" | "run" | "install"),
+        "docker" => matches!(second, "build" | "compose" | "pull" | "push"),
+        "pip" | "pip3" => matches!(second, "install" | "uninstall"),
+        "composer" => matches!(second, "install" | "update" | "require"),
+        "systemctl" | "service" => matches!(second, "restart" | "reload" | "start" | "stop"),
+        "make" | "cmake" | "gradle" => true,
+        "go" => matches!(second, "build" | "test" | "install"),
+        _ => false,
+    };
+    long && !interactive_command(command)
+}
+
+/// Programs meant to stay on screen. They must be launched with a real Enter
+/// and without the exit sentinel used by `execute`/`start_execute`.
+fn interactive_command(command: &str) -> bool {
+    let normalized = crate::mcp::terminal_keys(command);
+    let words = command_words(&normalized);
+    let first = words.first().map(String::as_str).unwrap_or("");
+    const TUIS: &[&str] = &[
+        "htop", "top", "btop", "atop", "vim", "nvim", "vi", "nano", "micro", "less", "more",
+        "man", "mc", "ranger", "tmux", "screen", "watch", "ping", "ssh",
+    ];
+    if TUIS.contains(&first) {
+        return true;
+    }
+    (first == "tail" || first == "journalctl") && words.iter().any(|word| word == "-f" || word == "--follow")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -77,6 +249,14 @@ pub struct ChatConfig {
     pub configured: bool,
     pub model: String,
     pub allow_credentials: bool,
+    pub allow_vps: bool,
+}
+
+/// Friendly target shown in the chat header — no internal session id.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatTarget {
+    pub name: String,
+    pub address: String,
 }
 
 /// A model offered by OpenRouter, for the Settings dropdown.
@@ -94,6 +274,10 @@ struct Call {
 }
 
 fn client() -> Result<reqwest::Client, String> {
+    client_with_timeout(60)
+}
+
+fn client_with_timeout(seconds: u64) -> Result<reqwest::Client, String> {
     // OpenRouter asks apps to identify themselves; some providers require it
     // for free-tier requests.
     let mut headers = reqwest::header::HeaderMap::new();
@@ -103,8 +287,10 @@ fn client() -> Result<reqwest::Client, String> {
     if let Ok(value) = "RuTerm".parse() {
         headers.insert("X-Title", value);
     }
+    // Tool results are returned outside this stream. A completion itself
+    // should be quick; a short ceiling lets us fall back instead of hanging.
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(180))
+        .timeout(Duration::from_secs(seconds))
         .default_headers(headers)
         .build()
         .map_err(|error| format!("Could not build HTTP client: {error}"))
@@ -150,35 +336,103 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn system_prompt() -> String {
-    "You are RuTerm's built-in assistant. You can read the user's saved SSH hosts, notes, \
+/// The no-target variant is sent on every request, so an old tool result in
+/// localStorage can never be presented as a live reading again.
+fn vps_target_ready(app: &AppHandle, state: &AppState) -> bool {
+    let Some(id) = app.state::<crate::mcp::Bridge>().target_id() else {
+        return false;
+    };
+    lock(&state.ssh).contains_key(&id)
+}
+
+fn system_prompt_for(allow_vps: bool, has_target: bool) -> String {
+    let base = "You are RuTerm's built-in assistant. You can read the user's saved SSH hosts, notes, \
      snippets, groups, per-VPS work logs, app preferences, Google/sync status and the AI agent \
      CLIs installed on this Mac. You can also switch the interface theme between dark and light, \
      launch a detected AI agent in a local tab, and save a new SSH host and open it in a terminal \
      tab. \
-     Always call a tool for facts — never invent host names, addresses, note contents, settings \
-     or sync state. Credential fields are omitted by default and only appear after the user \
-     explicitly approves a read; API keys and tokens are never exposed. Other config writes \
-     require approval. When the user asks to change the theme, call `set_theme` immediately — do \
-     not merely say that you can. When the user asks to open/start an AI agent from `list_agents` \
-     (OpenCode, Freebuff, Kilo, Claude, Kiro, Command AI), call `launch_agent` with its id — never \
-     call `create_host` for an agent name. `create_host` is ONLY for a real SSH host with an IP or \
-     hostname. When the user pastes an address/IP, port, user or password and asks to save/open a \
-     host, call `create_host` with those exact values; it asks for confirmation and opens the SSH \
-     tab automatically. Never invent a password. Always answer in the same \
-     language as the user's latest message \
-     (Indonesian in, Indonesian out). Be concise and refer to hosts by their saved labels rather \
-     than internal ids."
-        .into()
+     Always call a tool for facts — never invent host names, addresses, note contents, settings, \
+     sync state, or command output. Credential fields are omitted by default and only appear after \
+     the user explicitly approves a read; API keys and tokens are never exposed. Other config \
+     writes require approval. When the user asks to change the theme, call `set_theme` immediately \
+     — do not merely say that you can. When the user asks to open/start an AI agent from \
+     `list_agents` (OpenCode, Freebuff, Kilo, Claude, Kiro, Command AI), call `launch_agent` with \
+     its id — never call `create_host` for an agent name. `create_host` is ONLY for a real SSH host \
+     with an IP or hostname. When the user pastes an address/IP, port, user or password and asks to \
+     save/open a host, call `create_host` with those exact values; it asks for confirmation and \
+     opens the SSH tab automatically. When the user asks to record, recap, or save a result into \
+     a RuTerm note, call `create_note` immediately with the full summary in `body` and a short \
+     `title` — never merely say you will save it. The note opens in a new tab automatically. \
+     Never invent a password. Always answer in the same language \
+     as the user's latest message (Indonesian in, Indonesian out). Be concise and refer to hosts \
+     by their saved labels rather than internal ids.";
+    if allow_vps {
+        let guard = if has_target {
+            "An SSH tab is focused right now. It is the ONLY valid target. Any RAM, disk, \
+             process, log or command-output claim must come from a `vps_*` tool result in THIS turn."
+        } else {
+            "IMPORTANT: NO SSH TAB IS FOCUSED RIGHT NOW. Never report current RAM, disk, \
+             processes, logs or command output from memory or from earlier chat history — those \
+             readings are stale. If the user asks WHICH saved hosts exist, call `list_hosts` — \
+             `vps_list_targets` only shows currently OPEN terminal tabs, not saved hosts. If the \
+             user asks to connect/work on a saved host, call `vps_open_host` first; otherwise say \
+             no VPS tab is open and ask them to open/focus one. Never present old tool output as \
+             a current result."
+        };
+        format!(
+            "{base} VPS control is enabled and NATIVE: you drive the focused SSH tab through \
+             RuTerm's embedded MCP bridge. The only valid target is the tab the user is looking \
+             at; you cannot switch tabs or pass a `session`. WORKFLOW — follow it every time: \
+             (1) If the user asks to open a SAVED host in a new tab, call `vps_open_host` with its \
+             saved label (e.g. 'VPS Murah') or address. `create_host` is ONLY for a brand-new host \
+             the user pastes — never claim an existing saved host cannot be opened. The new tab \
+             becomes the active target automatically. \
+             (2) Decide the next step from the question, not from a fixed script. For a direct \
+             fact (RAM, disk, domains, services, logs, versions, processes), run ONE read-only \
+             command with `vps_execute`; do not call `vps_inspect` first unless you need terminal \
+             state. Use `vps_inspect` and `vps_list_targets` when the task depends on what the \
+             shell is doing right now, then check the host, clean \
+             recent screen, detected prompt and running jobs. If 'Idle at prompt' is no, follow \
+             the running job with `vps_read_stream` or stop it with `vps_send_keys` Ctrl-C \
+             (\\u0003) — never inject a command into a busy shell. \
+             (3) Call `vps_read_memory` for durable context on this host — it also contains an \
+             automatic log of every previous AI chat action and reply, so use it to keep continuity. \
+             Use `vps_note_memory` when you learn a fact worth remembering (deploy path, service \
+             name, quirks). \
+             (4) Use `vps_execute` for short commands; installs/builds auto-start as background \
+             jobs — reply that it is running and use `vps_read_stream` (`wait_ms` up to 60000) \
+             when asked for the result. Use `vps_open_tui` to LAUNCH htop/vim/nano/less/tail -f, \
+             then `vps_send_keys` for navigation and `vps_read_screen` to look. Never type the \
+             word 'Enter'. \
+             (5) If a TUI is open (inspect reports it), close it first with `vps_close_tui` before \
+             any command — the bridge also does this automatically, but never type a command into \
+             htop/vim. Confirm done vs not done from the ACTUAL SCREEN: call `vps_verify_screen` \
+             after an action (every `vps_execute` result also includes a screen check). Only say \
+             'sudah/selesai' when the screen check is VERIFIED — the command must be visible on \
+             the VPS terminal and new output must be captured. NEVER type a nested `ssh` command inside \
+             an already-open VPS tab — the tab is already that SSH session; run commands directly. \
+             A timed-out or NOT VERIFIED tool means NO DATA — never report RAM/disk/domain numbers \
+             means NO DATA — never report RAM/disk/domain numbers from memory or history. Report failures \
+             honestly; never expose internal session ids. Risky commands open Deny / Allow / Always allow; \
+             'Always allow' is exact-command and process-only. ALWAYS finish with a short text \
+             answer in the user's language — never end a turn with an empty message. {guard}"
+        )
+    } else {
+        format!(
+            "{base} VPS control is disabled in Settings. Never try to run server commands and \
+             never call any `vps_*` tool; tell the user to enable `Allow AI Chat to control SSH \
+             tabs` in Settings if they want that."
+        )
+    }
 }
 
-fn tools() -> Value {
-    json!([
+fn tools_for(allow_vps: bool, has_target: bool) -> Value {
+    let mut list = match json!([
       {
         "type": "function",
         "function": {
           "name": "list_hosts",
-          "description": "List every saved SSH host with label, address, port, username, tags and notes. Credentials are omitted unless include_credentials is true (requires approval).",
+          "description": "List every saved SSH host with label, address, port, username, tags and notes. Use this for 'list my saved hosts'; `vps_list_targets` only shows open terminal tabs. Credentials are omitted unless include_credentials is true (requires approval).",
           "parameters": { "type": "object", "properties": {
             "include_credentials": { "type": "boolean", "description": "Ask to include passwords, private keys and env values." }
           } }
@@ -211,6 +465,18 @@ fn tools() -> Value {
           "parameters": { "type": "object", "properties": {
             "id": { "type": "string" }, "query": { "type": "string" }
           } }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "create_note",
+          "description": "Create a new note in the encrypted RuTerm vault and open it in a new tab. Use this immediately whenever the user asks to record, recap, or save a result/check into a note. No approval dialog is needed for a note.",
+          "parameters": { "type": "object", "properties": {
+            "title": { "type": "string", "description": "Short title; it becomes the first line of the note." },
+            "body": { "type": "string", "description": "Full note content, written from the facts just obtained from tools." },
+            "favorite": { "type": "boolean", "description": "Mark as favorite (default false)." }
+          }, "required": ["body"] }
         }
       },
       {
@@ -329,7 +595,168 @@ fn tools() -> Value {
           }
         }
       }
-    ])
+    ]) {
+        Value::Array(items) => items,
+        _ => Vec::new(),
+    };
+    if allow_vps {
+        let extra = json!([
+          {
+            "type": "function",
+            "function": {
+              "name": "vps_list_targets",
+              "description": "List SSH terminals currently open in RuTerm with friendly VPS names. Call this before a server task; the focused tab is marked active. Never call local shell tools for server work.",
+              "parameters": { "type": "object", "properties": {} }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "vps_open_host",
+              "description": "Open an ALREADY SAVED SSH host (e.g. 'VPS Murah') in a new terminal tab and make it the active target. Use this when the user asks to open/connect to a host from their vault — never say it cannot be done and never use create_host for it.",
+              "parameters": { "type": "object", "properties": {
+                "name": { "type": "string", "description": "Saved host label, address or IP from list_hosts." }
+              }, "required": ["name"] }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "vps_inspect",
+              "description": "Snapshot the focused VPS terminal before typing: host, clean recent screen, detected prompt, idle/busy state and running jobs. Call this before any server task.",
+              "parameters": { "type": "object", "properties": {
+                "lines": { "type": "integer", "description": "Recent screen lines (default 30)." }
+              } }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "vps_verify_screen",
+              "description": "Read the ACTUAL VPS screen after an action and report whether the expected command is visible, whether new output appeared, and whether the shell is at a clean prompt. Use this to decide done vs not done instead of trusting tool status.",
+              "parameters": { "type": "object", "properties": {
+                "command": { "type": "string", "description": "The command that should be visible on screen." },
+                "lines": { "type": "integer", "description": "Screen tail lines (default 20)." }
+              } }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "vps_execute",
+              "description": "Type a short command into the focused VPS terminal and return its output. Long installs/upgrades/builds are auto-started as background jobs so the chat does not block. Risky commands open a Deny / Allow / Always allow dialog.",
+              "parameters": { "type": "object", "properties": {
+                "command": { "type": "string" },
+                "timeout_ms": { "type": "integer", "description": "0 = no limit, default 60000. Prefer vps_start_execute for anything slower." }
+              }, "required": ["command"] }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "vps_open_tui",
+              "description": "Launch an interactive terminal program (htop, vim, nano, less, tail -f) in the focused VPS tab. Sends a real Enter with no exit sentinel, so the program stays open. Never type the word 'Enter' into the terminal.",
+              "parameters": { "type": "object", "properties": {
+                "command": { "type": "string", "description": "TUI command, e.g. `htop`, `sudo htop`, `vim /etc/nginx/nginx.conf`." }
+              }, "required": ["command"] }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "vps_close_tui",
+              "description": "Exit an open htop/vim/nano/less session and return to the shell prompt. Call this before running a command if vps_inspect says a TUI is open.",
+              "parameters": { "type": "object", "properties": {
+                "keys": { "type": "string", "description": "Exit keys. Default Ctrl-C; use `q` for htop/less or `:q\\n` for vim." }
+              } }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "vps_start_execute",
+              "description": "Start a long VPS command in the focused tab and return a job id immediately. Follow it with vps_read_stream instead of blocking.",
+              "parameters": { "type": "object", "properties": {
+                "command": { "type": "string" },
+                "timeout_ms": { "type": "integer", "description": "0 = no limit (default)." }
+              }, "required": ["command"] }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "vps_read_stream",
+              "description": "Read newly produced output from a VPS job, with the next offset and done/exit status. Pass the job id returned by vps_start_execute; the command text is also accepted. For a long job pass wait_ms up to 60000 instead of polling repeatedly.",
+              "parameters": { "type": "object", "properties": {
+                "job": { "type": "string", "description": "Job id from vps_start_execute, or the command text itself." },
+                "offset": { "type": "integer" },
+                "wait_ms": { "type": "integer", "description": "Long-poll wait (max 60000), default 1000." }
+              }, "required": ["job"] }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "vps_cancel_stream",
+              "description": "Send Ctrl-C to cancel a running VPS job.",
+              "parameters": { "type": "object", "properties": { "job": { "type": "string" } }, "required": ["job"] }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "vps_send_keys",
+              "description": "Send navigation keys to an already-open TUI. Use vps_open_tui to LAUNCH htop/vim/etc.; never send the literal word 'Enter' — use a real \\n.",
+              "parameters": { "type": "object", "properties": {
+                "keys": { "type": "string" },
+                "include_screen": { "type": "boolean" }
+              }, "required": ["keys"] }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "vps_read_screen",
+              "description": "Read recent clean screen lines from the focused VPS terminal (ANSI and redraws removed).",
+              "parameters": { "type": "object", "properties": {
+                "max_bytes": { "type": "integer" },
+                "lines": { "type": "integer" }
+              } }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "vps_read_memory",
+              "description": "Read the persistent work log for the focused VPS so you remember earlier decisions on this host.",
+              "parameters": { "type": "object", "properties": {} }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "vps_note_memory",
+              "description": "Append a durable fact or decision about the focused VPS to its session memory file.",
+              "parameters": { "type": "object", "properties": {
+                "text": { "type": "string" }
+              }, "required": ["text"] }
+            }
+          }
+        ]);
+        if let Value::Array(extra) = extra {
+            list.extend(extra);
+        }
+    }
+    // With no focused SSH tab, hide only the tools that actually type into a
+    // VPS. Saved-host reads, notes, settings and theme tools stay available —
+    // the user can still ask "list my saved hosts" before opening any tab.
+    if allow_vps && !has_target {
+        list.retain(|entry| {
+            let name = entry["function"]["name"].as_str().unwrap_or("");
+            !name.starts_with("vps_") || matches!(name, "vps_list_targets" | "vps_open_host")
+        });
+    }
+    Value::Array(list)
 }
 
 fn short_error(raw: &str) -> String {
@@ -345,6 +772,228 @@ fn short_error(raw: &str) -> String {
     raw.trim().chars().take(300).collect()
 }
 
+const RECOVERY_SYSTEM: &str = "You are RuTerm's recovery writer. The main assistant stopped \
+after a tool ran, sometimes after only saying what it would do. Answer the user's question using \
+ONLY the tool result shown below. Reply in the user's language, concise, with no markdown fences. \
+If the user asked to save/record the result in a RuTerm note and the result actually contains the \
+answer, reply with exactly `CREATE_NOTE: <short title>` on the first line and the full note body on \
+the following lines. If the result is empty, failed, or not enough to answer — or if the assistant \
+only promised an action — reply with exactly one line and nothing else: \
+NEED_COMMAND: <the single safest read-only shell command that would answer the question>. \
+Never invent values.";
+
+const COMMAND_SYSTEM: &str = "You choose RuTerm's next step. If the user asked to save the result \
+in a RuTerm note, reply with `CREATE_NOTE: <short title>` on the first line and the note body after \
+it. Otherwise reply with ONLY one safe, read-only shell command that answers the user's question. \
+No prose, no markdown fences.";
+
+const ANSWER_SYSTEM: &str = "You are RuTerm's recovery writer. Answer the user's question using \
+ONLY the command output and the screen check below. Reply in the user's language, concise, with no \
+markdown fences. If the user asked to save the result in a RuTerm note, reply with exactly \
+`CREATE_NOTE: <short title>` on the first line and the full note body after it instead of a normal \
+answer. If the screen check says NOT VERIFIED, do not claim the task succeeded — say what could not \
+be confirmed. Never output NEED_COMMAND and never invent values.";
+
+/// A tiny tool-free completion. Short context and no tool schema avoid the
+/// exact failure mode that makes free models stall after a tool result.
+async fn short_completion(
+    http: &reqwest::Client,
+    key: &str,
+    model: &str,
+    system: &str,
+    user: &str,
+    max_tokens: u64,
+) -> Result<String, String> {
+    let body = json!({
+        "model": model,
+        "stream": false,
+        "max_tokens": max_tokens,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user }
+        ]
+    });
+    let response = send_with_retry(|| {
+        http.post(OPENROUTER_CHAT)
+            .bearer_auth(key)
+            .json(&body)
+    })
+    .await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let raw = response.text().await.unwrap_or_default();
+        return Err(format!("OpenRouter {status} — {}", short_error(&raw)));
+    }
+    let value: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("Invalid OpenRouter response: {error}"))?;
+    let text = value
+        .get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        Err("OpenRouter returned an empty reply".into())
+    } else {
+        Ok(text)
+    }
+}
+
+/// Parse the model's own next-step suggestion. No topic keywords are involved.
+fn proposed_command(text: &str) -> Option<String> {
+    let at = text.to_lowercase().find("need_command:")?;
+    let rest = &text[at + "need_command:".len()..];
+    let line = rest.lines().next()?.trim();
+    let line = line.trim_matches('`').trim();
+    let line = line.strip_prefix("$ ").unwrap_or(line).trim();
+    if line.is_empty() || line.len() > 400 {
+        return None;
+    }
+    Some(line.to_string())
+}
+
+/// The recovery writer can also ask RuTerm to persist an artifact. This keeps
+/// note creation working when a free model stalls after a tool result and the
+/// normal tool-calling turn never reaches `create_note`.
+fn proposed_note(text: &str) -> Option<(String, String)> {
+    let at = text.to_lowercase().find("create_note:")?;
+    let rest = &text[at + "create_note:".len()..];
+    let mut lines = rest.lines();
+    let title = lines.next()?.trim().trim_matches('`').trim();
+    let body = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+    if title.is_empty() || body.is_empty() {
+        return None;
+    }
+    Some((title.chars().take(80).collect(), body))
+}
+
+async fn persist_recovery_note(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    session: &str,
+    allow_vps: bool,
+    title: &str,
+    body: &str,
+) -> String {
+    let args = json!({ "title": title, "body": body });
+    let saved = run_tool(app, state, session, "create_note", &args, allow_vps)
+        .await
+        .unwrap_or_else(|error| format!("Tool error: {error}"));
+    format!("{body}\n\n{saved}")
+}
+
+/// Generic recovery for ANY question: let the model decide, from the tool
+/// result, whether to answer now, run one more command, or save a note. Keeps
+/// the assistant useful when a free model falls silent in the post-tool
+/// completion.
+async fn recover_after_tools(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    session: &str,
+    key: &str,
+    model: &str,
+    allow_vps: bool,
+    question: &str,
+    partial: &str,
+    last_tool_name: &str,
+    last_result: &str,
+    may_run: bool,
+) -> String {
+    let http = match client_with_timeout(25) {
+        Ok(http) => http,
+        Err(_) => {
+            return format!(
+                "Model tidak mengirim ringkasan. Berikut hasil tool terakhir:\n{}",
+                cap_tool_text(last_result, 2_500)
+            )
+        }
+    };
+    let shown = cap_tool_text(last_result, 4_000);
+    // If the main turn already created the note, a stalled follow-up must not
+    // create a duplicate one.
+    let note_allowed = last_tool_name != "create_note";
+    let prompt = format!(
+        "User question:\n{question}\n\nTool `{last_tool_name}` returned:\n{shown}\n\n\
+         Assistant's unfinished message: {}\n\nSSH control available: {}",
+        if partial.trim().is_empty() { "(none)" } else { partial.trim() },
+        if may_run { "yes" } else { "no" }
+    );
+    let first = short_completion(&http, key, model, RECOVERY_SYSTEM, &prompt, 500)
+        .await
+        .unwrap_or_default();
+    if note_allowed {
+        if let Some((title, body)) = proposed_note(&first) {
+            return persist_recovery_note(app, state, session, allow_vps, &title, &body).await;
+        }
+    }
+    let mut command = proposed_command(&first);
+    // If even the recovery writer went silent, ask one even smaller question:
+    // just the command. Still no topic keywords — the model chooses it.
+    if command.is_none() && first.trim().is_empty() && may_run {
+        if let Ok(text) = short_completion(&http, key, model, COMMAND_SYSTEM, question, 120).await {
+            if note_allowed {
+                if let Some((title, body)) = proposed_note(&text) {
+                    return persist_recovery_note(app, state, session, allow_vps, &title, &body).await;
+                }
+            }
+            command = proposed_command(&text).or_else(|| {
+                let line = text
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches('`')
+                    .trim();
+                if line.is_empty() || line.to_lowercase().starts_with("need_command:") {
+                    None
+                } else {
+                    Some(line.to_string())
+                }
+            });
+        }
+    }
+    if may_run {
+        if let Some(command) = command {
+            let args = json!({ "command": command, "timeout_ms": 15_000 });
+            let ran = run_tool(app, state, session, "vps_execute", &args, allow_vps)
+                .await
+                .unwrap_or_else(|error| format!("Tool error: {error}"));
+            let follow_up = format!(
+                "User question:\n{question}\n\nCommand run on the VPS:\n{command}\n\nOutput:\n{}",
+                cap_tool_text(&ran, 4_000)
+            );
+            let answer = match short_completion(&http, key, model, ANSWER_SYSTEM, &follow_up, 500)
+                .await
+            {
+                Ok(text) => text,
+                Err(_) => format!(
+                    "Sudah saya jalankan di VPS, tetapi model tidak mengirim ringkasan:\n{}",
+                    cap_tool_text(&ran, 2_500)
+                ),
+            };
+            if note_allowed {
+                if let Some((title, body)) = proposed_note(&answer) {
+                    return persist_recovery_note(app, state, session, allow_vps, &title, &body).await;
+                }
+            }
+            return answer;
+        }
+    }
+    if !first.trim().is_empty() {
+        first
+    } else {
+        format!(
+            "Model tidak mengirim ringkasan. Berikut hasil tool terakhir:\n{}",
+            cap_tool_text(&shown, 2_500)
+        )
+    }
+}
+
 /// Stream one completion. Content deltas are pushed to the drawer as they
 /// arrive; tool-call fragments are aggregated across chunks before returning.
 async fn stream_completion(
@@ -355,22 +1004,36 @@ async fn stream_completion(
     model: &str,
     messages: &[ChatMessage],
     allow_tools: bool,
-) -> Result<(String, Vec<Call>), String> {
+    allow_vps: bool,
+    has_target: bool,
+) -> Result<(String, Vec<Call>, bool), String> {
+    // Third value = model stalled; the caller must not nudge it again.
     let mut body = json!({
         "model": model,
         "stream": true,
         "messages": messages,
+        // A bounded answer keeps free-tier models from stalling mid-generation.
+        "max_tokens": 1200,
     });
     if allow_tools {
-        body["tools"] = tools();
+        body["tools"] = tools_for(allow_vps, has_target);
         body["tool_choice"] = json!("auto");
     }
-    let mut response = send_with_retry(|| {
+    let mut response = match send_with_retry(|| {
         http.post(OPENROUTER_CHAT)
             .bearer_auth(key)
             .json(&body)
     })
-    .await?;
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            if messages.last().is_some_and(|message| message.role == "tool") {
+                return Ok((String::new(), Vec::new(), true));
+            }
+            return Err(error);
+        }
+    };
 
     if !response.status().is_success() {
         let status = response.status();
@@ -382,8 +1045,13 @@ async fn stream_completion(
             && (status == 400 || status == 422)
             && message.to_lowercase().contains("tool")
         {
-            return Box::pin(stream_completion(app, session, http, key, model, messages, false))
-                .await;
+            return Box::pin(stream_completion(
+                app, session, http, key, model, messages, false, allow_vps, has_target,
+            ))
+            .await;
+        }
+        if messages.last().is_some_and(|message| message.role == "tool") {
+            return Ok((String::new(), Vec::new(), true));
         }
         return Err(format!("OpenRouter {status} — {message}"));
     }
@@ -392,12 +1060,31 @@ async fn stream_completion(
     let mut content = String::new();
     let mut calls: Vec<Call> = Vec::new();
     let mut saw_data = false;
+    let mut last_delta = Instant::now();
 
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| format!("Stream interrupted: {error}"))?
-    {
+    loop {
+        // Providers may keep the SSE socket alive with comments while the
+        // model itself is silent. A token-idle watchdog is the only reliable
+        // way to stop waiting and hand control back to RuTerm.
+        if last_delta.elapsed() > Duration::from_secs(30) {
+            if messages.last().is_some_and(|message| message.role == "tool") {
+                return Ok((content, Vec::new(), true));
+            }
+            return Err("Model stopped responding before finishing.".into());
+        }
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(error) => {
+                // A stalled completion right after a tool result must not eat
+                // the tool work. Hand an empty turn back so the caller can use
+                // its deterministic fallback.
+                if messages.last().is_some_and(|message| message.role == "tool") {
+                    return Ok((content, Vec::new(), true));
+                }
+                return Err(format!("Stream interrupted: {error}"));
+            }
+        };
         buffer.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(position) = buffer.find('\n') {
             let line: String = buffer[..position].trim().to_string();
@@ -430,6 +1117,7 @@ async fn stream_completion(
 
             if let Some(text) = delta.get("content").and_then(Value::as_str) {
                 if !text.is_empty() {
+                    last_delta = Instant::now();
                     content.push_str(text);
                     let _ = app.emit(
                         "chat://delta",
@@ -440,6 +1128,7 @@ async fn stream_completion(
 
             if let Some(fragments) = delta.get("tool_calls").and_then(Value::as_array) {
                 for fragment in fragments {
+                    last_delta = Instant::now();
                     let index = fragment
                         .get("index")
                         .and_then(Value::as_u64)
@@ -478,10 +1167,14 @@ async fn stream_completion(
             call.id = format!("call_{}", Uuid::new_v4().simple());
         }
     }
-    Ok((content, calls.into_iter().filter(|call| !call.name.is_empty()).collect()))
+    Ok((
+        content,
+        calls.into_iter().filter(|call| !call.name.is_empty()).collect(),
+        false,
+    ))
 }
 
-fn host_view(host: &Host, with_credentials: bool) -> Value {
+pub(crate) fn host_view(host: &Host, with_credentials: bool) -> Value {
     let mut view = json!({
         "label": host.label,
         "address": host.address,
@@ -626,6 +1319,7 @@ fn settings_view(settings: &rterm_core::model::VaultSettings, theme: &str) -> Va
         "chat_model": settings.openrouter_model,
         "chat_configured": !settings.openrouter_api_key.is_empty(),
         "chat_credentials_allowed": settings.chat_allow_credentials,
+        "chat_vps_allowed": settings.chat_allow_vps,
     })
 }
 
@@ -653,7 +1347,7 @@ fn sync_status_view(
     })
 }
 
-fn find_host<'a>(vault: &'a rterm_core::model::Vault, query: &str) -> Option<&'a Host> {
+pub(crate) fn find_host<'a>(vault: &'a rterm_core::model::Vault, query: &str) -> Option<&'a Host> {
     let needle = query.trim().to_lowercase();
     if needle.is_empty() {
         return None;
@@ -684,6 +1378,54 @@ fn session_file(host: &Host) -> PathBuf {
         .join(".ruterm")
         .join("sessions")
         .join(format!("{safe}.md"))
+}
+
+fn compact_entry(text: &str, max: usize) -> String {
+    let flat = text.replace(['\n', '\r', '\t'], " ");
+    let mut out: String = flat.chars().take(max).collect();
+    if flat.chars().count() > max {
+        out.push('…');
+    }
+    out
+}
+
+/// Notes have no title field; the UI derives one from the first line. Keep the
+/// tool reply consistent with what the user will see in the new tab.
+pub(crate) fn note_preview(body: &str) -> String {
+    let first = body
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("Untitled note")
+        .trim_start_matches('#')
+        .trim();
+    compact_entry(if first.is_empty() { "Untitled note" } else { first }, 56)
+}
+
+fn append_action(path: &PathBuf, entry: &str) {
+    let stamp = Utc::now().format("%Y-%m-%d %H:%M UTC");
+    let line = format!("- [{stamp}] {}\n", compact_entry(entry, 500));
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    let content = if existing.trim().is_empty() {
+        format!("# RuTerm session memory\n\n## Work log\n\n{line}\n## Notes\n")
+    } else if let Some(pos) = existing.find("## Notes") {
+        format!("{}{line}\n", &existing[..pos])
+    } else {
+        format!("{existing}{line}\n")
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, content);
+}
+
+/// Every chat action is recorded in the focused VPS's memory file, so the next
+/// conversation starts with the same context the current one had.
+fn remember_chat_action(app: &AppHandle, entry: &str) {
+    let bridge = app.state::<crate::mcp::Bridge>();
+    if let Some(id) = bridge.target_id() {
+        bridge.remember(&id, &compact_entry(entry, 500), false);
+    }
 }
 
 fn safe_filename(input: Option<&str>, fallback: &str) -> Result<String, String> {
@@ -737,7 +1479,12 @@ async fn ask_approval(
             "preview": preview.chars().take(1200).collect::<String>(),
         }),
     );
-    let choice = rx.await.unwrap_or(ApprovalChoice::Deny);
+    // A modal left unanswered (or lost during a dev reload) must never block
+    // the chat forever. Deny it after the same window used by the MCP bridge.
+    let choice = tokio::time::timeout(Duration::from_secs(120), rx)
+        .await
+        .unwrap_or(Ok(ApprovalChoice::Deny))
+        .unwrap_or(ApprovalChoice::Deny);
     lock(&state.chat_pending).remove(&id);
     match choice {
         ApprovalChoice::Deny => Ok(false),
@@ -779,8 +1526,166 @@ async fn run_tool(
     session: &str,
     name: &str,
     args: &Value,
+    allow_vps: bool,
 ) -> Result<String, String> {
     match name {
+        tool if tool.starts_with("vps_") => {
+            if !allow_vps {
+                return Err(
+                    "VPS control is disabled. Enable 'Allow AI Chat to control SSH tabs' in Settings."
+                        .into(),
+                );
+            }
+            let mcp_name = &tool["vps_".len()..];
+            // Built-in chat never switches tabs: the only legal target is the
+            // SSH tab the user is looking at. Strip a hallucinated `session`
+            // and refuse the bridge's tab-switching tool entirely.
+            if mcp_name == "switch_target" {
+                return Err("AI Chat cannot switch SSH tabs. Ask the user to focus the target tab.".into());
+            }
+            let mut safe_args = args.clone();
+            if let Value::Object(map) = &mut safe_args {
+                map.remove("session");
+            }
+            let bridge = app.state::<crate::mcp::Bridge>();
+
+            if mcp_name == "open_host" {
+                let name = args.get("name").and_then(Value::as_str).unwrap_or("");
+                let vault = state.unlocked_vault().await?;
+                let host = find_host(&vault, name).ok_or_else(|| {
+                    format!("No saved host matches '{name}'. Use list_hosts to see saved hosts.")
+                })?;
+                let id = host.id.to_string();
+                let label = host.label.clone();
+                let address = host.address.clone();
+                // Same path as clicking a host in the sidebar: a real SSH tab
+                // with its own session; the UI pins it as the chat target once
+                // connected.
+                let _ = app.emit("rterm:open-host", json!({ "id": id }));
+                append_action(
+                    &session_file(host),
+                    &format!("AI chat opened saved host '{label}' ({address}) in a new tab"),
+                );
+                return Ok(format!(
+                    "Opening saved host '{label}' ({address}) in a new SSH tab. It becomes the active target once connected."
+                ));
+            }
+
+            // The model sometimes calls `execute` or `send_keys` for a TUI.
+            // Launch it correctly with a real Enter and no exit sentinel so
+            // `htop` actually opens instead of sitting typed at the prompt.
+            let command = args.get("command").and_then(Value::as_str);
+            let normalized = command.map(crate::mcp::terminal_keys);
+            let tui = normalized
+                .as_deref()
+                .filter(|value| interactive_command(value))
+                .map(|value| value.trim().to_string());
+            if normalized.as_deref().is_some_and(crate::mcp::nested_ssh_command) {
+                return Ok(
+                    "Already inside the SSH tab — do not run a nested `ssh` command. Run the command directly in this VPS."
+                        .into(),
+                );
+            }
+            let mut launched_tui = false;
+            let mut started_in_background = false;
+            let invoke_name = if mcp_name == "execute" {
+                if let Some(clean) = tui {
+                    launched_tui = true;
+                    if let Value::Object(map) = &mut safe_args {
+                        map.insert("command".into(), json!(clean));
+                    }
+                    "open_tui"
+                } else if normalized
+                    .as_deref()
+                    .map(long_running_command)
+                    .unwrap_or(false)
+                {
+                    started_in_background = true;
+                    if let Value::Object(map) = &mut safe_args {
+                        map.insert("timeout_ms".into(), json!(0));
+                    }
+                    "start_execute"
+                } else {
+                    mcp_name
+                }
+            } else if mcp_name == "send_keys"
+                && args
+                    .get("keys")
+                    .and_then(Value::as_str)
+                    .map(crate::mcp::nested_ssh_command)
+                    .unwrap_or(false)
+            {
+                return Ok(
+                    "Already inside the SSH tab — do not run a nested `ssh` command. Run the command directly in this VPS."
+                        .into(),
+                );
+            } else if mcp_name == "send_keys"
+                && args
+                    .get("keys")
+                    .and_then(Value::as_str)
+                    .map(crate::mcp::looks_like_tui_launch)
+                    .unwrap_or(false)
+            {
+                launched_tui = true;
+                if let Value::Object(map) = &mut safe_args {
+                    let keys = args
+                        .get("keys")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    map.insert("command".into(), json!(crate::mcp::terminal_keys(keys).trim()));
+                    map.remove("keys");
+                }
+                "open_tui"
+            } else if mcp_name == "inspect" {
+                "inspect_terminal"
+            } else if mcp_name == "read_memory" {
+                "read_session"
+            } else if mcp_name == "note_memory" {
+                "note_session"
+            } else {
+                mcp_name
+            };
+            let action_args = safe_args
+                .get("command")
+                .or_else(|| safe_args.get("keys"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let action = format!(
+                "AI chat tool {name}({})",
+                compact_entry(action_args, 200)
+            );
+            let result = match crate::mcp::invoke_tool(app, &bridge, invoke_name, &safe_args) {
+                Ok(result) => {
+                    remember_chat_action(app, &format!("{action} -> ok"));
+                    result
+                }
+                Err(error) => {
+                    remember_chat_action(app, &format!("{action} -> error: {error}"));
+                    return Err(error);
+                }
+            };
+            // Internal session ids belong in the file, never in chat prose.
+            let result = result
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("Session id:"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let result = if launched_tui {
+                format!(
+                    "{result}\nThe command was launched with a real Enter; do not type the word \
+                     'Enter' into the terminal."
+                )
+            } else if started_in_background {
+                format!(
+                    "{result}\nStarted in the background because this command is long-running. \
+                     Use vps_read_stream with this job id if you need the final output; meanwhile \
+                     the command is visible in the focused SSH tab."
+                )
+            } else {
+                result
+            };
+            Ok(cap_tool_text(&result, 16_000))
+        }
         "list_hosts" => {
             let vault = state.unlocked_vault().await?;
             let requested = args
@@ -893,6 +1798,58 @@ async fn run_tool(
                 .map(|note| format!("--- note {} ---\n{}", note.id, note.body))
                 .collect::<Vec<_>>()
                 .join("\n\n"))
+        }
+        "create_note" => {
+            let title = args
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(80)
+                .collect::<String>();
+            let content = args
+                .get("body")
+                .and_then(Value::as_str)
+                .ok_or("body is required")?
+                .trim()
+                .chars()
+                .take(50_000)
+                .collect::<String>();
+            if content.is_empty() {
+                return Err("body must not be empty".into());
+            }
+            let body = if title.is_empty() {
+                content
+            } else {
+                format!("# {title}\n\n{content}")
+            };
+            let favorite = args
+                .get("favorite")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let id = Uuid::new_v4();
+            let note_id = id.to_string();
+            let stamp = now();
+            let label = if title.is_empty() {
+                note_preview(&body)
+            } else {
+                title.clone()
+            };
+            let mut vault = state.unlocked_vault().await?;
+            vault.notes.push(Note {
+                id,
+                body,
+                favorite,
+                created_at: stamp,
+                updated_at: stamp,
+                deleted: false,
+            });
+            let payload = commands::persist_vault(state, vault).await?;
+            let _ = app.emit("rterm:note-created", json!({ "id": note_id, "payload": payload }));
+            Ok(format!(
+                "Note '{label}' saved in your encrypted vault and opened in a new tab."
+            ))
         }
         "list_snippets" => {
             let vault = state.unlocked_vault().await?;
@@ -1242,11 +2199,13 @@ pub async fn chat_config(state: State<'_, AppState>) -> Result<ChatConfig, Strin
             configured: !vault.settings.openrouter_api_key.is_empty(),
             model: vault.settings.openrouter_model.clone(),
             allow_credentials: vault.settings.chat_allow_credentials,
+            allow_vps: vault.settings.chat_allow_vps,
         },
         None => ChatConfig {
             configured: false,
             model: String::new(),
             allow_credentials: false,
+            allow_vps: false,
         },
     })
 }
@@ -1260,6 +2219,7 @@ pub async fn chat_set_key(
     key: String,
     model: String,
     allow_credentials: bool,
+    allow_vps: bool,
     clear: bool,
 ) -> Result<ChatConfig, String> {
     let mut vault = state.unlocked_vault().await?;
@@ -1274,6 +2234,7 @@ pub async fn chat_set_key(
         vault.settings.openrouter_model = model.to_string();
     }
     vault.settings.chat_allow_credentials = allow_credentials;
+    vault.settings.chat_allow_vps = allow_vps;
     vault.settings.updated_at = Some(Utc::now());
     let configured = !vault.settings.openrouter_api_key.is_empty();
     let model = vault.settings.openrouter_model.clone();
@@ -1282,6 +2243,7 @@ pub async fn chat_set_key(
         configured,
         model,
         allow_credentials,
+        allow_vps,
     })
 }
 
@@ -1333,6 +2295,15 @@ async fn fetch_models(state: &AppState) -> Result<Vec<ChatModel>, String> {
 #[tauri::command]
 pub async fn chat_models(state: State<'_, AppState>) -> Result<Vec<ChatModel>, String> {
     fetch_models(&state).await
+}
+
+/// Friendly target for the chat header; no internal session id crosses IPC.
+#[tauri::command]
+pub async fn chat_target(app: tauri::AppHandle) -> Result<Option<ChatTarget>, String> {
+    let bridge = app.state::<crate::mcp::Bridge>();
+    Ok(bridge
+        .target_view()
+        .map(|(name, address)| ChatTarget { name, address }))
 }
 
 /// End-to-end key check: send one tiny prompt and return what the model says.
@@ -1401,13 +2372,13 @@ pub async fn chat_send(
         return Err("Message is too long (8000 characters max)".into());
     }
     let key = openrouter_key(&state).await?;
-    let model = {
+    let (model, allow_vps) = {
         let vault = state.unlocked_vault().await?;
         let model = vault.settings.openrouter_model.trim().to_string();
         if model.is_empty() {
             return Err("OpenRouter model is not set in Settings".into());
         }
-        model
+        (model, vault.settings.chat_allow_vps)
     };
     lock(&state.chat_cancel).remove(&session);
     {
@@ -1420,7 +2391,10 @@ pub async fn chat_send(
 
     let http = client()?;
     let mut turn = 0usize;
+    let mut last_tool_result = String::new();
+    let mut last_tool_name = String::new();
     loop {
+        let _activity = ActivityBeat::start(app.clone());
         if lock(&state.chat_cancel).contains(&session) {
             let _ = app.emit(
                 "chat://done",
@@ -1428,9 +2402,13 @@ pub async fn chat_send(
             );
             return Ok(());
         }
+        let has_target = vps_target_ready(&app, &state);
         let messages: Vec<ChatMessage> = {
             let sessions = lock(&state.chat_sessions);
-            let mut all = vec![ChatMessage::plain("system", system_prompt())];
+            let mut all = vec![ChatMessage::plain(
+                "system",
+                system_prompt_for(allow_vps, has_target),
+            )];
             if let Some(history) = sessions.get(&session) {
                 all.extend(history.iter().cloned());
             }
@@ -1439,8 +2417,20 @@ pub async fn chat_send(
 
         // On the final turn hide the tools so the model must wrap up in text.
         let allow_tools = turn < MAX_TURNS;
-        let (content, calls) =
-            match stream_completion(&app, &session, &http, &key, &model, &messages, allow_tools).await {
+        let (content, calls, _stalled) =
+            match stream_completion(
+                &app,
+                &session,
+                &http,
+                &key,
+                &model,
+                &messages,
+                allow_tools,
+                allow_vps,
+                has_target,
+            )
+            .await
+            {
                 Ok(result) => result,
                 Err(error) => {
                     let _ = app.emit(
@@ -1454,15 +2444,58 @@ pub async fn chat_send(
         let calls = if allow_tools { calls } else { Vec::new() };
 
         if calls.is_empty() {
+            let empty = content.trim().is_empty();
+            // A silent post-tool turn is a model failure, not an answer. Let
+            // the recovery writer inspect the SAME tool result and decide —
+            // for any topic — whether to answer or run one more command.
+            if (empty && turn > 0) || (!empty && looks_unfinished(&content)) {
+                let final_text = recover_after_tools(
+                    &app,
+                    &state,
+                    &session,
+                    &key,
+                    &model,
+                    allow_vps,
+                    last_user_text(&messages),
+                    &content,
+                    &last_tool_name,
+                    &last_tool_result,
+                    has_target && allow_vps,
+                )
+                .await;
+                let mut sessions = lock(&state.chat_sessions);
+                sessions
+                    .entry(session.clone())
+                    .or_default()
+                    .push(ChatMessage::plain("assistant", final_text.clone()));
+                drop(sessions);
+                remember_chat_action(&app, &format!("AI chat reply: {final_text}"));
+                let _ = app.emit(
+                    "chat://done",
+                    json!({ "session": session, "text": final_text, "cancelled": false }),
+                );
+                return Ok(());
+            }
+            // Never end a turn silently after tools ran.
+            let final_text = if empty {
+                if turn > 0 {
+                    fallback_after_tools(&last_tool_result)
+                } else {
+                    "Model sedang tidak merespons. Silakan coba lagi.".to_string()
+                }
+            } else {
+                content.clone()
+            };
             let mut sessions = lock(&state.chat_sessions);
             sessions
                 .entry(session.clone())
                 .or_default()
-                .push(ChatMessage::plain("assistant", content.clone()));
+                .push(ChatMessage::plain("assistant", final_text.clone()));
             drop(sessions);
+            remember_chat_action(&app, &format!("AI chat reply: {final_text}"));
             let _ = app.emit(
                 "chat://done",
-                json!({ "session": session, "text": content, "cancelled": false }),
+                json!({ "session": session, "text": final_text, "cancelled": false }),
             );
             return Ok(());
         }
@@ -1492,9 +2525,11 @@ pub async fn chat_send(
         for call in &calls {
             let args: Value = serde_json::from_str(&call.arguments)
                 .unwrap_or_else(|_| json!({}));
-            let result = run_tool(&app, &state, &session, &call.name, &args)
+            let result = run_tool(&app, &state, &session, &call.name, &args, allow_vps)
                 .await
                 .unwrap_or_else(|error| format!("Tool error: {error}"));
+            last_tool_result = result.clone();
+            last_tool_name = call.name.clone();
             let _ = app.emit(
                 "chat://tool",
                 json!({
@@ -1506,11 +2541,28 @@ pub async fn chat_send(
             let mut sessions = lock(&state.chat_sessions);
             sessions.entry(session.clone()).or_default().push(ChatMessage {
                 role: "tool".into(),
-                content: result,
+                content: result.clone(),
                 tool_calls: None,
                 tool_call_id: Some(call.id.clone()),
                 name: Some(call.name.clone()),
             });
+            let lower = result.to_lowercase();
+            if lower.contains("timed out")
+                || lower.contains("command produced no output")
+                || lower.starts_with("tool error")
+            {
+                sessions.entry(session.clone()).or_default().push(
+                    ChatMessage::plain(
+                        "user",
+                        format!(
+                            "The last tool ({}) FAILED and returned no usable data. Do NOT report \
+                             RAM, disk, process or log values from memory or earlier messages. \
+                             Retry with a different tool or say the check failed.",
+                            call.name
+                        ),
+                    ),
+                );
+            }
         }
 
         turn += 1;
@@ -1694,7 +2746,7 @@ mod tests {
 
     #[test]
     fn tools_cover_app_reads_and_theme_switch() {
-        let list = tools();
+        let list = tools_for(false, true);
         let names: Vec<&str> = list
             .as_array()
             .unwrap()
@@ -1706,6 +2758,7 @@ mod tests {
             "launch_agent",
             "create_host",
             "list_notes",
+            "create_note",
             "get_app_settings",
             "get_sync_status",
             "list_agents",
@@ -1713,5 +2766,156 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
+        assert!(!names.iter().any(|name| name.starts_with("vps_")));
+    }
+
+    #[test]
+    fn vps_tools_are_opt_in() {
+        let list = tools_for(true, true);
+        let names: Vec<&str> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["function"]["name"].as_str().unwrap())
+            .collect();
+        for expected in [
+            "vps_list_targets",
+            "vps_open_host",
+            "vps_inspect",
+            "vps_verify_screen",
+            "vps_execute",
+            "vps_open_tui",
+            "vps_close_tui",
+            "vps_start_execute",
+            "vps_read_stream",
+            "vps_cancel_stream",
+            "vps_send_keys",
+            "vps_read_screen",
+            "vps_read_memory",
+            "vps_note_memory",
+        ] {
+            assert!(names.contains(&expected), "missing tool {expected}");
+        }
+        assert!(!names.contains(&"vps_switch_target"));
+        assert!(system_prompt_for(false, true).contains("VPS control is disabled"));
+        assert!(system_prompt_for(true, true).contains("VPS control is enabled"));
+
+        let no_target = tools_for(true, false);
+        let no_target_names: Vec<&str> = no_target
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(no_target_names.contains(&"list_hosts"));
+        assert!(no_target_names.contains(&"create_note"));
+        let no_target_vps: Vec<&str> = no_target_names
+            .iter()
+            .copied()
+            .filter(|name| name.starts_with("vps_"))
+            .collect();
+        assert_eq!(no_target_vps, vec!["vps_list_targets", "vps_open_host"]);
+        assert!(system_prompt_for(true, false).contains("NO SSH TAB IS FOCUSED"));
+        assert!(system_prompt_for(true, false).contains("call `list_hosts`"));
+    }
+
+    #[test]
+    fn unfinished_answers_are_detected() {
+        assert!(looks_unfinished("Sekarang saya cek konfigurasi nginx dan SSL."));
+        assert!(looks_unfinished("I'll check the disk usage now."));
+        assert!(looks_unfinished("Baik, saya coba jalankan apt update."));
+        assert!(!looks_unfinished("RAM 522 MiB / 5.78 GiB (9%). Disk 8.56 GiB / 18.25 GiB (47%)."));
+    }
+
+    #[test]
+    fn recovery_can_propose_a_note_artifact() {
+        let parsed = proposed_note("CREATE_NOTE: Nginx check\nPanel listen 80;\nSSL aktif sampai 2027.").unwrap();
+        assert_eq!(parsed.0, "Nginx check");
+        assert_eq!(parsed.1, "Panel listen 80;\nSSL aktif sampai 2027.");
+        assert!(proposed_note("CREATE_NOTE: only a title").is_none());
+        assert!(proposed_note("No artifact here.").is_none());
+    }
+
+    #[test]
+    fn note_preview_matches_the_ui_title() {
+        assert_eq!(note_preview("# Rekap nginx\n\nDetail ..."), "Rekap nginx");
+        assert_eq!(note_preview("\n\nfirst body line"), "first body line");
+    }
+
+    #[test]
+    fn nested_ssh_is_blocked_before_it_reaches_the_vps() {
+        assert!(crate::mcp::nested_ssh_command("ssh root@109.123.235.168 -p 20153 'free -h'"));
+        assert!(crate::mcp::nested_ssh_command("sudo ssh root@example.com"));
+        assert!(!crate::mcp::nested_ssh_command("sshd -T | grep PermitRootLogin"));
+        assert!(!crate::mcp::nested_ssh_command("grep -R 'ssh' /etc/nginx"));
+    }
+
+    #[test]
+    fn recovery_parses_any_next_command_without_topic_keywords() {
+        let a = proposed_command("Need to look at the config.\nNEED_COMMAND: `grep -R server_name /etc/nginx`");
+        assert_eq!(a.as_deref(), Some("grep -R server_name /etc/nginx"));
+        let b = proposed_command("need_command: $ df -h");
+        assert_eq!(b.as_deref(), Some("df -h"));
+        assert_eq!(proposed_command("RAM is 9% used, disk 47%."), None);
+    }
+
+    #[test]
+    fn long_commands_are_detected() {
+        for command in [
+            "apt update",
+            "sudo apt-get install nginx",
+            "npm ci",
+            "cargo build --release",
+            "docker compose up -d",
+            "nginx -T | grep server_name",
+        ] {
+            assert!(long_running_command(command), "missed {command}");
+        }
+        for command in [
+            "apt --version",
+            "ls -la",
+            "echo apt update",
+            "nginx -t",
+            "uptime",
+            "htop",
+            "tail -f /var/log/syslog",
+        ] {
+            assert!(!long_running_command(command), "false positive: {command}");
+        }
+    }
+
+    #[test]
+    fn interactive_commands_are_detected() {
+        for command in [
+            "htop",
+            "htopEnter",
+            "sudo htop",
+            "vim /etc/nginx/nginx.conf",
+            "nano",
+            "less /var/log/syslog",
+            "tail -f /var/log/syslog",
+            "journalctl -f",
+        ] {
+            assert!(interactive_command(command), "missed {command}");
+        }
+        for command in ["apt update", "ls -la", "uptime", "echo htop"] {
+            assert!(!interactive_command(command), "false positive: {command}");
+        }
+    }
+
+    #[test]
+    fn empty_tool_turns_still_produce_a_visible_reply() {
+        let plain = fallback_after_tools("Disk usage: 42%");
+        assert!(plain.contains("42%"));
+        let empty = fallback_after_tools("   ");
+        assert!(empty.contains("Coba ulangi"));
+    }
+
+    #[test]
+    fn tool_output_is_capped_without_losing_the_tail() {
+        let text = "A".repeat(100) + "TAIL";
+        let capped = cap_tool_text(&text, 20);
+        assert!(capped.contains("truncated"));
+        assert!(capped.ends_with("TAIL"));
     }
 }

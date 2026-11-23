@@ -6,9 +6,11 @@
     errorText,
     type ChatApproval,
     type ChatConfig,
+    type ChatTarget,
   } from '#lib/api';
   import { app } from '#lib/state.svelte';
   import { applyTheme } from '#lib/ui.svelte';
+  import { renderSafeMarkdown } from '#lib/markdown';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import Icon from './Icon.svelte';
 
@@ -89,7 +91,13 @@
     }
   }
 
-  let cfg = $state<ChatConfig>({ configured: false, model: '', allow_credentials: false });
+  let cfg = $state<ChatConfig>({
+    configured: false,
+    model: '',
+    allow_credentials: false,
+    allow_vps: false,
+  });
+  let target = $state<ChatTarget | null>(null);
   let open = $state(false);
 
   function setOpen(value: boolean) {
@@ -108,6 +116,43 @@
   let hydrated = $state(false);
   let loadedKey = $state('');
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
+  let watchdog: ReturnType<typeof setInterval> | null = null;
+  let lastActivity = 0;
+
+  function stopWatchdog() {
+    if (watchdog) clearInterval(watchdog);
+    watchdog = null;
+  }
+
+  function touch() {
+    lastActivity = Date.now();
+  }
+
+  /** A hung stream or an unanswered approval must never lock the composer. */
+  function startWatchdog() {
+    stopWatchdog();
+    touch();
+    watchdog = setInterval(() => {
+      if (!busy) return stopWatchdog();
+      if (Date.now() - lastActivity < 75_000) return;
+      const last = messages[messages.length - 1];
+      if (last?.role === 'assistant' && !last.text) last.text = '(response timed out)';
+      error = 'No response for 75 seconds. Generation stopped — try again.';
+      approval = null;
+      void api.chatCancel(SESSION).catch(() => {});
+      busy = false;
+      stopWatchdog();
+    }, 2_000);
+  }
+
+  async function focusInput() {
+    await tick();
+    inputEl?.focus();
+  }
+
+  $effect(() => {
+    if (open && hydrated) void focusInput();
+  });
 
   async function refreshConfig() {
     try {
@@ -118,10 +163,19 @@
     }
   }
 
+  async function refreshTarget() {
+    try {
+      target = await api.chatTarget();
+    } catch {
+      target = null;
+    }
+  }
+
   function appendDelta(text: string) {
     // Ignore late/duplicate stream events (e.g. from a leaked listener during
     // dev HMR) — they must never be appended to a finished reply.
     if (!busy || !text) return;
+    touch();
     const last = messages[messages.length - 1];
     if (last?.role === 'assistant') last.text += text;
     else messages.push({ role: 'assistant', text });
@@ -147,17 +201,24 @@
     messages.push({ role: 'user', text });
     messages.push({ role: 'assistant', text: '' });
     busy = true;
+    startWatchdog();
+    void focusInput();
     try {
       await api.chatSend(SESSION, text);
     } catch (cause) {
       error = errorText(cause);
       busy = false;
+      stopWatchdog();
+      void focusInput();
     }
   }
 
   function stop() {
     void api.chatCancel(SESSION).catch(cause => (error = errorText(cause)));
+    approval = null;
     busy = false;
+    stopWatchdog();
+    void focusInput();
   }
 
   function answer(choice: 'deny' | 'allow' | 'always') {
@@ -194,6 +255,7 @@
     loadedKey = initialKey;
     hydrated = true;
     void refreshConfig();
+    void refreshTarget();
     const unlisteners: UnlistenFn[] = [];
     let disposed = false;
     const on = <T>(name: string, handler: (payload: T) => void) => {
@@ -212,6 +274,9 @@
         .catch(() => {});
     };
 
+    // Rust emits this while a tool or recovery model call is still running.
+    // It deliberately renders nothing — it only keeps the watchdog honest.
+    on('chat://activity', () => touch());
     on<{ text: string }>('chat://delta', payload => appendDelta(payload.text));
     on<{ text: string; cancelled: boolean }>('chat://done', payload => {
       // The backend sends the complete final text. Use it as the source of
@@ -228,11 +293,15 @@
         }
       }
       busy = false;
+      stopWatchdog();
+      void focusInput();
       pruneEmptyBubbles();
     });
     on<{ message: string }>('chat://error', payload => {
       error = payload.message;
       busy = false;
+      stopWatchdog();
+      void focusInput();
     });
     on<{ name: string; preview: string }>('chat://tool', payload => {
       // The streaming placeholder is empty until real text arrives. A tool
@@ -241,8 +310,10 @@
       const last = messages[messages.length - 1];
       if (last?.role === 'assistant' && !last.text) messages.pop();
       messages.push({ role: 'tool', name: payload.name, text: payload.preview });
+      touch();
     });
     on<ChatApproval>('chat://approval', payload => (approval = payload));
+    on<ChatTarget>('rterm:mcp-target', payload => (target = payload));
     // The `set_theme` tool asks the renderer to persist/apply the choice.
     on<string>('rterm:set-theme', theme => {
       if (theme === 'dark' || theme === 'light') applyTheme(theme);
@@ -253,6 +324,7 @@
     return () => {
       disposed = true;
       if (saveTimer) clearTimeout(saveTimer);
+      stopWatchdog();
       unlisteners.forEach(fn => fn());
       window.removeEventListener('rterm:chat-updated', onUpdated);
     };
@@ -265,6 +337,7 @@
       approval = null;
       busy = false;
       error = '';
+      stopWatchdog();
     }
   });
 
@@ -314,7 +387,13 @@
         <span class="chat-logo"><Icon name="spark" size={16} /></span>
         <div class="chat-heading">
           <strong>RuTerm AI Chat</strong>
-          <small>{cfg.model || 'OpenRouter'}</small>
+          <small title={cfg.allow_vps && target ? `${target.name} — ${target.address}` : undefined}>
+            {cfg.allow_vps
+              ? target
+                ? `${target.name} · ${cfg.model || 'OpenRouter'}`
+                : `No SSH tab focused · ${cfg.model || 'OpenRouter'}`
+              : cfg.model || 'OpenRouter'}
+          </small>
         </div>
       </div>
       <div class="head-actions">
@@ -355,8 +434,17 @@
             <button type="button" disabled={busy || !cfg.configured} onclick={() => void send('List my saved hosts')}>List my saved hosts</button>
             <button type="button" disabled={busy || !cfg.configured} onclick={() => void send('Summarize my notes')}>Summarize my notes</button>
             <button type="button" disabled={busy || !cfg.configured} onclick={() => void send('Show snippets for deploying')}>Show deploy snippets</button>
+            {#if cfg.allow_vps}
+              <button type="button" disabled={busy || !cfg.configured || !target} onclick={() => void send('Check disk space on this VPS')}>Check disk space on this VPS</button>
+            {/if}
           </div>
-          <p class="scope">Reads vault data and writes config only — never runs VPS commands.</p>
+          <p class="scope">
+            {cfg.allow_vps
+              ? target
+                ? 'Can read vault data and drive the focused SSH tab. Risky commands ask for approval.'
+                : 'SSH control is on, but no tab is focused. Open a saved host first — ask me to open it for you.'
+              : 'Reads vault data and writes config only. Enable SSH control in Settings to run VPS commands.'}
+          </p>
         </div>
       {:else}
         <div class="thread">
@@ -368,6 +456,8 @@
                 <div class="bubble" class:placeholder={bubble.role === 'assistant' && bubble.text === '' && busy}>
                   {#if bubble.text === '' && bubble.role === 'assistant' && busy}
                     <span class="dots"><i></i><i></i><i></i></span>
+                  {:else if bubble.role === 'assistant'}
+                    {@html renderSafeMarkdown(bubble.text)}
                   {:else}
                     {bubble.text}
                   {/if}
@@ -616,7 +706,7 @@
   }
   .chat-drawer.tab .bubble {
     max-width: 82%;
-    font-size: 14px;
+    font-size: 15px;
   }
   .chat-drawer.tab .head-actions {
     gap: 6px;
@@ -637,7 +727,7 @@
     color: var(--accent);
   }
   .empty h2 { margin: 14px 0 4px; font-size: 16px; font-weight: 600; }
-  .empty p { margin: 0; font-size: 12.5px; line-height: 1.6; color: var(--text-secondary); }
+  .empty p { margin: 0; font-size: 13.5px; line-height: 1.6; color: var(--text-secondary); }
   .empty .scope { margin-top: 16px; color: var(--text-tertiary); font-size: 11px; }
   .suggestions { display: flex; flex-direction: column; gap: 6px; margin-top: 16px; }
   .suggestions button {
@@ -646,7 +736,7 @@
     border-radius: 9px;
     background: var(--bg-elevated);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: 12.5px;
     cursor: pointer;
   }
   .suggestions button:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
@@ -660,10 +750,27 @@
     border-radius: 14px 14px 14px 4px;
     background: var(--bg-elevated);
     border: 1px solid var(--line);
-    font-size: 13px;
-    line-height: 1.6;
+    font-size: 15.5px;
+    line-height: 1.65;
     white-space: pre-wrap;
     word-break: break-word;
+  }
+  .bubble :global(p) { margin: 0; }
+  .bubble :global(p + p) { margin-top: 6px; }
+  .bubble :global(strong) { font-weight: 650; color: var(--text); }
+  .bubble :global(a) {
+    color: var(--accent);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    cursor: pointer;
+  }
+  .bubble :global(a:hover) { filter: brightness(1.15); }
+  .bubble :global(code) {
+    padding: 1px 4px;
+    border-radius: 4px;
+    background: var(--bg-elevated-2, rgba(127, 127, 127, 0.16));
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 0.92em;
   }
   .mine .bubble {
     border-color: transparent;
@@ -692,7 +799,7 @@
     border: 1px solid var(--line);
     border-radius: 999px;
     color: var(--ok);
-    font-size: 11px;
+    font-size: 11.5px;
   }
   .tool-chip span {
     color: var(--text-tertiary);
@@ -727,7 +834,7 @@
   }
   .chat-drawer.tab .composer textarea {
     min-height: 84px;
-    font-size: 14px;
+    font-size: 15px;
     border-radius: 16px;
     padding: 14px 58px 14px 16px;
   }
@@ -736,7 +843,7 @@
   }
   .composer textarea {
     min-height: 56px;
-    font-size: 13px;
+    font-size: 14px;
     border-radius: 16px;
     padding: 11px 54px 11px 13px;
     resize: none;

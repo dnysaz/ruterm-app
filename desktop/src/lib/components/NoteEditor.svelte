@@ -52,6 +52,17 @@
     return () => window.removeEventListener('beforeunload', onBeforeUnload);
   });
 
+  // Local AI agents can edit this note through the MCP bridge while its tab is
+  // already open. Adopt their changes, but never clobber unsaved local typing.
+  $effect(() => {
+    const incoming = note.body;
+    if (incoming === saved) return;
+    if (editing && text !== saved) return;
+    text = incoming;
+    saved = incoming;
+    if (incoming.trim().length === 0) editing = true;
+  });
+
   onDestroy(() => {
     flush();
   });

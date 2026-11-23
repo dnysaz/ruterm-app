@@ -23,10 +23,16 @@
   let restoreScrollback = $state(isRestoreEnabled());
 
   // BYOK AI chat. Rust only exposes key *status*, never the key itself.
-  let chatCfg = $state<ChatConfig>({ configured: false, model: '', allow_credentials: false });
+  let chatCfg = $state<ChatConfig>({
+    configured: false,
+    model: '',
+    allow_credentials: false,
+    allow_vps: false,
+  });
   let chatKeyInput = $state('');
   let chatModelInput = $state('');
   let chatAllow = $state(false);
+  let chatAllowVps = $state(false);
   let chatShowKey = $state(false);
   let chatBusy = $state(false);
   let chatStatus = $state('');
@@ -91,6 +97,7 @@
       chatCfg = await api.chatConfig();
       chatModelInput = chatCfg.model;
       chatAllow = chatCfg.allow_credentials;
+      chatAllowVps = chatCfg.allow_vps;
       await loadChatModels();
     } catch (error) {
       chatStatus = errorText(error);
@@ -106,7 +113,7 @@
     chatBusy = true;
     chatStatus = '';
     try {
-      chatCfg = await api.chatSetKey(chatKeyInput, chatModelInput, chatAllow, clear);
+      chatCfg = await api.chatSetKey(chatKeyInput, chatModelInput, chatAllow, chatAllowVps, clear);
       chatKeyInput = '';
       chatStatus = clear
         ? 'API key removed.'
@@ -467,6 +474,23 @@
             />
           </label>
 
+          <label class="chat-field chat-switch-field">
+            <div class="chat-label">
+              <div class="strong">Allow AI Chat to control SSH tabs</div>
+              <small>
+                Off by default. When on, the chat types commands into the focused VPS tab. Risky
+                commands still need Deny / Allow / Always allow.
+              </small>
+            </div>
+            <input
+              type="checkbox"
+              class="switch"
+              checked={chatAllowVps}
+              onchange={event => (chatAllowVps = event.currentTarget.checked)}
+              aria-label="Allow AI Chat to control SSH tabs"
+            />
+          </label>
+
           <div class="chat-actions">
             <span
               class="chat-status"
@@ -491,8 +515,8 @@
         </div>
         <p class="hint chat-hint">
           Once a key is saved, a floating chat button appears in the bottom-right corner. The key
-          syncs encrypted to D1 like the rest of your vault. Chat reads data and writes config only —
-          it never runs VPS commands.
+          syncs encrypted to D1 like the rest of your vault. VPS control stays off until you enable
+          it above; “Always allow” applies only to the exact command and resets on restart.
         </p>
       </section>
 
