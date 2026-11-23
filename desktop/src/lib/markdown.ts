@@ -80,3 +80,43 @@ export function renderSafeMarkdown(
 function escapeHtml(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
+
+export type ChatSegment =
+  | { kind: 'text'; text: string }
+  | { kind: 'code'; text: string; label: string };
+
+const FENCED_CODE = /```([^\n`]*)\n([\s\S]*?)```/g;
+
+function looksLikeShell(code: string): boolean {
+  return /^\s*(?:sudo|apt(?:-get)?|yum|dnf|brew|cd|ls|cat|echo|curl|wget|ssh|scp|rsync|systemctl|service|nginx|docker|git|mkdir|chmod|chown|python3?|node|npm|pnpm|yarn|tail|grep|awk|sed|df|du|top|htop)\b/m.test(
+    code,
+  );
+}
+
+/**
+ * Split a chat reply into prose and fenced code blocks. Rendering code as its
+ * own card (instead of inside the markdown HTML) gives every block a language
+ * label and a dedicated Copy button.
+ */
+export function parseChatSegments(markdown: string): ChatSegment[] {
+  const source = markdown ?? '';
+  const segments: ChatSegment[] = [];
+  let cursor = 0;
+  FENCED_CODE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = FENCED_CODE.exec(source))) {
+    const prose = source.slice(cursor, match.index).trim();
+    if (prose) segments.push({ kind: 'text', text: prose });
+    const language = match[1].trim().toLowerCase();
+    const code = match[2].replace(/\n$/, '');
+    segments.push({
+      kind: 'code',
+      text: code,
+      label: language || (looksLikeShell(code) ? 'bash' : 'code'),
+    });
+    cursor = FENCED_CODE.lastIndex;
+  }
+  const tail = source.slice(cursor).trim();
+  if (tail) segments.push({ kind: 'text', text: tail });
+  return segments;
+}

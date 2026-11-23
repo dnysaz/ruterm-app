@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
@@ -812,6 +812,10 @@ async fn mark_synced(state: &AppState, revision: i64) {
     let _ = store::write_settings(&state.paths.settings, &settings);
 }
 
+/// Serialises the read → seal → write cycle. Autosave, sync and AI tools can
+/// all reach the vault at once; without this they race on the same file.
+static VAULT_IO: AsyncMutex<()> = AsyncMutex::const_new(());
+
 /// Seals `vault` into the on-disk file and keeps in-memory state in sync.
 pub(crate) async fn persist_vault(
     state: &AppState,
@@ -821,6 +825,7 @@ pub(crate) async fn persist_vault(
     let key = state.unlocked_key().await?;
     vault.updated_at = Some(Utc::now());
 
+    let _vault_io = VAULT_IO.lock().await;
     let mut file = store::read(&state.paths.vault)?
         .unwrap_or_else(|| VaultFile::new(&state.settings.device_id, None, String::new()));
     if file.kdf.is_none() {
@@ -902,6 +907,7 @@ pub async fn vault_sync(state: tauri::State<'_, AppState>) -> Result<VaultPayloa
     let mut client = BridgeClient::new(&bridge_url);
     client.set_token(Some(token));
 
+    let _vault_io = VAULT_IO.lock().await;
     let mut file = store::read(&state.paths.vault)?
         .unwrap_or_else(|| VaultFile::new(&state.settings.device_id, None, String::new()));
     if file.kdf.is_none() {

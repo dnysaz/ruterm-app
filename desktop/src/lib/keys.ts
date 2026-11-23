@@ -1,4 +1,5 @@
 import { zoomIn, zoomOut, zoomReset } from '#lib/ui.svelte';
+import { requestSoftReload } from '#lib/state.svelte';
 
 const isMac = navigator.platform.toLowerCase().includes('mac');
 
@@ -41,7 +42,9 @@ export function installShortcuts(): () => void {
         return;
       case 'r':
         event.preventDefault();
-        window.location.reload();
+        // Refresh RuTerm's data only — never remount the webview or close the
+        // open notes, chat and terminal sessions.
+        requestSoftReload();
         return;
       case 't':
         event.preventDefault();

@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -93,8 +94,11 @@ pub fn read(path: &Path) -> Result<Option<VaultFile>, String> {
     }
 }
 
+static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Atomic write: the old file is copied to `.bak`, the new one is flushed to
-/// `.tmp` and renamed over the target, so a crash never leaves half a file.
+/// a unique `.tmp` and renamed over the target, so a crash never leaves half a
+/// file and two writers can never truncate each other's temp file.
 pub fn write_atomic(path: &Path, file: &VaultFile) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
@@ -106,7 +110,8 @@ pub fn write_atomic(path: &Path, file: &VaultFile) -> Result<(), String> {
         let _ = restrict_file(&backup);
     }
     let text = serde_json::to_string_pretty(file).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
+    let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), seq));
     {
         #[cfg(unix)]
         let mut out = fs::OpenOptions::new()
@@ -261,7 +266,8 @@ pub fn remember_fingerprint(
         restrict_dir(dir)?;
     }
     let text = serde_json::to_string_pretty(&pins).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
+    let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), seq));
     {
         #[cfg(unix)]
         let mut out = fs::OpenOptions::new()

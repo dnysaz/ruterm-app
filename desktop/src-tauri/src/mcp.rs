@@ -187,6 +187,13 @@ impl Bridge {
         }
     }
 
+    /// Forget a closed terminal so the next tool call pins a live tab again.
+    pub fn clear_target(&self) {
+        if let Ok(mut target) = self.target.lock() {
+            *target = None;
+        }
+    }
+
     /// Friendly name/address of the pinned target, safe to show in the UI.
     /// Internal session ids are never exposed.
     pub fn target_view(&self) -> Option<(String, String)> {
@@ -722,6 +729,11 @@ fn tool_definitions() -> Value {
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
         },
         {
+            "name": "close_terminal",
+            "description": "Close the currently focused SSH terminal tab in RuTerm. Only the live tab is closed; the saved host and vault data remain. Local agent terminals are never targets.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+        },
+        {
             "name": "execute",
             "description": "Type a command into the remote VPS terminal and return its output. The command is visibly typed in the user's SSH tab. Use this instead of local shell tools for server work.",
             "inputSchema": {
@@ -946,6 +958,30 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "open_note",
+            "description": "Open an existing note from the encrypted vault in a new RuTerm tab. Find its id with list_notes or read_note first. Use this when the user asks to open/show/view a saved note — not only after creating one.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Note id from list_notes or read_note." }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "close_note",
+            "description": "Close a note tab in RuTerm without deleting the note. Find its id with list_notes or read_note first. Use this when the user asks to close/tutup a note tab — never say tabs cannot be closed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Note id from list_notes or read_note." }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }
+        },
+        {
             "name": "update_note",
             "description": "Edit an existing note by id (from list_notes), replacing or appending to its body, then refresh its open tab. Use this when the user asks to edit, update or add to a note.",
             "inputSchema": {
@@ -959,6 +995,16 @@ fn tool_definitions() -> Value {
                 "required": ["id", "body"],
                 "additionalProperties": false
             }
+        },
+        {
+            "name": "delete_note",
+            "description": "Delete an existing note from the encrypted vault by id (from list_notes). Use this when the user asks to delete/remove a note.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string", "description": "Note id from list_notes." } },
+                "required": ["id"],
+                "additionalProperties": false
+            }
         }
     ])
 }
@@ -968,8 +1014,11 @@ fn tool_definitions() -> Value {
 const VAULT_TOOLS_HINT: &str = "RuTerm vault tools: ruterm_list_hosts lists every SAVED SSH host \
  (ruterm_list_targets only shows currently OPEN tabs); ruterm_get_host details one host. \
  ruterm_list_notes + ruterm_read_note find notes; ruterm_create_note writes a note and opens it in \
- a new tab, ruterm_update_note edits one by id and refreshes its tab. Use these whenever the user \
- asks which hosts they have, or asks to save, recap or edit a note — no local file writing is needed.";
+ a new tab, ruterm_open_note opens an EXISTING saved note in a new tab by id, ruterm_close_note \
+ closes a note tab without deleting it, ruterm_update_note edits one by id and refreshes its tab, \
+ and ruterm_delete_note removes one by id. ruterm_close_terminal closes the focused SSH tab without \
+ deleting the saved host. Use these whenever the user asks which hosts they have, or asks to save, \
+ recap, open, close, edit or delete a note/tab — no local file writing is needed.";
 
 fn target_instructions(app: &tauri::AppHandle, bridge: &Bridge) -> String {
     match resolve_target(app, bridge, None) {
@@ -1299,6 +1348,13 @@ pub(crate) fn call_tool(
                     bridge.session_file(&active).display()
                 )
             }
+        }
+        "close_terminal" => {
+            let session = resolve_target(app, bridge, None).map_err(|error| (-32000, error))?;
+            let label = bridge.display_name(&session);
+            let _ = app.emit("rterm:close-terminal", json!({ "id": session }));
+            bridge.clear_target();
+            format!("Closed terminal tab '{label}'. The saved host is unchanged.")
         }
         "execute" => {
             let command = args
@@ -1828,6 +1884,110 @@ pub(crate) fn call_tool(
             })
             .map_err(|error| (-32000, error))?
         }
+        "close_note" => {
+            let id = args
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let query = args
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
+            vault_call(app, move |app| async move {
+                let state = app.state::<AppState>();
+                let vault = state.unlocked_vault().await?;
+                let found = if !id.is_empty() {
+                    vault
+                        .notes
+                        .iter()
+                        .find(|note| !note.deleted && note.id.to_string() == id)
+                } else if !query.is_empty() {
+                    let matches: Vec<_> = vault
+                        .notes
+                        .iter()
+                        .filter(|note| {
+                            !note.deleted
+                                && (note.body.to_lowercase().contains(&query)
+                                    || crate::chat::note_preview(&note.body)
+                                        .to_lowercase()
+                                        .contains(&query))
+                        })
+                        .collect();
+                    if matches.len() > 1 {
+                        return Err(format!(
+                            "More than one note matches '{query}'. Use list_notes and pass the exact id."
+                        ));
+                    }
+                    matches.first().copied()
+                } else {
+                    None
+                };
+                let found = found
+                    .ok_or_else(|| "No matching note. Use list_notes to find its id.".to_string())?;
+                let note_id = found.id.to_string();
+                let label = crate::chat::note_preview(&found.body);
+                let _ = app.emit("rterm:close-note", json!({ "id": note_id }));
+                Ok(format!(
+                    "Note '{label}' tab closed. The note is still saved in your vault."
+                ))
+            })
+            .map_err(|error| (-32000, error))?
+        }
+        "open_note" => {
+            let id = args
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let query = args
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
+            vault_call(app, move |app| async move {
+                let state = app.state::<AppState>();
+                let vault = state.unlocked_vault().await?;
+                let found = if !id.is_empty() {
+                    vault
+                        .notes
+                        .iter()
+                        .find(|note| !note.deleted && note.id.to_string() == id)
+                } else if !query.is_empty() {
+                    let matches: Vec<_> = vault
+                        .notes
+                        .iter()
+                        .filter(|note| {
+                            !note.deleted
+                                && (note.body.to_lowercase().contains(&query)
+                                    || crate::chat::note_preview(&note.body)
+                                        .to_lowercase()
+                                        .contains(&query))
+                        })
+                        .collect();
+                    if matches.len() > 1 {
+                        return Err(format!(
+                            "More than one note matches '{query}'. Use list_notes and pass the exact id."
+                        ));
+                    }
+                    matches.first().copied()
+                } else {
+                    None
+                };
+                let found = found
+                    .ok_or_else(|| "No matching note. Use list_notes to find its id.".to_string())?;
+                let note_id = found.id.to_string();
+                let label = crate::chat::note_preview(&found.body);
+                let _ = app.emit("rterm:note-open", json!({ "id": note_id }));
+                Ok(format!("Note '{label}' opened in a new tab."))
+            })
+            .map_err(|error| (-32000, error))?
+        }
         "update_note" => {
             let id = args
                 .get("id")
@@ -1876,6 +2036,31 @@ pub(crate) fn call_tool(
                 Ok(format!(
                     "Note '{label}' updated in your encrypted vault. Its tab has been refreshed."
                 ))
+            })
+            .map_err(|error| (-32000, error))?
+        }
+        "delete_note" => {
+            let id = args
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or((-32602, "id is required".into()))?
+                .trim()
+                .to_string();
+            vault_call(app, move |app| async move {
+                let state = app.state::<AppState>();
+                let mut vault = state.unlocked_vault().await?;
+                let note = vault
+                    .notes
+                    .iter_mut()
+                    .find(|note| !note.deleted && note.id.to_string() == id)
+                    .ok_or_else(|| format!("No note with id '{id}'. Use list_notes to find it."))?;
+                note.deleted = true;
+                note.updated_at = now();
+                let label = crate::chat::note_preview(&note.body);
+                let note_id = note.id.to_string();
+                let payload = crate::commands::persist_vault(&state, vault).await?;
+                let _ = app.emit("rterm:note-deleted", json!({ "id": note_id, "payload": payload }));
+                Ok(format!("Note '{label}' deleted from your encrypted vault."))
             })
             .map_err(|error| (-32000, error))?
         }
@@ -2864,12 +3049,16 @@ mod tests {
             .collect();
         for expected in [
             "list_targets",
+            "close_terminal",
             "list_hosts",
             "get_host",
             "list_notes",
             "read_note",
             "create_note",
+            "open_note",
+            "close_note",
             "update_note",
+            "delete_note",
         ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
         }
@@ -2887,6 +3076,10 @@ mod tests {
         assert!(description.contains("list_targets"));
         assert!(VAULT_TOOLS_HINT.contains("ruterm_list_hosts"));
         assert!(VAULT_TOOLS_HINT.contains("ruterm_create_note"));
+        assert!(VAULT_TOOLS_HINT.contains("ruterm_open_note"));
+        assert!(VAULT_TOOLS_HINT.contains("ruterm_close_note"));
+        assert!(VAULT_TOOLS_HINT.contains("ruterm_close_terminal"));
         assert!(VAULT_TOOLS_HINT.contains("ruterm_update_note"));
+        assert!(VAULT_TOOLS_HINT.contains("ruterm_delete_note"));
     }
 }

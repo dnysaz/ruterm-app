@@ -130,3 +130,24 @@ export function languageForPath(path: string): string {
   if (dot <= 0) return 'plaintext';
   return BY_EXTENSION[name.slice(dot + 1)] ?? 'plaintext';
 }
+
+/** Whole label aliases used by fenced code blocks in notes and AI chat. */
+const LABEL_ALIASES: Record<string, string> = {
+  text: 'plaintext',
+  txt: 'plaintext',
+  code: 'plaintext',
+  console: 'plaintext',
+  log: 'plaintext',
+  shellsession: 'shell',
+  shell: 'shell',
+  bash: 'shell',
+  zsh: 'shell',
+  sh: 'shell',
+};
+
+/** Map a fenced-code label (e.g. `bash`, `ts`) to a Monaco language id. */
+export function languageForLabel(label: string): string {
+  const key = label.trim().toLowerCase().replace(/^\./, '');
+  if (!key) return 'plaintext';
+  return LABEL_ALIASES[key] ?? BY_EXTENSION[key] ?? key;
+}

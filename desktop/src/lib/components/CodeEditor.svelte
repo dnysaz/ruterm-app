@@ -4,7 +4,7 @@
   let monacoPromise: Promise<MonacoApi> | null = null;
 
   /** Monaco is heavy and browser-only, so it is imported lazily, once, on mount. */
-  async function loadMonaco(): Promise<MonacoApi> {
+  export async function loadMonaco(): Promise<MonacoApi> {
     if (!monacoPromise) {
       monacoPromise = (async () => {
         const [monaco, editorWorker, jsonWorker, cssWorker, htmlWorker, tsWorker] =

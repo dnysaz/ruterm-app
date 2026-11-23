@@ -1,11 +1,24 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { app, bootstrap } from '#lib/state.svelte';
+  import { app, bootstrap, setSoftReloadHandler } from '#lib/state.svelte';
   import { installShortcuts } from '#lib/keys';
   import { restoreTheme, restoreZoom } from '#lib/ui.svelte';
   import Welcome from '#lib/components/Welcome.svelte';
   import Unlock from '#lib/components/Unlock.svelte';
   import VaultShell from '#lib/components/VaultShell.svelte';
+
+  /**
+   * Cmd/Ctrl+R refreshes RuTerm's data from the backend. It deliberately does
+   * NOT remount VaultShell: open notes, the AI chat and live SSH terminals must
+   * keep their tabs and terminal state across a refresh.
+   */
+  function softReload() {
+    void bootstrap({ skipAuthRestore: true });
+  }
+
+  // A direct callback survives HMR cleanly; a window listener would leave the
+  // previous closure behind and that one still closed every open tab.
+  setSoftReloadHandler(softReload);
 
   onMount(() => {
     restoreTheme();

@@ -352,7 +352,9 @@ fn system_prompt_for(allow_vps: bool, has_target: bool) -> String {
      launch a detected AI agent in a local tab, and save a new SSH host and open it in a terminal \
      tab. \
      Always call a tool for facts — never invent host names, addresses, note contents, settings, \
-     sync state, or command output. Credential fields are omitted by default and only appear after \
+     sync state, or command output. For current, recent or uncertain facts (news, versions, prices, \
+     docs), call `web_search` first and cite the URLs it returns — never guess from memory. \
+     Credential fields are omitted by default and only appear after \
      the user explicitly approves a read; API keys and tokens are never exposed. Other config \
      writes require approval. When the user asks to change the theme, call `set_theme` immediately \
      — do not merely say that you can. When the user asks to open/start an AI agent from \
@@ -362,7 +364,16 @@ fn system_prompt_for(allow_vps: bool, has_target: bool) -> String {
      save/open a host, call `create_host` with those exact values; it asks for confirmation and \
      opens the SSH tab automatically. When the user asks to record, recap, or save a result into \
      a RuTerm note, call `create_note` immediately with the full summary in `body` and a short \
-     `title` — never merely say you will save it. The note opens in a new tab automatically. \
+     `title` — never merely say you will save it. The `body` is plain markdown, not a JSON-escaped string: write punctuation once, never pile up backslashes, and never paste the same summary twice into one body. The note opens in a new tab automatically. \
+     Notes are fully editable: find one with `list_notes`/`read_note`, then call `update_note` to \
+     replace its body or pass `append: true` to add text at the end, or `delete_note` to remove it. \
+     Never claim you cannot edit or delete a note — call the tool. `delete_note` asks for confirmation. \
+     To open an existing saved note in a new tab, call `open_note` with its id from `list_notes` or \
+     `read_note` — never say only newly created notes can be opened. To close a note tab without \
+     deleting the note, call `close_note` with its id — never say you cannot close note tabs. \
+     When the user asks to clear/erase/reset the chat history, call `clear_chat_history`: a \
+     confirmation dialog appears and nothing is removed until the user confirms. Never claim the \
+     history is cleared before they confirm. \
      Never invent a password. Always answer in the same language \
      as the user's latest message (Indonesian in, Indonesian out). Be concise and refer to hosts \
      by their saved labels rather than internal ids.";
@@ -412,8 +423,11 @@ fn system_prompt_for(allow_vps: bool, has_target: bool) -> String {
              the VPS terminal and new output must be captured. NEVER type a nested `ssh` command inside \
              an already-open VPS tab — the tab is already that SSH session; run commands directly. \
              A timed-out or NOT VERIFIED tool means NO DATA — never report RAM/disk/domain numbers \
-             means NO DATA — never report RAM/disk/domain numbers from memory or history. Report failures \
-             honestly; never expose internal session ids. Risky commands open Deny / Allow / Always allow; \
+             from memory or history. Report failures \
+             honestly; never expose internal session ids. \
+             (6) If the user asks to close the terminal tab, call `vps_close_terminal` — it closes \
+             only the focused SSH tab, not the saved host. Never say terminal tabs cannot be closed. \
+             Risky commands open Deny / Allow / Always allow; \
              'Always allow' is exact-command and process-only. ALWAYS finish with a short text \
              answer in the user's language — never end a turn with an empty message. {guard}"
         )
@@ -477,6 +491,69 @@ fn tools_for(allow_vps: bool, has_target: bool) -> Value {
             "body": { "type": "string", "description": "Full note content, written from the facts just obtained from tools." },
             "favorite": { "type": "boolean", "description": "Mark as favorite (default false)." }
           }, "required": ["body"] }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "open_note",
+          "description": "Open an EXISTING note from the encrypted vault in a new RuTerm tab. Find its id with list_notes or read_note first. Use this whenever the user asks to open/show/view a saved note — never say you cannot open notes.",
+          "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "Note id from list_notes/read_note, or a unique title/body query." }
+          }, "required": ["id"] }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "close_note",
+          "description": "Close a note TAB in RuTerm without deleting the note. Find its id with list_notes/read_note first. Use this whenever the user asks to close/tutup a note tab — never say you cannot close tabs.",
+          "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "Note id from list_notes/read_note, or a unique title/body query." }
+          }, "required": ["id"] }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "update_note",
+          "description": "Edit an EXISTING note in the encrypted vault. Find its id with list_notes or read_note. Use append:true to add text at the end; otherwise body replaces the whole note. Use this whenever the user asks to edit, update, add to, or fix a note — never say you cannot edit notes.",
+          "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "Note id from list_notes/read_note, or a unique title/body query." },
+            "body": { "type": "string", "description": "New full body, or the text to append." },
+            "title": { "type": "string", "description": "Optional title for a replacement body." },
+            "append": { "type": "boolean", "description": "true = add to the end instead of replacing." },
+            "favorite": { "type": "boolean" }
+          }, "required": ["body"] }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "delete_note",
+          "description": "Delete an existing note from the encrypted vault. Find its id with list_notes or read_note. Requires confirmation. Use this when the user asks to delete/remove a note.",
+          "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "Note id, or a unique title/body query." }
+          }, "required": ["id"] }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "clear_chat_history",
+          "description": "Ask RuTerm to clear this AI chat's conversation history. This opens the 'Clear chat history?' confirmation dialog; nothing is deleted until the user confirms. Use this when the user asks to clear/erase/reset chat history.",
+          "parameters": { "type": "object", "properties": {} }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "web_search",
+          "description": "Search the public web for current, recent or uncertain facts (news, docs, versions, prices). Returns titles, URLs and snippets; cite the URLs in your answer. No API key or user credential is used.",
+          "parameters": { "type": "object", "properties": {
+            "query": { "type": "string", "description": "Search query in the user's language or English." },
+            "limit": { "type": "integer", "description": "How many results to return (1-8, default 5)." }
+          }, "required": ["query"] }
         }
       },
       {
@@ -617,6 +694,14 @@ fn tools_for(allow_vps: bool, has_target: bool) -> Value {
               "parameters": { "type": "object", "properties": {
                 "name": { "type": "string", "description": "Saved host label, address or IP from list_hosts." }
               }, "required": ["name"] }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "vps_close_terminal",
+              "description": "Close the currently focused SSH terminal tab in RuTerm. It only closes the live tab; the saved host and its vault data stay. Use this when the user asks to close/tutup the current VPS terminal — never say you cannot close terminal tabs.",
+              "parameters": { "type": "object", "properties": {} }
             }
           },
           {
@@ -772,6 +857,197 @@ fn short_error(raw: &str) -> String {
     raw.trim().chars().take(300).collect()
 }
 
+#[derive(Clone)]
+struct SearchHit {
+    title: String,
+    url: String,
+    snippet: String,
+}
+
+fn decode_html_entities(input: &str) -> String {
+    input
+        .replace("&nbsp;", " ")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&quot;", "\"")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
+fn strip_html_tags(input: &str) -> String {
+    let mut out = String::new();
+    let mut inside = false;
+    for character in input.chars() {
+        if character == '<' {
+            inside = true;
+        } else if character == '>' {
+            inside = false;
+        } else if !inside {
+            out.push(character);
+        }
+    }
+    decode_html_entities(out.trim())
+}
+
+fn between(input: &str, start: &str, end: &str) -> Option<String> {
+    let from = input.find(start)? + start.len();
+    let rest = &input[from..];
+    let to = rest.find(end)?;
+    Some(rest[..to].to_string())
+}
+
+fn percent_decode(input: &str) -> String {
+    fn hex(value: u8) -> Option<u8> {
+        match value {
+            b'0'..=b'9' => Some(value - b'0'),
+            b'a'..=b'f' => Some(value - b'a' + 10),
+            b'A'..=b'F' => Some(value - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2])) {
+                out.push(high * 16 + low);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(if bytes[index] == b'+' { b' ' } else { bytes[index] });
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn clean_result_url(href: &str) -> String {
+    let href = href.trim();
+    if let Some(pos) = href.find("uddg=") {
+        let encoded = href[pos + 5..].split('&').next().unwrap_or("");
+        return percent_decode(encoded);
+    }
+    if href.starts_with("//") {
+        format!("https:{href}")
+    } else {
+        href.to_string()
+    }
+}
+
+fn parse_ddg_results(html: &str, limit: usize) -> Vec<SearchHit> {
+    let mut hits = Vec::new();
+    for chunk in html.split("class=\"result__a\"").skip(1) {
+        let open_end = match chunk.find('>') {
+            Some(index) => index,
+            None => continue,
+        };
+        let close = chunk.find("</a>").unwrap_or(chunk.len());
+        let title = strip_html_tags(&chunk[open_end + 1..close]);
+        let href = between(&chunk[..open_end], "href=\"", "\"").unwrap_or_default();
+        let url = clean_result_url(&href);
+        if title.is_empty() || url.is_empty() {
+            continue;
+        }
+        let rest = &chunk[close..];
+        let snippet = if let Some(snip) = rest.split("class=\"result__snippet\"").nth(1) {
+            let body = snip.find('>').map(|index| &snip[index + 1..]).unwrap_or(snip);
+            let body = body.find("</a>").map(|index| &body[..index]).unwrap_or(body);
+            strip_html_tags(body).chars().take(400).collect()
+        } else {
+            String::new()
+        };
+        hits.push(SearchHit { title, url, snippet });
+        if hits.len() >= limit {
+            break;
+        }
+    }
+    hits
+}
+
+/// Best-effort public web search. No API key, no credential data, no renderer
+/// involvement — only the title/URL/snippet list goes back to the model.
+async fn web_search(query: &str, limit: usize) -> Result<String, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("query is required".into());
+    }
+    let http = client_with_timeout(20)?;
+    let agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) RuTerm-AI-Chat";
+    let url = reqwest::Url::parse_with_params("https://html.duckduckgo.com/html/", &[("q", query)])
+        .map_err(|error| format!("Could not build search URL: {error}"))?;
+    let mut hits = match http.get(url).header("User-Agent", agent).send().await {
+        Ok(response) if response.status().is_success() => {
+            parse_ddg_results(&response.text().await.unwrap_or_default(), limit)
+        }
+        _ => Vec::new(),
+    };
+
+    if hits.is_empty() {
+        // DuckDuckGo's Instant Answer JSON is a smaller but sturdier fallback.
+        if let Ok(url) = reqwest::Url::parse_with_params(
+            "https://api.duckduckgo.com/",
+            &[
+                ("q", query),
+                ("format", "json"),
+                ("no_html", "1"),
+                ("skip_disambig", "1"),
+            ],
+        ) {
+            if let Ok(response) = http.get(url).header("User-Agent", agent).send().await {
+                if response.status().is_success() {
+                    if let Ok(value) = response.json::<Value>().await {
+                        let snippet = value["AbstractText"].as_str().unwrap_or("").to_string();
+                        let link = value["AbstractURL"].as_str().unwrap_or("").to_string();
+                        if !snippet.is_empty() && !link.is_empty() {
+                            hits.push(SearchHit {
+                                title: value["Heading"]
+                                    .as_str()
+                                    .unwrap_or("DuckDuckGo")
+                                    .to_string(),
+                                url: link,
+                                snippet: snippet.chars().take(400).collect(),
+                            });
+                        }
+                        if let Some(topics) = value["RelatedTopics"].as_array() {
+                            for topic in topics {
+                                let text = topic["Text"].as_str().unwrap_or("");
+                                let link = topic["FirstURL"].as_str().unwrap_or("");
+                                if !text.is_empty() && !link.is_empty() {
+                                    hits.push(SearchHit {
+                                        title: strip_html_tags(text).chars().take(120).collect(),
+                                        url: link.to_string(),
+                                        snippet: String::new(),
+                                    });
+                                }
+                                if hits.len() >= limit {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if hits.is_empty() {
+        return Ok(format!("No web results found for '{query}'. Try a different query."));
+    }
+    let mut output = format!("Web results for '{query}':\n");
+    for (index, hit) in hits.iter().enumerate() {
+        output.push_str(&format!(
+            "{}. {}\n   {}\n   {}\n",
+            index + 1,
+            hit.title,
+            hit.url,
+            hit.snippet
+        ));
+    }
+    Ok(output.chars().take(8000).collect())
+}
+
 const RECOVERY_SYSTEM: &str = "You are RuTerm's recovery writer. The main assistant stopped \
 after a tool ran, sometimes after only saying what it would do. Answer the user's question using \
 ONLY the tool result shown below. Reply in the user's language, concise, with no markdown fences. \
@@ -916,7 +1192,10 @@ async fn recover_after_tools(
     let shown = cap_tool_text(last_result, 4_000);
     // If the main turn already created the note, a stalled follow-up must not
     // create a duplicate one.
-    let note_allowed = last_tool_name != "create_note";
+    let note_allowed = !matches!(
+        last_tool_name,
+        "create_note" | "open_note" | "close_note" | "update_note" | "delete_note"
+    ) && !last_tool_name.starts_with("clear_");
     let prompt = format!(
         "User question:\n{question}\n\nTool `{last_tool_name}` returned:\n{shown}\n\n\
          Assistant's unfinished message: {}\n\nSSH control available: {}",
@@ -1391,6 +1670,25 @@ fn compact_entry(text: &str, max: usize) -> String {
 
 /// Notes have no title field; the UI derives one from the first line. Keep the
 /// tool reply consistent with what the user will see in the new tab.
+/// Tool arguments are produced by a chat model. It sometimes JSON-escapes the
+/// markdown repeatedly, so an address arrives as `16\\\\.176...` instead of
+/// `16.176...`. Collapse backslash runs before anything touches the vault.
+pub(crate) fn normalize_note_body(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            while chars.peek() == Some(&'\\') {
+                chars.next();
+            }
+            out.push('\\');
+        } else {
+            out.push(ch);
+        }
+    }
+    out.trim().to_string()
+}
+
 pub(crate) fn note_preview(body: &str) -> String {
     let first = body
         .lines()
@@ -1400,6 +1698,41 @@ pub(crate) fn note_preview(body: &str) -> String {
         .trim_start_matches('#')
         .trim();
     compact_entry(if first.is_empty() { "Untitled note" } else { first }, 56)
+}
+
+/// Resolve a note for the write tools. An exact id always wins; a short query
+/// is accepted for convenience, but only when it matches one live note.
+fn find_note<'a>(
+    vault: &'a rterm_core::model::Vault,
+    id: &str,
+    query: &str,
+) -> Result<&'a Note, String> {
+    let id = id.trim();
+    if !id.is_empty() {
+        return vault
+            .notes
+            .iter()
+            .find(|note| !note.deleted && note.id.to_string() == id)
+            .ok_or_else(|| format!("No note with id '{id}'. Use list_notes to find the id."));
+    }
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Err("id or query is required".into());
+    }
+    let mut matches = vault.notes.iter().filter(|note| {
+        !note.deleted
+            && (note.body.to_lowercase().contains(&needle)
+                || note_preview(&note.body).to_lowercase().contains(&needle))
+    });
+    let first = matches
+        .next()
+        .ok_or_else(|| format!("No note matches '{query}'."))?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "More than one note matches '{query}'. Use list_notes and pass the exact id."
+        ));
+    }
+    Ok(first)
 }
 
 fn append_action(path: &PathBuf, entry: &str) {
@@ -1808,14 +2141,15 @@ async fn run_tool(
                 .chars()
                 .take(80)
                 .collect::<String>();
-            let content = args
-                .get("body")
-                .and_then(Value::as_str)
-                .ok_or("body is required")?
-                .trim()
-                .chars()
-                .take(50_000)
-                .collect::<String>();
+            let content = normalize_note_body(
+                &args
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .ok_or("body is required")?
+                    .chars()
+                    .take(50_000)
+                    .collect::<String>(),
+            );
             if content.is_empty() {
                 return Err("body must not be empty".into());
             }
@@ -1837,6 +2171,15 @@ async fn run_tool(
                 title.clone()
             };
             let mut vault = state.unlocked_vault().await?;
+            // A model sometimes repeats the same create_note tool call. Open the
+            // existing note instead of writing a second copy into the vault.
+            if let Some(existing) = vault.notes.iter().find(|n| !n.deleted && n.body == body) {
+                let existing_id = existing.id.to_string();
+                let _ = app.emit("rterm:note-open", json!({ "id": existing_id }));
+                return Ok(format!(
+                    "Note '{label}' already exists in your vault; opened the existing note."
+                ));
+            }
             vault.notes.push(Note {
                 id,
                 body,
@@ -1850,6 +2193,128 @@ async fn run_tool(
             Ok(format!(
                 "Note '{label}' saved in your encrypted vault and opened in a new tab."
             ))
+        }
+        "close_note" => {
+            let id = args.get("id").and_then(Value::as_str).unwrap_or("");
+            let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+            let (note_id, label) = {
+                let vault = state.unlocked_vault().await?;
+                let found = find_note(&vault, id, query)?;
+                (found.id.to_string(), note_preview(&found.body))
+            };
+            let _ = app.emit("rterm:close-note", json!({ "id": note_id }));
+            Ok(format!(
+                "Note '{label}' tab closed. The note is still saved in your vault."
+            ))
+        }
+        "open_note" => {
+            let id = args.get("id").and_then(Value::as_str).unwrap_or("");
+            let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+            let (note_id, label) = {
+                let vault = state.unlocked_vault().await?;
+                let found = find_note(&vault, id, query)?;
+                (found.id.to_string(), note_preview(&found.body))
+            };
+            let _ = app.emit("rterm:note-open", json!({ "id": note_id }));
+            Ok(format!("Note '{label}' opened in a new tab."))
+        }
+        "update_note" => {
+            let id = args.get("id").and_then(Value::as_str).unwrap_or("");
+            let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+            let mut content = normalize_note_body(
+                &args
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .ok_or("body is required")?
+                    .chars()
+                    .take(50_000)
+                    .collect::<String>(),
+            );
+            if content.is_empty() {
+                return Err("body must not be empty".into());
+            }
+            let append = args.get("append").and_then(Value::as_bool).unwrap_or(false);
+            let title = args.get("title").and_then(Value::as_str).unwrap_or("").trim();
+            if !append && !title.is_empty() {
+                let clean = title.chars().take(80).collect::<String>();
+                content = format!("# {clean}\n\n{content}");
+            }
+            let favorite = args.get("favorite").and_then(Value::as_bool);
+            let mut vault = state.unlocked_vault().await?;
+            let (note_id, label) = {
+                let found = find_note(&vault, id, query)?;
+                (found.id.to_string(), note_preview(&found.body))
+            };
+            let stamp = now();
+            let note = vault
+                .notes
+                .iter_mut()
+                .find(|note| note.id.to_string() == note_id)
+                .ok_or("note disappeared")?;
+            note.body = if append {
+                if !note.body.is_empty() && !note.body.ends_with('\n') {
+                    note.body.push('\n');
+                }
+                note.body.push_str(&content);
+                note.body.clone()
+            } else {
+                content
+            };
+            note.updated_at = stamp;
+            if let Some(favorite) = favorite {
+                note.favorite = favorite;
+            }
+            let payload = commands::persist_vault(state, vault).await?;
+            let _ = app.emit("rterm:note-updated", json!({ "id": note_id, "payload": payload }));
+            Ok(format!(
+                "Note '{label}' updated in your encrypted vault and refreshed in its tab."
+            ))
+        }
+        "delete_note" => {
+            let id = args.get("id").and_then(Value::as_str).unwrap_or("");
+            let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+            let mut vault = state.unlocked_vault().await?;
+            let (note_id, label) = {
+                let found = find_note(&vault, id, query)?;
+                (found.id.to_string(), note_preview(&found.body))
+            };
+            let approved = ask_approval(
+                app,
+                state,
+                session,
+                &format!("delete:note:{note_id}"),
+                "write",
+                "Delete this note?",
+                &format!("Note '{label}' will be removed from your encrypted vault and sync."),
+                &label,
+            )
+            .await?;
+            if !approved {
+                return Ok("Note deletion denied by user.".into());
+            }
+            let note = vault
+                .notes
+                .iter_mut()
+                .find(|note| note.id.to_string() == note_id)
+                .ok_or("note disappeared")?;
+            note.deleted = true;
+            note.updated_at = now();
+            let payload = commands::persist_vault(state, vault).await?;
+            let _ = app.emit("rterm:note-deleted", json!({ "id": note_id, "payload": payload }));
+            Ok(format!("Note '{label}' deleted from your encrypted vault."))
+        }
+        "clear_chat_history" => {
+            let _ = app.emit("chat://clear-request", json!({ "session": session }));
+            Ok("Clear chat history confirmation opened. Nothing was deleted until you confirm.".into())
+        }
+        "web_search" => {
+            let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(5)
+                .clamp(1, 8) as usize;
+            web_search(query, limit).await
         }
         "list_snippets" => {
             let vault = state.unlocked_vault().await?;
@@ -2745,6 +3210,17 @@ mod tests {
     }
 
     #[test]
+    fn web_results_are_parsed_from_duckduckgo_html() {
+        let html = r##"<a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdocs&amp;rut=x">Example <b>Docs</b></a><a class="result__snippet" href="#">Latest &amp; greatest docs.</a>"##;
+        let hits = parse_ddg_results(html, 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "Example Docs");
+        assert_eq!(hits[0].url, "https://example.com/docs");
+        assert_eq!(hits[0].snippet, "Latest & greatest docs.");
+        assert!(system_prompt_for(false, true).contains("web_search"));
+    }
+
+    #[test]
     fn tools_cover_app_reads_and_theme_switch() {
         let list = tools_for(false, true);
         let names: Vec<&str> = list
@@ -2758,7 +3234,14 @@ mod tests {
             "launch_agent",
             "create_host",
             "list_notes",
+            "read_note",
             "create_note",
+            "open_note",
+            "close_note",
+            "update_note",
+            "delete_note",
+            "clear_chat_history",
+            "web_search",
             "get_app_settings",
             "get_sync_status",
             "list_agents",
@@ -2781,6 +3264,7 @@ mod tests {
         for expected in [
             "vps_list_targets",
             "vps_open_host",
+            "vps_close_terminal",
             "vps_inspect",
             "vps_verify_screen",
             "vps_execute",
@@ -2809,12 +3293,18 @@ mod tests {
             .collect();
         assert!(no_target_names.contains(&"list_hosts"));
         assert!(no_target_names.contains(&"create_note"));
+        assert!(no_target_names.contains(&"open_note"));
+        assert!(no_target_names.contains(&"update_note"));
+        assert!(no_target_names.contains(&"delete_note"));
+        assert!(no_target_names.contains(&"clear_chat_history"));
+        assert!(no_target_names.contains(&"web_search"));
         let no_target_vps: Vec<&str> = no_target_names
             .iter()
             .copied()
             .filter(|name| name.starts_with("vps_"))
             .collect();
         assert_eq!(no_target_vps, vec!["vps_list_targets", "vps_open_host"]);
+        assert!(!no_target_names.contains(&"vps_close_terminal"));
         assert!(system_prompt_for(true, false).contains("NO SSH TAB IS FOCUSED"));
         assert!(system_prompt_for(true, false).contains("call `list_hosts`"));
     }

@@ -1,7 +1,13 @@
 {
   "version": 1,
-  "generated_at": "2026-11-23T05:09:25.913Z",
+  "generated_at": "2026-11-23T09:33:10.220Z",
   "entries": [
+    {
+      "file": "2026-11-23-notes-code-blocks.md",
+      "date": "2026-11-23",
+      "title": "Notes: type code, get a code block — Enter gets you out again",
+      "summary": "Notes now recognise code as you type it. A line like <p> hello </p> becomes a"
+    },
     {
       "file": "2026-11-23-agents-share-vault-tools.md",
       "date": "2026-11-23",

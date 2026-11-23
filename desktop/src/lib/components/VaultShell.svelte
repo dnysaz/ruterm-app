@@ -43,6 +43,7 @@
   import InfoPage from './InfoPage.svelte';
   import NoteEditor from './NoteEditor.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
+  import TrafficLights from './TrafficLights.svelte';
   import AiAgentIcon from './AiAgentIcon.svelte';
   import WhatsNew from './WhatsNew.svelte';
   import AiChatDrawer from './AiChatDrawer.svelte';
@@ -136,6 +137,15 @@
   let query = $state('');
   let filter = $state<'all' | 'favorite' | 'note'>('all');
   let noteToDelete = $state<Note | null>(null);
+  /** The Note filter shows a short, newest-first list until asked for more. */
+  let noteLimit = $state(10);
+
+  $effect(() => {
+    // A new filter or search term starts from the ten most recent notes again.
+    void filter;
+    void query;
+    noteLimit = 10;
+  });
   /** Pending risky-command approval from an agent or the built-in AI Chat. */
   interface McpConfirmRequest {
     id: string;
@@ -170,6 +180,11 @@
 
   const lastId = (ids: string[]): string | null => ids[ids.length - 1] ?? null;
 
+  /// Pane identity belongs to its terminals, not to its slot (left/right or
+  /// top/bottom). Renaming a pane remounts every Terminal inside it and wipes
+  /// the visible screen, which is exactly what a layout-only change must avoid.
+  const otherPaneId = (id: 'a' | 'b'): 'a' | 'b' => (id === PANE_A ? PANE_B : PANE_A);
+
   const fixPaneActive = (pane: Pane): Pane => ({
     ...pane,
     active: pane.active && pane.tabs.includes(pane.active) ? pane.active : lastId(pane.tabs),
@@ -179,7 +194,9 @@
   function normalizePanes(list: Pane[]): Pane[] {
     const nonEmpty = list.filter(p => p.tabs.length > 0);
     if (nonEmpty.length === 0) return [{ id: PANE_A, tabs: [], active: null }];
-    if (nonEmpty.length === 1) return [{ ...nonEmpty[0], id: PANE_A }];
+    // Keep the surviving pane's id — forcing PANE_A here would remount its
+    // terminals when the other pane is closed.
+    if (nonEmpty.length === 1) return [fixPaneActive(nonEmpty[0])];
     return list.slice(0, 2).map(fixPaneActive);
   }
 
@@ -437,6 +454,20 @@
       .sort((a, b) => Number(b.favorite) - Number(a.favorite) || a.label.localeCompare(b.label)),
   );
 
+  // Older sessions stored a literal "Note" title. Keep every open note tab in
+  // sync with the first words of its body, including after a soft reload.
+  $effect(() => {
+    const list = notes();
+    const stale = tabs.filter(tab => tab.title === 'Note' && typeof tab.hostId === 'string');
+    if (!stale.length) return;
+    for (const tab of stale) {
+      const host = String(tab.hostId ?? '');
+      const note = list.find(candidate =>
+        candidate.id === host || candidate.id === host.replace(/^note-/, ''));
+      if (note) syncNoteTabTitle(note);
+    }
+  });
+
   const noteList = $derived(
     notes()
       .filter(n => (filter === 'favorite' ? n.favorite : true))
@@ -446,6 +477,8 @@
       })
       .sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || '')),
   );
+
+  const visibleNotes = $derived(noteList.slice(0, noteLimit));
 
   const focusedPane = $derived(panes.find(p => p.id === focusedPaneId) ?? panes[0]);
   const focusedActiveTabId = $derived(focusedPane?.active ?? null);
@@ -635,15 +668,47 @@
   }
 
   // ---------------------------------------------------------------- notes
-  /// A note's list title is the first few words of its body.
+  /// A note's tab title is the first 2-3 sentences of its own body.
   function noteTitle(note: Note): string {
-    const first = note.body
-      .split('\n')
-      .map(line => line.trim())
-      .find(Boolean);
-    if (!first) return 'Untitled note';
-    const short = first.split(/\s+/).filter(Boolean).slice(0, 7).join(' ');
-    return short.length > 56 ? `${short.slice(0, 55)}…` : short;
+    const clean = note.body
+      .replace(/\\([\\`*_{}\[\]()#+\-.!])/g, '$1')
+      .replace(/^[\s#>*+\-`_]+/gm, '')
+      .replace(/\*\*|__|`/g, '')
+      .trim();
+    if (!clean) return 'Untitled note';
+
+    // A newline also ends a sentence here: headings often have no full stop.
+    const sentences: string[] = [];
+    let current = '';
+    for (const char of clean) {
+      current += char;
+      if (char === '\n' || char === '.' || char === '!' || char === '?') {
+        const piece = current.trim();
+        if (piece) sentences.push(piece);
+        current = '';
+        if (sentences.length === 3) break;
+      }
+    }
+    if (sentences.length < 3 && current.trim()) sentences.push(current.trim());
+
+    let title = sentences.join(' ').replace(/\s+/g, ' ').trim();
+    if (!title) title = clean.replace(/\s+/g, ' ').trim();
+    const limit = 52;
+    return title.length > limit ? `${title.slice(0, limit - 3).trimEnd()}...` : title;
+  }
+
+  function displayTabTitle(tab: Tab): string {
+    if (tab.kind !== 'note') return tab.title;
+    const note = notes().find(candidate => candidate.id === tab.hostId);
+    return note ? noteTitle(note) : tab.title;
+  }
+
+  function syncNoteTabTitle(note: Note) {
+    const title = noteTitle(note);
+    const isNoteTab = (candidate: Tab) => candidate.kind === 'note' && candidate.hostId === note.id;
+    const matches = tabs.filter(isNoteTab);
+    if (!matches.length || matches.every(candidate => candidate.title === title)) return;
+    tabs = tabs.map(candidate => (isNoteTab(candidate) ? { ...candidate, title } : candidate));
   }
 
   function noteTime(note: Note): string {
@@ -662,13 +727,14 @@
     const id = `note-${note.id}`;
     const existing = tabs.find(t => t.id === id);
     if (existing) {
+      syncNoteTabTitle(note);
       activateTab(id);
       return;
     }
     const tab: Tab = {
       id,
       hostId: note.id,
-      title: 'Note',
+      title: noteTitle(note),
       status: 'connected',
       kind: 'note',
     };
@@ -700,6 +766,7 @@
   async function onNoteBody(note: Note, body: string) {
     try {
       await saveNote({ ...note, body });
+      syncNoteTabTitle({ ...note, body });
       void syncQuiet();
     } catch (error) {
       fail(error);
@@ -810,26 +877,16 @@
     return { username: match[1], address: match[2], port };
   });
 
-  function quickConnect(event?: SubmitEvent) {
-    event?.preventDefault();
-    const match = quickTarget.trim().match(QUICK_RE);
-    if (!match) {
-      quickError = 'Format: ssh username@host:port';
-      return;
-    }
+  /** Shared by the home card and the strip under the tabs. Returns an error, or null on success. */
+  function connectQuick(target: string, withAgent: boolean): string | null {
+    const match = target.trim().match(QUICK_RE);
+    if (!match) return 'Format: ssh username@host:port';
     const port = match[3] ? Number(match[3]) : 22;
-    if (port < 1 || port > 65535) {
-      quickError = 'Port must be between 1 and 65535';
-      return;
-    }
+    if (port < 1 || port > 65535) return 'Port must be between 1 and 65535';
     // F-06: quick-connect always uses the SSH agent. Require a deliberate
     // per-connection opt-in so injected script cannot silently turn the agent
     // into a signing oracle for an attacker-controlled host.
-    if (!allowAgent) {
-      quickError = 'Tick the SSH agent checkbox to connect to a new host.';
-      return;
-    }
-    quickError = '';
+    if (!withAgent) return 'Tick the SSH agent checkbox to connect to a new host.';
     const tab: Tab = {
       id: crypto.randomUUID(),
       hostId: '',
@@ -845,8 +902,35 @@
     };
     tabs = [...tabs, tab];
     addTabToPane(tab.id, lastFocusedOrFirst());
+    return null;
+  }
+
+  function quickConnect(event?: SubmitEvent) {
+    event?.preventDefault();
+    const error = connectQuick(quickTarget, allowAgent);
+    if (error) {
+      quickError = error;
+      return;
+    }
+    quickError = '';
     quickTarget = '';
     allowAgent = false;
+  }
+
+  // Compact strip directly under the tab bar — same action as the home card.
+  let barTarget = $state('');
+  let barError = $state('');
+
+  function barConnect(event: SubmitEvent) {
+    event.preventDefault();
+    // Pressing Connect is the deliberate opt-in for this one-off host.
+    const error = connectQuick(barTarget, true);
+    if (error) {
+      barError = error;
+      return;
+    }
+    barError = '';
+    // Keep the address visible so the user can see which host was just opened.
   }
 
   function cycleTab(direction: 1 | -1) {
@@ -1113,11 +1197,17 @@
     splitAxis = axis;
     const sibling = spawnSibling(tab);
     tabs = [...tabs, sibling];
-    const mine = { id: PANE_A, tabs: [tab.id], active: tab.id };
-    const fresh = { id: PANE_B, tabs: [sibling.id], active: sibling.id };
-    // Match dropToZone semantics: left/top keeps the tab first, right/bottom last.
-    applyPanes(toFirst ? [mine, fresh] : [{ ...fresh, id: PANE_A }, { ...mine, id: PANE_B }]);
-    focusedPaneId = toFirst ? PANE_A : PANE_B;
+    const original = panes.find(p => p.tabs.includes(tab.id)) ?? panes[0];
+    // The existing terminal keeps its pane id; only the new sibling gets the
+    // other one. Array order supplies the visual left/right or top/bottom.
+    const mine: Pane = {
+      id: original.id,
+      tabs: original.tabs.includes(tab.id) ? original.tabs : [...original.tabs, tab.id],
+      active: tab.id,
+    };
+    const fresh: Pane = { id: otherPaneId(original.id), tabs: [sibling.id], active: sibling.id };
+    applyPanes(toFirst ? [fresh, mine] : [mine, fresh]);
+    focusedPaneId = mine.id;
   }
 
   /// Close on outside pointer / Escape / window blur; Tab or arrows walk the items.
@@ -1289,17 +1379,34 @@
         clearDrag();
         return;
       }
-      const first: Pane = toFirst
-        ? { id: PANE_A, tabs: [tabId], active: tabId }
-        : { id: PANE_A, tabs: rest, active: lastId(rest) };
-      const second: Pane = toFirst
-        ? { id: PANE_B, tabs: rest, active: lastId(rest) }
-        : { id: PANE_B, tabs: [tabId], active: tabId };
-      focusedPaneId = toFirst ? PANE_A : PANE_B;
-      applyPanes([first, second]);
+      const original = panes[0];
+      // Keep the dragged terminal in its current pane so its screen survives.
+      // Move the *other* tabs to the sibling pane instead; the array order
+      // still puts the dragged tab on the requested side/edge.
+      const dropped: Pane = { id: original.id, tabs: [tabId], active: tabId };
+      const others: Pane = {
+        id: otherPaneId(original.id),
+        tabs: rest,
+        active: lastId(rest),
+      };
+      focusedPaneId = dropped.id;
+      applyPanes(toFirst ? [dropped, others] : [others, dropped]);
     } else {
-      const target = toFirst ? panes[0].id : panes[1].id;
-      moveTabToPane(tabId, target, null);
+      const wantedIndex = toFirst ? 0 : 1;
+      const currentIndex = panes.findIndex(p => p.tabs.includes(tabId));
+      if (currentIndex !== -1 && currentIndex !== wantedIndex) {
+        // A pure re-position (left/right/top/bottom) only swaps the visual
+        // order of the panes. Moving the tab itself would remount its Terminal
+        // and close the live SSH/local session attached to it.
+        const swapped: Pane[] = [panes[1], panes[0]];
+        applyPanes(swapped);
+        focusedPaneId = swapped[1 - currentIndex].id;
+      } else if (currentIndex !== -1) {
+        focusedPaneId = panes[currentIndex].id;
+      } else {
+        const target = toFirst ? panes[0].id : panes[1].id;
+        moveTabToPane(tabId, target, null);
+      }
     }
     clearDrag();
   }
@@ -1468,7 +1575,11 @@
     let unlistenHost: UnlistenFn | undefined;
     let unlistenOpenHost: UnlistenFn | undefined;
     let unlistenNote: UnlistenFn | undefined;
+    let unlistenNoteOpen: UnlistenFn | undefined;
+    let unlistenNoteClose: UnlistenFn | undefined;
+    let unlistenTerminalClose: UnlistenFn | undefined;
     let unlistenNoteUpdated: UnlistenFn | undefined;
+    let unlistenNoteDeleted: UnlistenFn | undefined;
     let unlistenAgent: UnlistenFn | undefined;
     let disposed = false;
     void listen<Omit<McpConfirmRequest, 'target'>>('ruterm://mcp-confirm', event => {
@@ -1519,6 +1630,39 @@
       .then(fn => (disposed ? fn() : (unlistenNote = fn)))
       .catch(() => {});
 
+    // `open_note` (native chat) and `ruterm_open_note` (local agents) reuse the
+    // same tab path as clicking a note, without writing anything to the vault.
+    void listen<{ id: string }>('rterm:note-open', event => {
+      if (disposed) return;
+      const note = notes().find(candidate => candidate.id === event.payload.id);
+      if (!note) return;
+      filter = 'note';
+      openNote(note);
+      notify(`Note '${noteTitle(note)}' opened`);
+    })
+      .then(fn => (disposed ? fn() : (unlistenNoteOpen = fn)))
+      .catch(() => {});
+
+    // `close_note` / `ruterm_close_note` only close the tab; the note stays in
+    // the encrypted vault and in the sidebar.
+    void listen<{ id: string }>('rterm:close-note', event => {
+      if (disposed) return;
+      closeTab(`note-${event.payload.id}`);
+      notify('Note tab closed');
+    })
+      .then(fn => (disposed ? fn() : (unlistenNoteClose = fn)))
+      .catch(() => {});
+
+    // `vps_close_terminal` / `ruterm_close_terminal` close the pinned SSH tab.
+    // Rust clears the bridge target first; no local agent PTY is ever eligible.
+    void listen<{ id: string }>('rterm:close-terminal', event => {
+      if (disposed) return;
+      closeTab(event.payload.id);
+      notify('Terminal tab closed');
+    })
+      .then(fn => (disposed ? fn() : (unlistenTerminalClose = fn)))
+      .catch(() => {});
+
     // Local AI agents can edit notes through the MCP bridge. Adopt the payload
     // and focus the note so the change is visible immediately, like chat's
     // `create_note`.
@@ -1532,6 +1676,17 @@
       notify(`Note '${noteTitle(note)}' updated`);
     })
       .then(fn => (disposed ? fn() : (unlistenNoteUpdated = fn)))
+      .catch(() => {});
+
+    // AI chat's `delete_note` soft-deletes in Rust. Adopt the payload and close
+    // its tab so the UI never keeps showing a note that is gone from the vault.
+    void listen<{ id: string; payload: VaultPayload }>('rterm:note-deleted', event => {
+      if (disposed) return;
+      applyVaultPayload(event.payload.payload);
+      closeTab(`note-${event.payload.id}`);
+      notify('Note deleted');
+    })
+      .then(fn => (disposed ? fn() : (unlistenNoteDeleted = fn)))
       .catch(() => {});
 
     // AI chat's `launch_agent` tool uses the same local-tab path as the dock.
@@ -1597,7 +1752,11 @@
       unlistenHost?.();
       unlistenOpenHost?.();
       unlistenNote?.();
+      unlistenNoteOpen?.();
+      unlistenNoteClose?.();
+      unlistenTerminalClose?.();
       unlistenNoteUpdated?.();
+      unlistenNoteDeleted?.();
       unlistenAgent?.();
       window.removeEventListener('rterm:next-tab', onNext);
       window.removeEventListener('rterm:prev-tab', onPrev);
@@ -1710,7 +1869,7 @@
 
     <div class="list">
       {#if filter === 'note'}
-        {#each noteList as note (note.id)}
+        {#each visibleNotes as note (note.id)}
           <div
             class="host note"
             class:active={activeNoteId === note.id}
@@ -1750,6 +1909,12 @@
             </div>
           {/if}
         {/each}
+
+        {#if !collapsed && noteList.length > noteLimit}
+          <button class="load-more" type="button" onclick={() => (noteLimit += 10)}>
+            Load more notes ({noteList.length - noteLimit})
+          </button>
+        {/if}
 
         {#if collapsed}
           <button
@@ -1989,8 +2154,8 @@
                       title={tab.kind === 'home'
                         ? 'Home'
                         : isSessionTab(tab)
-                          ? `${tab.title} — drag to reorder, double-click for another session`
-                          : `${tab.title} — drag to reorder`}
+                          ? `${displayTabTitle(tab)} — drag to reorder, double-click for another session`
+                          : `${displayTabTitle(tab)} — drag to reorder`}
                       onclick={() => setPaneActive(pane.id, id)}
                       ondblclick={() => duplicateTab(tab)}
                       ondragstart={event => onTabDragStart(event, tab)}
@@ -2031,7 +2196,7 @@
                           class:idle={tab.status === 'closed'}
                         ></span>
                       {/if}
-                      <span class="tabname">{tab.title}</span>
+                      <span class="tabname">{displayTabTitle(tab)}</span>
                       {#if tab.kind !== 'home'}
                         <button
                           class="close"
@@ -2053,6 +2218,26 @@
                 {@render addTabButton(pane.id)}
               </div>
             </div>
+
+            <form class="quickbar" onsubmit={barConnect}>
+              <input
+                class="qc-input mono"
+                bind:value={barTarget}
+                placeholder="user@host:port"
+                aria-label="Quick SSH connect"
+                autocapitalize="off"
+                autocomplete="off"
+                autocorrect="off"
+                spellcheck="false"
+              />
+              {#if barError}
+                <span class="qc-error" role="alert">{barError}</span>
+              {/if}
+              <button class="btn primary qc-button" type="submit">
+                Connect
+                <Icon name="chevron-right" size={14} />
+              </button>
+            </form>
 
             <div class="panes">
               {#each pane.tabs as id (id)}
@@ -2535,6 +2720,8 @@
       onopenchange={value => (chatPanelOpen = value)}
     />
   {/if}
+
+  <TrafficLights />
 </div>
 
 <style>
@@ -2788,6 +2975,23 @@
   .rail-add:hover {
     color: var(--text);
     border-color: var(--line);
+    background: var(--panel-hover);
+  }
+  .load-more {
+    display: block;
+    width: calc(100% - 8px);
+    margin: 6px 4px 0;
+    padding: 7px 9px;
+    border: 1px dashed var(--line);
+    border-radius: 9px;
+    background: transparent;
+    color: var(--text-tertiary);
+    font-size: 11.5px;
+    cursor: pointer;
+  }
+  .load-more:hover {
+    color: var(--text);
+    border-color: var(--accent);
     background: var(--panel-hover);
   }
   .collapsed footer {
@@ -3414,7 +3618,8 @@
     height: 68px;
     padding: 30px 6px 0;
     flex: 0 0 auto;
-    background: var(--tabbar);
+    /* Blue reaches the very top edge; the native traffic lights sit over it. */
+    background: color-mix(in srgb, var(--accent) 18%, var(--tabbar));
   }
   .tabbar::after {
     content: '';
@@ -3443,6 +3648,45 @@
   .tabs::-webkit-scrollbar {
     display: none;
   }
+
+  /* Compact quick-connect strip directly under the tab bar. */
+  .quickbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 0 48px;
+    height: 48px;
+    min-width: 0;
+    padding: 0 14px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+  }
+  .quickbar .qc-input {
+    flex: 1;
+    height: 34px;
+    min-width: 0;
+    padding: 0 12px;
+    border-radius: 8px;
+    font-size: 13px;
+  }
+  .quickbar .qc-input::placeholder {
+    font-size: 12.5px;
+  }
+  .quickbar .qc-error {
+    flex: 0 1 auto;
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .quickbar .qc-button {
+    margin-left: auto;
+    height: 34px;
+    padding: 0 16px;
+    border-radius: 8px;
+    font-size: 13px;
+  }
+
 
   /* ---------- split workspace ---------- */
   .workspace-wrap {
@@ -3679,28 +3923,35 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    min-width: 72px;
     max-width: 240px;
     height: 36px;
     padding: 0 6px 0 12px;
     border: 0;
     border-radius: 11px 11px 0 0;
-    background: transparent;
+    background: var(--tabbar);
     color: var(--text-secondary);
     font-size: 13px;
     cursor: pointer;
     white-space: nowrap;
-    flex: 0 0 auto;
+    /* Normal size while there is room; shrink gradually once the strip fills. */
+    flex: 0 1 auto;
     margin-bottom: 0;
     position: relative;
     transition:
       background 0.14s ease,
-      color 0.14s ease;
+      color 0.14s ease,
+      min-width 0.16s ease;
   }
-  .tab:hover {
+  .tab:hover,
+  .tab:focus-visible {
+    flex: 0 0 auto;
+    z-index: 3;
     color: var(--text);
     background: var(--panel-hover);
   }
   .tab.active {
+    flex: 0 0 auto;
     color: var(--text);
     background: var(--panel);
   }
@@ -3764,12 +4015,14 @@
     background: var(--text-tertiary);
   }
   .tabname {
+    min-width: 0;
+    flex: 0 1 auto;
     overflow: hidden;
     text-overflow: ellipsis;
     font-weight: 500;
   }
   .close {
-    display: grid;
+    display: none;
     place-items: center;
     width: 19px;
     height: 19px;
@@ -3779,12 +4032,12 @@
     border-radius: 5px;
     background: transparent;
     color: var(--text-tertiary);
-    opacity: 0;
     cursor: pointer;
   }
   .tab:hover .close,
+  .tab:focus-visible .close,
   .tab.active .close {
-    opacity: 1;
+    display: grid;
   }
   .close:hover {
     color: var(--text);

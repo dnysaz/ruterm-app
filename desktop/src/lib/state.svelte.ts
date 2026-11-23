@@ -37,11 +37,26 @@ export function fail(error: unknown) {
   app.error = errorText(error);
 }
 
-export async function bootstrap() {
+/**
+ * Cmd/Ctrl+R dispatch. Kept here (instead of a window event) so a dev HMR
+ * update can replace the handler without leaving an old closure registered —
+ * the old one used to remount VaultShell and close every open tab.
+ */
+let softReloadHandler: (() => void) | null = null;
+export function setSoftReloadHandler(handler: (() => void) | null) {
+  softReloadHandler = handler;
+}
+export function requestSoftReload() {
+  softReloadHandler?.();
+}
+
+export async function bootstrap(options: { skipAuthRestore?: boolean } = {}) {
   app.busy = true;
   try {
     app.status = await api.appStatus();
-    if (!app.status.signed_in) {
+    // A soft reload (Cmd/Ctrl+R) refreshes the UI only. Re-running the silent
+    // sign-in here would prompt the macOS Keychain on every refresh.
+    if (!app.status.signed_in && !options.skipAuthRestore) {
       // Silent sign-in with the refresh token in the OS keychain.
       try {
         const account = await api.authRestore();

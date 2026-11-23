@@ -10,9 +10,10 @@
   } from '#lib/api';
   import { app } from '#lib/state.svelte';
   import { applyTheme } from '#lib/ui.svelte';
-  import { renderSafeMarkdown } from '#lib/markdown';
+  import { parseChatSegments, renderSafeMarkdown } from '#lib/markdown';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import Icon from './Icon.svelte';
+  import CodeBlock from './CodeBlock.svelte';
 
   let {
     variant = 'drawer',
@@ -111,6 +112,8 @@
   let error = $state('');
   let approval = $state<ChatApproval | null>(null);
   let clearConfirm = $state(false);
+  let copiedKey = $state<string | null>(null);
+  let copyTimer: ReturnType<typeof setTimeout> | null = null;
   let scroller = $state<HTMLDivElement>();
   let inputEl = $state<HTMLTextAreaElement>();
   let hydrated = $state(false);
@@ -213,6 +216,40 @@
     }
   }
 
+  async function copyText(text: string, key: string) {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const area = document.createElement('textarea');
+        area.value = text;
+        area.style.position = 'fixed';
+        area.style.opacity = '0';
+        document.body.appendChild(area);
+        area.select();
+        document.execCommand('copy');
+        area.remove();
+      }
+      copiedKey = key;
+      if (copyTimer) clearTimeout(copyTimer);
+      copyTimer = setTimeout(() => (copiedKey = null), 1400);
+    } catch {
+      copiedKey = null;
+    }
+  }
+
+  /** Re-send the user prompt behind an answer so the model can try again. */
+  function resendAt(index: number) {
+    if (busy) return;
+    const bubble = messages[index];
+    const previous = messages
+      .slice(0, index)
+      .reverse()
+      .find(item => item.role === 'user');
+    const source = bubble.role === 'user' ? bubble.text : previous?.text;
+    if (source?.trim()) void send(source.trim());
+  }
+
   function stop() {
     void api.chatCancel(SESSION).catch(cause => (error = errorText(cause)));
     approval = null;
@@ -313,6 +350,12 @@
       touch();
     });
     on<ChatApproval>('chat://approval', payload => (approval = payload));
+    // The `clear_chat_history` tool never deletes on its own: it asks the
+    // renderer to show the same confirmation modal as the header button.
+    on<{ session: string }>('chat://clear-request', () => {
+      clearConfirm = true;
+      touch();
+    });
     on<ChatTarget>('rterm:mcp-target', payload => (target = payload));
     // The `set_theme` tool asks the renderer to persist/apply the choice.
     on<string>('rterm:set-theme', theme => {
@@ -324,6 +367,7 @@
     return () => {
       disposed = true;
       if (saveTimer) clearTimeout(saveTimer);
+      if (copyTimer) clearTimeout(copyTimer);
       stopWatchdog();
       unlisteners.forEach(fn => fn());
       window.removeEventListener('rterm:chat-updated', onUpdated);
@@ -453,15 +497,49 @@
               <div class="tool-chip"><Icon name="check" size={12} /> {bubble.name ?? 'tool'} <span>{bubble.text}</span></div>
             {:else}
               <div class="bubble-row" class:mine={bubble.role === 'user'}>
-                <div class="bubble" class:placeholder={bubble.role === 'assistant' && bubble.text === '' && busy}>
-                  {#if bubble.text === '' && bubble.role === 'assistant' && busy}
-                    <span class="dots"><i></i><i></i><i></i></span>
-                  {:else if bubble.role === 'assistant'}
-                    {@html renderSafeMarkdown(bubble.text)}
-                  {:else}
-                    {bubble.text}
-                  {/if}
-                </div>
+                {#if bubble.role === 'user'}
+                  <div class="bubble">{bubble.text}</div>
+                {:else if bubble.text === '' && busy}
+                  <div class="answer placeholder"><span class="dots"><i></i><i></i><i></i></span></div>
+                {:else}
+                  <div class="answer">
+                    {#each parseChatSegments(bubble.text) as segment, part (part)}
+                      {#if segment.kind === 'code'}
+                        <div class="code-card">
+                          <div class="code-head">
+                            <span>{segment.label}</span>
+                            <button
+                              type="button"
+                              class="code-copy"
+                              title="Copy code"
+                              onclick={() => void copyText(segment.text, `code-${index}-${part}`)}
+                            >
+                              <Icon name={copiedKey === `code-${index}-${part}` ? 'check' : 'copy'} size={13} />
+                              {copiedKey === `code-${index}-${part}` ? 'Copied' : 'Copy'}
+                            </button>
+                          </div>
+                          <CodeBlock code={segment.text} label={segment.label} />
+                        </div>
+                      {:else}
+                        <div class="prose">{@html renderSafeMarkdown(segment.text)}</div>
+                      {/if}
+                    {/each}
+                  </div>
+                {/if}
+                {#if !(bubble.role === 'assistant' && bubble.text === '' && busy)}
+                  <div class="msg-actions">
+                    <button
+                      type="button"
+                      title="Copy message"
+                      onclick={() => void copyText(bubble.text, `msg-${index}`)}
+                    >
+                      <Icon name={copiedKey === `msg-${index}` ? 'check' : 'copy'} size={13} /> Copy
+                    </button>
+                    <button type="button" title="Resend" onclick={() => resendAt(index)}>
+                      <Icon name="refresh" size={13} /> Resend
+                    </button>
+                  </div>
+                {/if}
               </div>
             {/if}
           {/each}
@@ -708,6 +786,7 @@
     max-width: 82%;
     font-size: 15px;
   }
+  .chat-drawer.tab .answer { font-size: 15px; }
   .chat-drawer.tab .head-actions {
     gap: 6px;
   }
@@ -742,8 +821,13 @@
   .suggestions button:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
   .suggestions button:disabled { opacity: 0.45; cursor: not-allowed; }
 
-  .bubble-row { display: flex; justify-content: flex-start; }
-  .bubble-row.mine { justify-content: flex-end; }
+  .bubble-row {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 5px;
+  }
+  .bubble-row.mine { align-items: flex-end; }
   .bubble {
     max-width: 88%;
     padding: 9px 12px;
@@ -755,30 +839,84 @@
     white-space: pre-wrap;
     word-break: break-word;
   }
-  .bubble :global(p) { margin: 0; }
-  .bubble :global(p + p) { margin-top: 6px; }
-  .bubble :global(strong) { font-weight: 650; color: var(--text); }
-  .bubble :global(a) {
+  /* AI replies sit directly on the page; only the sender gets a bubble. */
+  .answer {
+    width: 100%;
+    max-width: 820px;
+    font-size: 15.5px;
+    line-height: 1.65;
+    white-space: normal;
+    word-break: break-word;
+  }
+  .answer.placeholder { min-height: 18px; }
+  .answer :global(p) { margin: 0; }
+  .answer :global(p + p) { margin-top: 8px; }
+  .answer :global(strong) { font-weight: 650; color: var(--text); }
+  .answer :global(a) {
     color: var(--accent);
     text-decoration: underline;
     text-underline-offset: 2px;
     cursor: pointer;
   }
-  .bubble :global(a:hover) { filter: brightness(1.15); }
-  .bubble :global(code) {
+  .answer :global(a:hover) { filter: brightness(1.15); }
+  .answer :global(code) {
     padding: 1px 4px;
     border-radius: 4px;
     background: var(--bg-elevated-2, rgba(127, 127, 127, 0.16));
     font-family: var(--font-mono, ui-monospace, monospace);
     font-size: 0.92em;
   }
+  .code-card {
+    margin: 10px 0;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+    background: var(--bg-elevated);
+  }
+  .code-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 5px 9px 5px 12px;
+    border-bottom: 1px solid var(--line);
+    color: var(--text-tertiary);
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .code-copy,
+  .msg-actions button {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-tertiary);
+    font-size: 11px;
+    cursor: pointer;
+    padding: 3px 5px;
+  }
+  .code-copy:hover,
+  .msg-actions button:hover { background: var(--hover); color: var(--text); }
+  .code-card :global(code) {
+    padding: 0;
+    background: transparent;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 12.5px;
+    line-height: 1.55;
+    white-space: pre;
+  }
+  .msg-actions { display: flex; gap: 6px; opacity: 0.5; }
+  .bubble-row:hover .msg-actions { opacity: 1; }
   .mine .bubble {
     border-color: transparent;
     background: var(--accent);
     color: var(--accent-on, #fff);
     border-radius: 14px 14px 4px 14px;
   }
-  .bubble.placeholder { min-width: 46px; }
   .dots { display: inline-flex; gap: 4px; }
   .dots i {
     width: 5px; height: 5px; border-radius: 50%;
