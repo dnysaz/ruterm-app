@@ -13,6 +13,7 @@
     serializeEditor,
     formatInline,
   } from '#lib/markdown-editor';
+  import { ui } from '#lib/ui.svelte';
 
   let {
     note,
@@ -59,6 +60,13 @@
 
   onMount(() => {
     if (editor) renderEditor(editor, saved);
+  });
+
+  // Re-colour existing blocks when the app theme flips; Monaco inlines token
+  // colours, so old spans keep the previous theme until they are rebuilt.
+  $effect(() => {
+    const theme = ui.theme;
+    if (editor) void colorizeCode(editor);
   });
 
   function pointCopy(pre: HTMLElement | null) {

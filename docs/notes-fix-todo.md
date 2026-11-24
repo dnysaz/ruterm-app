@@ -6,6 +6,10 @@ Status of the five findings in `docs/notes-followups.md`.
 - [x] Unify the note-title algorithm (UI + Rust agent replies) and test it with shared fixtures.
 - [x] Add a favorite toggle to note rows and persist it with `saveNote`.
 - [x] Show favorited notes in the Favorite view, and show notes together with hosts in All.
+- [x] Order Host above Notes in both All and Favorite (follow-up request).
+- [x] Redesign the sidebar AI-agent dock: icon-only, no visible title/labels, always coloured.
+- [x] Simplify the home tab: clock plus New host / Local terminal / What's New? only, and remove the quick-connect setting from Settings.
+- [x] Keep the home view flat and minimal: plain clock/brand, standard buttons, no cards, gradients, glows or shadows.
 - [x] Make search placeholder and `aria-label` follow the active filter.
 - [x] Correct the "encrypted notes" copy in News, README, chat/MCP tool descriptions and replies.
 - [x] Regenerate `News/index.json` after the News copy change.

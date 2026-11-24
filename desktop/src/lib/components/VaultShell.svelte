@@ -15,7 +15,6 @@
   import { background, backgroundStyle, frostStyle } from '#lib/background.svelte';
   import { imageMimeForPath } from '#lib/images';
   import { noteTitle } from '#lib/note-title';
-  import { ui } from '#lib/ui.svelte';
   import {
     app,
     applyVaultPayload,
@@ -138,6 +137,11 @@
   let query = $state('');
   let filter = $state<'all' | 'favorite' | 'note'>('all');
   let noteToDelete = $state<Note | null>(null);
+  /** Manual close of a live host/SFTP session waits for an explicit confirm. */
+  let closeConfirmTabId = $state<string | null>(null);
+  const closeConfirmTab = $derived(
+    closeConfirmTabId ? tabs.find(t => t.id === closeConfirmTabId) ?? null : null,
+  );
   /** The Note filter shows a short, newest-first list until asked for more. */
   let noteLimit = $state(10);
 
@@ -503,6 +507,8 @@
   let chatDrawerOpen = $state(false);
   /** Drives the shell's third grid column while the chat panel is expanded. */
   let chatPanelOpen = $state(false);
+  /** Bumped when AI Chat asks Settings to jump to its BYOK section. */
+  let settingsFocus = $state<{ section?: 'chat'; seq: number }>({ seq: 0 });
   // Recently opened hosts for the session picker (most recent first).
   const RECENT_HOSTS_KEY = 'rterm.recent.hosts';
 
@@ -849,19 +855,14 @@
     }
   }
 
-  // ------------------------------------------------------------ quick connect
-  /// Home-screen shortcut: type `ssh user@host[:port]` (or just `user@host`)
-  /// and get a session without creating a vault host first.
-  let quickTarget = $state('');
-  let quickError = $state('');
-  let allowAgent = $state(false);
-
+  // ------------------------------------------------------------------- clock
   let now = $state(new Date());
   let clockTimer: ReturnType<typeof setInterval> | null = null;
   const pad = (value: number) => String(value).padStart(2, '0');
   const clockText = $derived(
     `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`,
   );
+  const clockMain = $derived(`${pad(now.getHours())}:${pad(now.getMinutes())}`);
 
   onDestroy(() => {
     if (clockTimer) clearInterval(clockTimer);
@@ -869,15 +870,7 @@
 
   const QUICK_RE = /^\s*(?:ssh[ \t]+)?([A-Za-z0-9._-]+)@([A-Za-z0-9._-]+)(?::([0-9]{1,5}))?\s*$/;
 
-  const quickParsed = $derived.by(() => {
-    const match = quickTarget.trim().match(QUICK_RE);
-    if (!match) return null;
-    const port = match[3] ? Number(match[3]) : 22;
-    if (port < 1 || port > 65535) return null;
-    return { username: match[1], address: match[2], port };
-  });
-
-  /** Shared by the home card and the strip under the tabs. Returns an error, or null on success. */
+  /** Backs the compact strip under the tab bar. Returns an error, or null on success. */
   function connectQuick(target: string, withAgent: boolean): string | null {
     const match = target.trim().match(QUICK_RE);
     if (!match) return 'Format: ssh username@host:port';
@@ -905,19 +898,7 @@
     return null;
   }
 
-  function quickConnect(event?: SubmitEvent) {
-    event?.preventDefault();
-    const error = connectQuick(quickTarget, allowAgent);
-    if (error) {
-      quickError = error;
-      return;
-    }
-    quickError = '';
-    quickTarget = '';
-    allowAgent = false;
-  }
-
-  // Compact strip directly under the tab bar — same action as the home card.
+  // Compact strip directly under the tab bar.
   let barTarget = $state('');
   let barError = $state('');
 
@@ -1019,6 +1000,13 @@
     };
     tabs = [...tabs, tab];
     addTabToPane(tab.id, lastFocusedOrFirst());
+  }
+
+  /** Open Settings and scroll straight to the AI chat configuration. */
+  function openAiSettingsTab() {
+    window.scrollTo(0, 0);
+    settingsFocus = { section: 'chat', seq: settingsFocus.seq + 1 };
+    openSettingsTab();
   }
 
   /** Promote the AI chat drawer into its own full-width tab. */
@@ -1542,6 +1530,22 @@
     applyPanes(panes);
   }
 
+  /// Only interactive host/SFTP sessions need a guard; page tabs close freely.
+  function requestCloseTab(id: string) {
+    const tab = tabs.find(t => t.id === id);
+    if (tab?.kind === 'ssh' || tab?.kind === 'adhoc' || tab?.kind === 'sftp') {
+      closeConfirmTabId = id;
+      return;
+    }
+    closeTab(id);
+  }
+
+  function confirmCloseTab() {
+    const id = closeConfirmTabId;
+    closeConfirmTabId = null;
+    if (id) closeTab(id);
+  }
+
   function closeTab(id: string) {
     if (id === HOME_ID) return; // the Home tab is pinned
     // File-viewer tabs share the parent SFTP tab's backend session; when the
@@ -1809,6 +1813,7 @@
     onkeydown={event => event.key === 'Enter' && openNote(note)}
   >
     {#if !collapsed}
+      <span class="note-icon" aria-hidden="true"><Icon name="file" size={17} /></span>
       <span class="meta">
         <span class="name">{noteTitle(note.body)}</span>
         <span class="sub">{noteTime(note)}</span>
@@ -1842,10 +1847,81 @@
         <Icon name="trash" size={16} />
       </button>
     {:else}
-      <span class="note-mark" aria-hidden="true">✎</span>
+      <span class="note-icon" aria-hidden="true"><Icon name="file" size={19} /></span>
       {#if note.favorite}<span class="rail-star" aria-hidden="true">★</span>{/if}
     {/if}
   </div>
+{/snippet}
+
+{#snippet noteRows()}
+  {#if visibleNotes.length}
+    {#if !collapsed}
+      <div class="list-heading">{filter === 'favorite' ? 'Favorite notes' : 'Notes'}</div>
+    {/if}
+    {#each visibleNotes as note (note.id)}
+      {@render noteRow(note)}
+    {/each}
+    {#if !collapsed && noteList.length > noteLimit}
+      <button class="load-more" type="button" onclick={() => (noteLimit += 10)}>
+        Load more notes ({noteList.length - noteLimit})
+      </button>
+    {/if}
+  {/if}
+{/snippet}
+
+{#snippet hostRows()}
+  {#if visible.length}
+    {#if !collapsed}
+      <div class="list-heading">{filter === 'favorite' ? 'Favorite hosts' : 'Hosts'}</div>
+    {/if}
+    {#each visible as host (host.id)}
+      <div
+        class="host"
+        class:active={activeHostId === host.id}
+        role="button"
+        tabindex="0"
+        title={collapsed ? `${host.label || host.address} — ${host.username}@${host.address}:${host.port}` : ''}
+        onclick={() => connect(host)}
+        onkeydown={event => event.key === 'Enter' && connect(host)}
+        ondblclick={() => openHostFormTab(host)}
+      >
+        <HostAvatar host={host} size={collapsed ? 32 : 28} />
+        {#if !collapsed}
+          <span class="meta">
+            <span class="name">
+              {#if host.favorite}<span class="star" aria-label="Favorite">★</span>{/if}
+              {host.label || host.address}
+            </span>
+            <span class="sub mono">{host.username}@{host.address}:{host.port}</span>
+          </span>
+          <button
+            class="more sftp"
+            type="button"
+            title="Files (SFTP)"
+            aria-label="Browse files on {host.label || host.address} over SFTP"
+            onclick={event => {
+              event.stopPropagation();
+              openSftpHost(host);
+            }}
+          >
+            <Icon name="folder" size={16} />
+          </button>
+          <button
+            class="more"
+            type="button"
+            title="Edit host"
+            aria-label="Edit host"
+            onclick={event => {
+              event.stopPropagation();
+              openHostFormTab(host);
+            }}
+          >
+            <Icon name="ellipsis" size={17} />
+          </button>
+        {/if}
+      </div>
+    {/each}
+  {/if}
 {/snippet}
 
 <div
@@ -1859,13 +1935,13 @@
     <header>
       {#if collapsed}
         <button
-          class="brand-badge"
+          class="rail-expand"
           type="button"
           title="Expand sidebar"
           aria-label="Expand sidebar"
           onclick={toggleSidebar}
         >
-          <span class="badge-glyphs"><span class="r-letter">R</span><span class="r-caret" aria-hidden="true"></span></span>
+          <Icon name="chevron-right" size={18} />
         </button>
       {:else}
         <span class="wordmark">RuTerm<span class="cursor" aria-hidden="true">_</span></span>
@@ -1948,72 +2024,8 @@
           </button>
         {/if}
       {:else}
-        {#if visibleNotes.length}
-          {#if !collapsed}
-            <div class="list-heading">{filter === 'favorite' ? 'Favorite notes' : 'Notes'}</div>
-          {/if}
-          {#each visibleNotes as note (note.id)}
-            {@render noteRow(note)}
-          {/each}
-          {#if !collapsed && noteList.length > noteLimit}
-            <button class="load-more" type="button" onclick={() => (noteLimit += 10)}>
-              Load more notes ({noteList.length - noteLimit})
-            </button>
-          {/if}
-        {/if}
-
-        {#if visible.length}
-          {#if !collapsed}
-            <div class="list-heading">{filter === 'favorite' ? 'Favorite hosts' : 'Hosts'}</div>
-          {/if}
-          {#each visible as host (host.id)}
-            <div
-              class="host"
-              class:active={activeHostId === host.id}
-              role="button"
-              tabindex="0"
-              title={collapsed ? `${host.label || host.address} — ${host.username}@${host.address}:${host.port}` : ''}
-              onclick={() => connect(host)}
-              onkeydown={event => event.key === 'Enter' && connect(host)}
-              ondblclick={() => openHostFormTab(host)}
-            >
-              <HostAvatar host={host} size={collapsed ? 32 : 28} />
-              {#if !collapsed}
-                <span class="meta">
-                  <span class="name">
-                    {#if host.favorite}<span class="star" aria-label="Favorite">★</span>{/if}
-                    {host.label || host.address}
-                  </span>
-                  <span class="sub mono">{host.username}@{host.address}:{host.port}</span>
-                </span>
-                <button
-                  class="more sftp"
-                  type="button"
-                  title="Files (SFTP)"
-                  aria-label="Browse files on {host.label || host.address} over SFTP"
-                  onclick={event => {
-                    event.stopPropagation();
-                    openSftpHost(host);
-                  }}
-                >
-                  <Icon name="folder" size={16} />
-                </button>
-                <button
-                  class="more"
-                  type="button"
-                  title="Edit host"
-                  aria-label="Edit host"
-                  onclick={event => {
-                    event.stopPropagation();
-                    openHostFormTab(host);
-                  }}
-                >
-                  <Icon name="ellipsis" size={17} />
-                </button>
-              {/if}
-            </div>
-          {/each}
-        {/if}
+        {@render hostRows()}
+        {@render noteRows()}
 
         {#if !collapsed && !visibleNotes.length && !visible.length}
           <div class="empty">
@@ -2056,9 +2068,6 @@
 
     {#if aiAgents.length > 0}
       <div class="side-ai" role="toolbar" aria-label="AI Agent ( Available on this device )">
-        {#if !collapsed}
-          <div class="side-ai-label">AI Agent ( Available on this device )</div>
-        {/if}
         {#each aiAgents as agent (agent.id)}
           <button
             class="side-ai-btn"
@@ -2069,8 +2078,7 @@
             aria-busy={isAgentLaunching(agent)}
             onclick={() => openAgent(agent)}
           >
-            <AiAgentIcon id={agent.id} size={collapsed ? 20 : 18} />
-            {#if !collapsed}<span>{agent.label}</span>{/if}
+            <AiAgentIcon id={agent.id} size={collapsed ? 20 : 19} />
           </button>
         {/each}
       </div>
@@ -2241,7 +2249,7 @@
                       {:else if tab.kind === 'sftpfile'}
                         <span class="tabicon page"><Icon name="file-text" size={13} /></span>
                       {:else if tab.kind === 'note'}
-                        <span class="tabicon page"><Icon name="edit" size={13} /></span>
+                        <span class="tabicon page"><Icon name="file" size={13} /></span>
                       {:else}
                         <HostAvatar host={tabHost(tab)} size={16} />
                       {/if}
@@ -2262,7 +2270,7 @@
                           aria-label="Close tab"
                           onclick={event => {
                             event.stopPropagation();
-                            closeTab(tab.id);
+                            requestCloseTab(tab.id);
                           }}
                         >
                           <Icon name="close" size={12} />
@@ -2303,97 +2311,50 @@
                   <div class="pane" class:hidden={pane.active !== id}>
                     {#if tab.kind === 'home'}
                       <div class="empty-main home-panel">
-        <div class="hero" class:frosted={background.mode === 'image'} class:clock={!ui.homeQuickConnect} style={frostStyle()}>
-        {#if ui.homeQuickConnect}
-          <div class="eyebrow"><span class="hero-badge">R</span>RUTERM · SSH CLIENT</div>
-          <h1>Connect in one line.</h1>
-          <p class="lede">
-            Type <code class="mono qc-code">ssh user@host:port</code> and hit Connect — no host setup
-            needed. Saved hosts live in the sidebar.
-          </p>
+                        <div class="hero" class:frosted={background.mode === 'image'} style={frostStyle()}>
+                          <div class="clock-view" role="timer" aria-label="Current time">
+                            <div class="digital-clock mono">{clockText}</div>
+                            <div class="clock-brand">RuTerm <span>|</span> SSH Client</div>
+                          </div>
+                          <div class="hero-actions">
+                            <button class="btn primary" onclick={startBlank}>
+                              <Icon name="plus" size={17} />
+                              New host
+                            </button>
+                            <button class="btn" onclick={openLocal} title="Open a shell on this device">
+                              <Icon name="terminal" size={16} />
+                              Local terminal
+                            </button>
+                            <button class="btn" onclick={openWhatsNewTab} title="Open release notes">
+                              <Icon name="spark" size={16} />
+                              What's New?
+                              {#if newsState.unread > 0}
+                                <span class="badge-count" aria-label={`${newsState.unread} unread release notes`}>
+                                  {newsState.unread > 9 ? '9+' : newsState.unread}
+                                </span>
+                              {/if}
+                            </button>
+                          </div>
+                        </div>
 
-          <form class="quick-connect" onsubmit={quickConnect}>
-            <label class="qc-label" for="quick-target">Quick connect</label>
-            <div class="qc-row">
-              <span class="qc-prefix mono" aria-hidden="true">ssh</span>
-              <input
-                id="quick-target"
-                class="qc-input mono"
-                bind:value={quickTarget}
-                placeholder="user@10.0.0.5:22"
-                autocapitalize="off"
-                autocomplete="off"
-                autocorrect="off"
-                spellcheck="false"
-              />
-              <button class="btn primary qc-button" type="submit">
-                Connect
-                <Icon name="chevron-right" size={16} />
-              </button>
-            </div>
-            <label class="qc-agent" for="qc-agent">
-              <span class="qc-check" class:checked={allowAgent}>
-                <input id="qc-agent" type="checkbox" bind:checked={allowAgent} />
-              </span>
-              <span class="qc-agent-text">
-                <span>Allow this host to use my SSH agent</span>
-                <span class="muted tiny">It can request signatures from your keys.</span>
-              </span>
-            </label>
-            <div class="qc-foot">
-              {#if quickError}
-                <p class="qc-error" role="alert">{quickError}</p>
-              {:else if quickParsed}
-                <p class="qc-parsed tiny mono">→ {quickParsed.username}@{quickParsed.address}:{quickParsed.port} · opens a new tab</p>
-              {:else}
-                <p class="qc-hint tiny muted">Opens directly in a new tab — your host key is pinned on first contact.</p>
-              {/if}
-            </div>
-          </form>
-
-          <div class="hero-actions">
-            <button class="btn primary" onclick={startBlank}>
-              <Icon name="plus" size={18} />
-              New host
-            </button>
-            <button class="btn" onclick={openLocal} title="Open a shell on this device">
-              <Icon name="terminal" size={17} />
-              Local terminal
-            </button>
-            <button class="btn" onclick={openWhatsNewTab} title="Open release notes">
-              <Icon name="spark" size={17} />
-              What's New?
-              {#if newsState.unread > 0}
-                <span class="badge-count" aria-label={`${newsState.unread} unread release notes`}>
-                  {newsState.unread > 9 ? '9+' : newsState.unread}
-                </span>
-              {/if}
-            </button>
-          </div>
-        {:else}
-          <div class="clock-view" role="timer" aria-label="Current time">
-            <div class="digital-clock mono">{clockText}</div>
-            <div class="clock-brand">RuTerm <span>|</span> SSH Client</div>
-          </div>
-        {/if}
-        </div>
-
-        <nav class="empty-links" aria-label="About RuTerm">
-          <button type="button" onclick={() => openInfoTab('about')}>About</button>
-          <button type="button" onclick={() => openInfoTab('terms')}>Terms</button>
-          <button type="button" onclick={() => openInfoTab('privacy')}>Privacy</button>
-          <button type="button" onclick={() => openInfoTab('contact')}>Contact</button>
-          <button type="button" onclick={() => openInfoTab('github')}>GitHub</button>
-        </nav>
+                        <nav class="empty-links" aria-label="About RuTerm">
+                          <button type="button" onclick={() => openInfoTab('about')}>About</button>
+                          <button type="button" onclick={() => openInfoTab('terms')}>Terms</button>
+                          <button type="button" onclick={() => openInfoTab('privacy')}>Privacy</button>
+                          <button type="button" onclick={() => openInfoTab('contact')}>Contact</button>
+                          <button type="button" onclick={() => openInfoTab('github')}>GitHub</button>
+                        </nav>
                       </div>
                     {:else if tab.kind === 'chat'}
                       <AiChatDrawer
                         variant="tab"
                         onminimize={minimizeChatTab}
                         onclose={closeChatTab}
+                        onopensettings={openAiSettingsTab}
                       />
                     {:else if tab.kind === 'settings'}
                       <Settings
+                        focus={settingsFocus}
                         onclose={() => closeTab(tab.id)}
                         onopeninfo={openInfoTab}
                         onopenwhatsnew={openWhatsNewTab}
@@ -2543,7 +2504,7 @@
               void openNewNote();
             }}
           >
-            <span class="action-icon note"><Icon name="edit" size={15} /></span>
+            <span class="action-icon note"><Icon name="file" size={15} /></span>
             <span class="meta">
               <span class="name">New note</span>
               <span class="sub">Write something to remember</span>
@@ -2681,7 +2642,7 @@
               Delete note
             </button>
           {/if}
-          <button type="button" role="menuitem" class="danger" title="Close this session" onclick={() => { closeTabMenu(); closeTab(menuTab.id); }}>
+          <button type="button" role="menuitem" class="danger" title="Close this session" onclick={() => { closeTabMenu(); requestCloseTab(menuTab.id); }}>
             <Icon name="close" size={15} />
             Close Tab
           </button>
@@ -2750,6 +2711,23 @@
     </ConfirmDialog>
   {/if}
 
+  {#if closeConfirmTab}
+    <ConfirmDialog
+      title="Close this vault tab?"
+      confirmLabel="Close tab"
+      oncancel={() => (closeConfirmTabId = null)}
+      onconfirm={confirmCloseTab}
+    >
+      <p>
+        Closing <strong>{closeConfirmTab.title}</strong> will end its active session. You can
+        reconnect from the sidebar anytime.
+      </p>
+      {#if closeConfirmTab.kind === 'sftp'}
+        <p class="mcp-hint">File viewers opened from this SFTP session will close too.</p>
+      {/if}
+    </ConfirmDialog>
+  {/if}
+
   {#if mcpConfirm}
     <ConfirmDialog
       title="Run this command on the VPS?"
@@ -2775,6 +2753,7 @@
       startOpen={chatDrawerOpen}
       onfullscreen={openChatTab}
       onopenchange={value => (chatPanelOpen = value)}
+      onopensettings={openAiSettingsTab}
     />
   {/if}
 
@@ -2811,14 +2790,14 @@
     transition: grid-template-columns 0.18s ease;
   }
   .shell.collapsed {
-    grid-template-columns: 64px minmax(0, 1fr);
+    grid-template-columns: 84px minmax(0, 1fr);
   }
   /* The chat panel is a real third column of the page, not an overlay. */
   .shell.chat-open {
     grid-template-columns: 280px minmax(0, 1fr) min(420px, 34vw);
   }
   .shell.collapsed.chat-open {
-    grid-template-columns: 64px minmax(0, 1fr) min(420px, 34vw);
+    grid-template-columns: 84px minmax(0, 1fr) min(420px, 34vw);
   }
   /* With a backdrop picked in Settings, one photo/pattern spans the whole
      shell so it continues behind the translucent sidebar. */
@@ -2861,52 +2840,28 @@
     gap: 4px;
     padding: 16px 10px 8px 14px;
   }
+  /* Expand affordance sits a little lower so it clears the native traffic
+     lights instead of crowding them. */
   .collapsed aside header {
     justify-content: center;
     padding: 16px 0 12px;
   }
-
-  /* Collapsed rail: the mark is the whole brand. */
-  .brand-badge {
-    width: 36px;
-    height: 36px;
+  .rail-expand {
     display: grid;
     place-items: center;
+    width: 34px;
+    height: 34px;
     padding: 0;
     border-radius: 50%;
     border: 1px solid var(--accent-dim);
     background: var(--accent-dim);
     color: var(--accent);
-    font-family: var(--term);
-    line-height: 1;
     cursor: pointer;
     transition:
       background 0.15s ease,
       border-color 0.15s ease;
   }
-  .badge-glyphs {
-    /* Lifts the pair ~1px so the low-hanging caret sits optically centered. */
-    display: inline-flex;
-    align-items: flex-end;
-    gap: 1.5px;
-    transform: translateY(-1px);
-  }
-  .r-letter {
-    font-size: 14px;
-    font-weight: 800;
-    line-height: 1;
-  }
-  .r-caret {
-    width: 0.52em;
-    font-size: 14px;
-    height: 2px;
-    min-width: 7px;
-    border-radius: 1px;
-    background: var(--accent);
-    margin-bottom: 2px;
-    animation: caret 1.15s step-end infinite;
-  }
-  .brand-badge:hover {
+  .rail-expand:hover {
     background: var(--accent-dim);
     border-color: var(--accent);
   }
@@ -3090,7 +3045,15 @@
   .collapsed .host.active::before {
     display: none;
   }
-
+  .note-icon {
+    display: grid;
+    place-items: center;
+    flex: 0 0 auto;
+    color: var(--text-tertiary);
+  }
+  .host.active .note-icon {
+    color: var(--accent);
+  }
 
   .meta {
     display: flex;
@@ -3291,51 +3254,16 @@
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 16px;
+    gap: 24px;
     width: 100%;
     max-width: 700px;
     text-align: center;
   }
-  .hero.clock {
-    max-width: none;
-  }
-  /* Clock mode keeps the wallpaper more legible: lighter tint, gentler blur. */
-  .hero.clock.frosted {
-    background: color-mix(in srgb, var(--panel) 30%, transparent);
-    backdrop-filter: blur(7px) saturate(125%);
-    -webkit-backdrop-filter: blur(7px) saturate(125%);
-  }
-  .clock-view {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 14px;
-    user-select: none;
-  }
-  .digital-clock {
-    font-size: clamp(38px, 6vw, 68px);
-    font-weight: 300;
-    line-height: 1;
-    letter-spacing: -0.04em;
-    color: color-mix(in srgb, var(--text) 82%, var(--bg));
-    font-variant-numeric: tabular-nums;
-  }
-  .clock-brand {
-    font-size: clamp(14px, 2vw, 19px);
-    font-weight: 650;
-    letter-spacing: 0.12em;
-    color: color-mix(in srgb, var(--text) 72%, var(--bg));
-  }
-  .clock-brand span {
-    margin: 0 6px;
-    color: var(--accent);
-  }
-  /* Frosted card behind the text/form: the photo stays sharp everywhere else. */
+  /* Only wallpaper mode gets a subtle frosted surface; no card otherwise. */
   .hero.frosted {
-    max-width: 640px;
-    padding: 34px 40px 30px;
-    border-radius: 22px;
+    padding: 28px 32px;
     border: 1px solid var(--line);
+    border-radius: 18px;
     background: color-mix(in srgb, var(--panel) var(--frost-alpha, 45%), transparent);
     backdrop-filter: blur(var(--frost-blur, 10px)) saturate(150%);
     -webkit-backdrop-filter: blur(var(--frost-blur, 10px)) saturate(150%);
@@ -3345,88 +3273,32 @@
       background: color-mix(in srgb, var(--panel) 92%, transparent);
     }
   }
-  .eyebrow {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.16em;
-    text-transform: uppercase;
-    color: var(--text-tertiary);
-    user-select: none;
-  }
-  .hero-badge {
-    display: grid;
-    place-items: center;
-    width: 26px;
-    height: 26px;
-    border-radius: 7px;
-    border: 1px solid var(--accent-dim);
-    background: var(--accent-dim);
-    color: var(--accent);
-    font-family: var(--term);
-    font-size: 12px;
-    font-weight: 700;
-    letter-spacing: 0;
-  }
-  .empty-main h1 {
-    margin: 0;
-    font-size: 26px;
-    font-weight: 650;
-    letter-spacing: -0.035em;
-  }
-  .lede {
-    margin: 0;
-    max-width: 50ch;
-    color: var(--text-secondary);
-    font-size: 13.5px;
-    line-height: 1.6;
-  }
-
-  /* ---- quick connect card on the home screen ---- */
-  .quick-connect {
-    width: 100%;
-    margin-top: 6px;
+  .clock-view {
     display: flex;
     flex-direction: column;
+    align-items: center;
     gap: 10px;
-    padding: 18px;
-    border: 1px solid var(--line);
-    border-radius: 16px;
-    background: var(--bg);
-    text-align: left;
-  }
-  .qc-label {
-    margin: 0;
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.09em;
-    text-transform: uppercase;
-    color: var(--text-tertiary);
     user-select: none;
   }
-  .qc-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
+  .digital-clock {
+    font-size: clamp(42px, 6vw, 72px);
+    font-weight: 300;
+    line-height: 1;
+    letter-spacing: -0.04em;
+    color: color-mix(in srgb, var(--text) 85%, var(--bg));
+    font-variant-numeric: tabular-nums;
   }
-  .qc-prefix {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 42px;
-    height: 44px;
-    flex: 0 0 auto;
-    border-radius: 10px;
-    border: 1px solid var(--line);
-    background: var(--bg-elevated);
-    color: var(--text-secondary);
-    font-size: 12.5px;
+  .clock-brand {
+    font-size: 14px;
     font-weight: 600;
-    letter-spacing: 0.02em;
-    user-select: none;
+    letter-spacing: 0.14em;
+    color: color-mix(in srgb, var(--text) 65%, var(--bg));
   }
+  .clock-brand span {
+    margin: 0 6px;
+    color: var(--accent);
+  }
+  /* Shared by the compact quick-connect strip under the tab bar. */
   .qc-input {
     flex: 1;
     height: 44px;
@@ -3449,166 +3321,53 @@
     border-radius: 10px;
     font-size: 13px;
   }
-  .qc-code {
-    padding: 1px 6px;
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    background: var(--bg-elevated);
-    font-size: 0.9em;
-  }
   .qc-error {
     margin: 0;
     font-size: 12px;
     color: var(--bad);
   }
-  .qc-parsed {
-    margin: 0;
-    color: var(--text-secondary);
-    overflow-wrap: anywhere;
-  }
-  .qc-hint {
-    margin: 0;
-  }
-  .qc-foot {
-    min-height: 18px;
-  }
-  .qc-agent {
-    display: flex;
-    align-items: flex-start;
-    gap: 10px;
-    margin-top: 2px;
-    padding: 10px 12px;
-    border: 1px solid var(--line);
-    border-radius: 10px;
-    background: var(--bg-elevated);
-    cursor: pointer;
-  }
-  .qc-agent:hover {
-    border-color: var(--line-hover);
-    background: var(--panel-hover);
-  }
-  .qc-check {
-    position: relative;
-    display: block;
-    width: 22px;
-    height: 22px;
-    flex: 0 0 auto;
-    margin-top: 1px;
-  }
-  .qc-check input {
-    position: absolute;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    margin: 0;
-    opacity: 0;
-    cursor: pointer;
-  }
-  .qc-check::before {
-    content: '';
-    position: absolute;
-    inset: 0;
-    border-radius: 7px;
-    border: 1px solid var(--line-hover);
-    background: var(--bg);
-    transition: background 0.15s ease, border-color 0.15s ease;
-  }
-  .qc-check::after {
-    content: '';
-    position: absolute;
-    left: 7px;
-    top: 3px;
-    width: 6px;
-    height: 11px;
-    border: solid var(--accent-on);
-    border-width: 0 2px 2px 0;
-    transform: rotate(45deg);
-    opacity: 0;
-  }
-  .qc-check.checked::before {
-    background: var(--accent);
-    border-color: transparent;
-    box-shadow: 0 0 0 3px var(--accent-dim);
-  }
-  .qc-check.checked::after {
-    opacity: 1;
-  }
-  .qc-check:has(input:focus-visible) {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-    border-radius: 7px;
-  }
-  .qc-agent-text {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    font-size: 12px;
-    line-height: 1.45;
-    color: var(--text-secondary);
-  }
-  .qc-agent-text .tiny {
-    font-size: 11.5px;
-  }
-
-  /* ------------------------------------- AI agents, docked in the sidebar */
+  /* ------------------------------------- AI agents, icon-only dock */
   .side-ai {
     flex: 0 0 auto;
-    max-height: 168px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    max-height: 116px;
     overflow-y: auto;
-    padding: 7px 10px 9px;
+    padding: 8px 10px 10px;
     border-top: 1px solid var(--line);
   }
   .collapsed .side-ai {
-    display: flex;
     flex-direction: column;
+    flex-wrap: nowrap;
     align-items: center;
-    gap: 4px;
+    gap: 5px;
     padding: 8px;
   }
-  .side-ai-label {
-    margin-bottom: 5px;
-    font-size: 10.5px;
-    font-weight: 650;
-    letter-spacing: 0.02em;
-    line-height: 1.35;
-    color: var(--text-tertiary);
-    user-select: none;
-  }
   .side-ai-btn {
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    width: 100%;
-    height: 30px;
-    padding: 0 8px;
-    border: 1px solid transparent;
-    border-radius: 8px;
-    background: transparent;
-    color: var(--text-tertiary);
-    font-size: 12.5px;
-    font-weight: 550;
-    text-align: left;
+    display: grid;
+    place-items: center;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    background: var(--panel-hover);
     cursor: pointer;
-    transition: color 0.14s ease, background 0.14s ease, border-color 0.14s ease;
+    transition: background 0.14s ease, border-color 0.14s ease, transform 0.14s ease;
   }
   .side-ai-btn :global(.ai-icon) {
-    filter: grayscale(1);
-    opacity: 0.55;
-    transition: filter 0.14s ease, opacity 0.14s ease;
+    display: block;
+    border-radius: 7px;
   }
   .side-ai-btn:hover,
   .side-ai-btn:focus-visible {
-    color: var(--text);
-    background: var(--panel-hover);
-    border-color: var(--line);
-  }
-  .side-ai-btn:hover :global(.ai-icon),
-  .side-ai-btn:focus-visible :global(.ai-icon) {
-    filter: none;
-    opacity: 1;
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 16%, var(--panel-hover));
+    transform: translateY(-1px);
   }
   .side-ai-btn.launching {
-    color: var(--text);
+    border-color: var(--accent);
   }
   .side-ai-btn.launching :global(.ai-icon) {
     animation: aiLaunchPulse 1.15s ease-in-out infinite;
@@ -3616,8 +3375,6 @@
   .collapsed .side-ai-btn {
     width: 34px;
     height: 34px;
-    padding: 0;
-    justify-content: center;
   }
   .side-ai-btn:focus-visible {
     outline: 2px solid var(--accent);
@@ -3642,8 +3399,9 @@
 
   .hero-actions {
     display: flex;
-    gap: 12px;
-    margin-top: 2px;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 10px;
   }
   .badge-count {
     display: inline-grid;

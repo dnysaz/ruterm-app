@@ -1,7 +1,13 @@
 {
   "version": 1,
-  "generated_at": "2026-11-24T03:47:10.270Z",
+  "generated_at": "2026-11-24T05:12:49.725Z",
   "entries": [
+    {
+      "file": "2026-11-24-notes-chat-and-safer-tabs.md",
+      "date": "2026-11-24",
+      "title": "Notes, chat and sidebar polish — plus safer tab closing",
+      "summary": "A round of small fixes that make the everyday paths feel calmer: notes behave"
+    },
     {
       "file": "2026-11-23-notes-code-blocks.md",
       "date": "2026-11-23",

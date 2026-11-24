@@ -44,30 +44,10 @@ function readTheme(): Theme {
   return 'dark';
 }
 
-const HOME_QUICK_CONNECT_KEY = 'rterm.home.quick-connect';
-
-function readHomeQuickConnect(): boolean {
-  try {
-    return localStorage.getItem(HOME_QUICK_CONNECT_KEY) !== 'off';
-  } catch {
-    return true;
-  }
-}
-
 export const ui = $state({
   zoom: read(),
   theme: readTheme(),
-  homeQuickConnect: readHomeQuickConnect(),
 });
-
-export function setHomeQuickConnect(enabled: boolean) {
-  ui.homeQuickConnect = enabled;
-  try {
-    localStorage.setItem(HOME_QUICK_CONNECT_KEY, enabled ? 'on' : 'off');
-  } catch {
-    /* ignore */
-  }
-}
 
 export function applyTheme(theme: Theme) {
   ui.theme = theme;

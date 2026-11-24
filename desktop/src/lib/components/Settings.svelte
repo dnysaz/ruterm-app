@@ -1,26 +1,33 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { api, errorText, type ChatConfig, type ChatModel } from '#lib/api';
   import { app, changeAccount, lock, notify, setRememberKey, signIn, signOut, syncNow } from '#lib/state.svelte';
-  import { applyTheme, setHomeQuickConnect, ui, type Theme } from '#lib/ui.svelte';
+  import { applyTheme, ui, type Theme } from '#lib/ui.svelte';
   import { isRestoreEnabled, setRestoreEnabled } from '#lib/scrollback';
   import Icon from './Icon.svelte';
   import GoogleIcon from './GoogleIcon.svelte';
   import BackgroundSettings from './BackgroundSettings.svelte';
   import { newsState } from '#lib/news.svelte';
+  import { openExternalLink } from '#lib/external';
+
+  const OPENROUTER_KEYS_URL = 'https://openrouter.ai/keys';
 
   let {
     onclose,
     onopeninfo,
     onopenwhatsnew,
+    focus,
   }: {
     onclose?: () => void;
     onopeninfo?: (page: 'about' | 'terms' | 'privacy' | 'contact' | 'github') => void;
     onopenwhatsnew?: () => void;
+    focus?: { section?: 'chat'; seq: number };
   } = $props();
 
   let version = $state('');
   let restoreScrollback = $state(isRestoreEnabled());
+  let chatSectionEl = $state<HTMLElement>();
+  let settingsScroller = $state<HTMLDivElement>();
 
   // BYOK AI chat. Rust only exposes key *status*, never the key itself.
   let chatCfg = $state<ChatConfig>({
@@ -185,6 +192,28 @@
     return () => window.removeEventListener('pointerdown', onPointerDown);
   });
 
+  // A fresh token means another "open AI settings" request, even when this
+  // Settings tab is already mounted from an earlier click.
+  $effect(() => {
+    const request = focus?.seq ?? 0;
+    if (!request || focus?.section !== 'chat') return;
+    void tick().then(() => {
+      const section = chatSectionEl;
+      const scroller = settingsScroller;
+      if (!section || !scroller) return;
+      // Scroll only this inner container. scrollIntoView() also climbs to the
+      // webview ancestor and drags the whole Settings tab upward.
+      const offset = section.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+      scroller.scrollTop = Math.max(0, scroller.scrollTop + offset - 16);
+      // A previous scrollIntoView may have left the webview itself scrolled;
+      // pin every outer scroll container back to the top.
+      window.scrollTo(0, 0);
+      document.documentElement.scrollTop = 0;
+      document.body.scrollTop = 0;
+      (document.querySelector('#svelte') as HTMLElement | null)?.scrollTo(0, 0);
+    });
+  });
+
 </script>
 
 <div class="page">
@@ -201,7 +230,7 @@
     {/if}
   </header>
 
-  <div class="scroll">
+  <div class="scroll" bind:this={settingsScroller}>
     <div class="column">
 
       <section class="section">
@@ -316,24 +345,21 @@
               aria-label="Dark theme"
             />
           </label>
-          <label class="row switch-row">
-            <div class="cell">
-              <div class="strong">Quick connect on home screen</div>
-              <small>Hide it to show a large clock with the RuTerm wordmark instead.</small>
-            </div>
-            <input
-              type="checkbox"
-              class="switch"
-              checked={ui.homeQuickConnect}
-              onchange={event => setHomeQuickConnect(event.currentTarget.checked)}
-              aria-label="Quick connect on home screen"
-            />
-          </label>
         </div>
       </section>
 
-      <section class="section chat-section">
-        <h2 class="section-title">RuTerm AI Chat (BYOK)</h2>
+      <section class="section chat-section" bind:this={chatSectionEl}>
+        <div class="section-heading">
+          <h2 class="section-title">RuTerm AI Chat (BYOK)</h2>
+          <button
+            class="section-link"
+            type="button"
+            title="Get a free OpenRouter API key"
+            onclick={() => void openExternalLink(OPENROUTER_KEYS_URL)}
+          >
+            Get a free API key <span aria-hidden="true">↗</span>
+          </button>
+        </div>
         <div class="chat-card">
           <div class="chat-field">
             <div class="chat-label">
@@ -680,6 +706,28 @@
     letter-spacing: -0.015em;
     color: var(--text);
     user-select: none;
+  }
+  .section-heading {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .section-link {
+    flex: 0 0 auto;
+    padding: 0 4px 10px;
+    border: 0;
+    background: transparent;
+    color: var(--accent);
+    font-size: 12.5px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .section-link:hover {
+    color: var(--text);
+  }
+  .section-link span {
+    margin-left: 3px;
   }
 
   .group {

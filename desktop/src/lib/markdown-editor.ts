@@ -8,6 +8,7 @@
 import { loadMonaco } from './components/CodeEditor.svelte';
 import { renderSafeMarkdown } from './markdown';
 import { languageForLabel } from './languages';
+import { ui } from '#lib/ui.svelte';
 
 const BLOCKS = 'p,div,h1,h2,h3,h4,h5,h6,ul,ol,li,blockquote,pre,hr,table';
 
@@ -603,19 +604,26 @@ function setCaretTextOffset(code: HTMLElement, offset: number): void {
 }
 
 let colorizeSequence = 0;
+let colorizeTheme: string | null = null;
 
 /** Monaco token colours for fenced code blocks inside the live editor. */
 export async function colorizeCode(root: HTMLElement): Promise<void> {
   const blocks = Array.from(root.querySelectorAll('pre > code')) as HTMLElement[];
   if (!blocks.length) return;
   const sequence = ++colorizeSequence;
+  const theme = ui.theme === 'light' ? 'rterm-light' : 'rterm-dark';
+  const themeChanged = colorizeTheme !== theme;
+  colorizeTheme = theme;
   try {
     const monaco = await loadMonaco();
     if (sequence !== colorizeSequence || !root.isConnected) return;
+    // colorize() bakes the active theme into inline styles. Without this the
+    // light default leaks dark tokens into dark-theme notes.
+    monaco.editor.setTheme(theme);
     for (const code of blocks) {
       const offset = caretTextOffset(code);
       const source = preText(code);
-      if (!source || code.dataset.colored === source) continue;
+      if (!source || (!themeChanged && code.dataset.colored === source)) continue;
       const label = code.className.match(/language-([\w-]+)/)?.[1] ?? 'plaintext';
       const html = await monaco.editor.colorize(source, languageForLabel(label), { tabSize: 2 });
       if (sequence !== colorizeSequence || !code.isConnected) return;

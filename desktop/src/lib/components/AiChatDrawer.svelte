@@ -22,6 +22,7 @@
     onminimize,
     onclose,
     onopenchange,
+    onopensettings,
   }: {
     variant?: 'drawer' | 'tab';
     /** Keep the drawer expanded when returning from the full tab. */
@@ -30,6 +31,7 @@
     onminimize?: () => void;
     onclose?: () => void;
     onopenchange?: (open: boolean) => void;
+    onopensettings?: () => void;
   } = $props();
 
   /** Stable per-process conversation id; never persisted by Rust. */
@@ -115,12 +117,17 @@
   let copiedKey = $state<string | null>(null);
   let copyTimer: ReturnType<typeof setTimeout> | null = null;
   let scroller = $state<HTMLDivElement>();
+  let suggestionScroller = $state<HTMLDivElement>();
   let inputEl = $state<HTMLTextAreaElement>();
   let hydrated = $state(false);
   let loadedKey = $state('');
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
   let watchdog: ReturnType<typeof setInterval> | null = null;
   let lastActivity = 0;
+
+  function scrollSuggestions(direction: -1 | 1) {
+    suggestionScroller?.scrollBy({ left: direction * 220, behavior: 'smooth' });
+  }
 
   function stopWatchdog() {
     if (watchdog) clearInterval(watchdog);
@@ -443,6 +450,14 @@
       <div class="head-actions">
         <button
           class="icon-btn"
+          title="AI chat settings"
+          aria-label="AI chat settings"
+          onclick={() => onopensettings?.()}
+        >
+          <Icon name="settings" size={15} />
+        </button>
+        <button
+          class="icon-btn"
           title={busy
             ? 'Wait for the reply to finish'
             : variant === 'tab'
@@ -471,16 +486,43 @@
     <div class="chat-body" bind:this={scroller}>
       {#if messages.length === 0}
         <div class="empty">
-          <span class="empty-icon"><Icon name="spark" size={26} /></span>
-          <h2>What can I help with?</h2>
-          <p>Ask about your saved hosts, notes, snippets and VPS work logs.</p>
-          <div class="suggestions">
-            <button type="button" disabled={busy || !cfg.configured} onclick={() => void send('List my saved hosts')}>List my saved hosts</button>
-            <button type="button" disabled={busy || !cfg.configured} onclick={() => void send('Summarize my notes')}>Summarize my notes</button>
-            <button type="button" disabled={busy || !cfg.configured} onclick={() => void send('Show snippets for deploying')}>Show deploy snippets</button>
+          <div class="welcome-head">
+            <span class="empty-icon"><Icon name="spark" size={26} /></span>
+            <h2 class="welcome-title">RuTerm AI Chat</h2>
+            <p class="welcome-prompt">What can I help with?</p>
+            <p>Ask about your saved hosts, notes, snippets and VPS work logs.</p>
+          </div>
+          <div class="suggestions" bind:this={suggestionScroller}>
+            <button type="button" class="suggest-card" disabled={busy || !cfg.configured} onclick={() => void send('List my saved hosts')}>
+              <span class="suggest-icon"><Icon name="terminal" size={18} /></span>
+              <span class="suggest-label">List my saved hosts</span>
+              <span class="suggest-arrow"><Icon name="chevron-right" size={14} /></span>
+            </button>
+            <button type="button" class="suggest-card" disabled={busy || !cfg.configured} onclick={() => void send('Summarize my notes')}>
+              <span class="suggest-icon"><Icon name="file-text" size={18} /></span>
+              <span class="suggest-label">Summarize my notes</span>
+              <span class="suggest-arrow"><Icon name="chevron-right" size={14} /></span>
+            </button>
+            <button type="button" class="suggest-card" disabled={busy || !cfg.configured} onclick={() => void send('Show snippets for deploying')}>
+              <span class="suggest-icon"><Icon name="code" size={18} /></span>
+              <span class="suggest-label">Show deploy snippets</span>
+              <span class="suggest-arrow"><Icon name="chevron-right" size={14} /></span>
+            </button>
             {#if cfg.allow_vps}
-              <button type="button" disabled={busy || !cfg.configured || !target} onclick={() => void send('Check disk space on this VPS')}>Check disk space on this VPS</button>
+              <button type="button" class="suggest-card" disabled={busy || !cfg.configured || !target} onclick={() => void send('Check disk space on this VPS')}>
+                <span class="suggest-icon"><Icon name="info" size={18} /></span>
+                <span class="suggest-label">Check disk space on this VPS</span>
+                <span class="suggest-arrow"><Icon name="chevron-right" size={14} /></span>
+              </button>
             {/if}
+          </div>
+          <div class="suggest-nav" aria-label="Scroll suggestions">
+            <button type="button" aria-label="Previous suggestions" onclick={() => scrollSuggestions(-1)}>
+              <Icon name="chevron-left" size={15} />
+            </button>
+            <button type="button" aria-label="Next suggestions" onclick={() => scrollSuggestions(1)}>
+              <Icon name="chevron-right" size={15} />
+            </button>
           </div>
           <p class="scope">
             {cfg.allow_vps
@@ -792,34 +834,126 @@
   }
 
   .empty {
+    width: 100%;
     margin: auto;
     text-align: center;
-    max-width: 280px;
+  }
+  .chat-drawer.tab .empty {
+    max-width: 860px;
+  }
+  .welcome-head {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 5px;
   }
   .empty-icon {
     display: inline-grid;
     place-items: center;
     width: 52px;
     height: 52px;
+    margin-bottom: 8px;
     border-radius: 16px;
     background: color-mix(in srgb, var(--accent) 14%, transparent);
     color: var(--accent);
   }
-  .empty h2 { margin: 14px 0 4px; font-size: 16px; font-weight: 600; }
+  .welcome-title {
+    margin: 0;
+    font-size: clamp(28px, 4vw, 40px);
+    font-weight: 650;
+    letter-spacing: -0.035em;
+    line-height: 1.1;
+    color: var(--text);
+  }
+  .empty .welcome-prompt {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text);
+  }
   .empty p { margin: 0; font-size: 13.5px; line-height: 1.6; color: var(--text-secondary); }
-  .empty .scope { margin-top: 16px; color: var(--text-tertiary); font-size: 11px; }
-  .suggestions { display: flex; flex-direction: column; gap: 6px; margin-top: 16px; }
-  .suggestions button {
-    padding: 8px 10px;
+  .empty .scope { margin-top: 18px; color: var(--text-tertiary); font-size: 11px; }
+
+  /* Suggestion cards read left-to-right and scroll horizontally in the narrow
+     drawer; each one eases in from the left in the same order. */
+  .suggestions {
+    display: flex;
+    gap: 10px;
+    margin-top: 24px;
+    padding-bottom: 6px;
+    overflow-x: auto;
+    scroll-snap-type: x mandatory;
+    scrollbar-width: none;
+  }
+  .suggestions::-webkit-scrollbar { display: none; }
+  .suggest-card {
+    scroll-snap-align: start;
+    flex: 0 0 auto;
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 10px;
+    width: 210px;
+    min-height: 92px;
+    padding: 14px;
     border: 1px solid var(--line);
+    border-radius: 14px;
+    background: var(--bg-elevated);
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 600;
+    text-align: left;
+    cursor: pointer;
+    animation: suggestIn 0.32s ease both;
+  }
+  .suggest-card:nth-child(2) { animation-delay: 0.05s; }
+  .suggest-card:nth-child(3) { animation-delay: 0.1s; }
+  .suggest-card:nth-child(4) { animation-delay: 0.15s; }
+  .suggest-icon {
+    display: grid;
+    place-items: center;
+    width: 32px;
+    height: 32px;
     border-radius: 9px;
+    background: var(--accent-dim);
+    color: var(--accent);
+  }
+  .suggest-label { line-height: 1.35; }
+  .suggest-arrow {
+    display: grid;
+    place-items: center;
+    color: var(--text-tertiary);
+  }
+  .suggest-card:hover:not(:disabled) { border-color: var(--accent); background: var(--panel-hover); }
+  .suggest-card:disabled { opacity: 0.45; cursor: not-allowed; animation: none; }
+  .suggest-nav {
+    display: flex;
+    justify-content: flex-end;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .suggest-nav button {
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: 1px solid var(--line);
+    border-radius: 8px;
     background: var(--bg-elevated);
     color: var(--text-secondary);
-    font-size: 12.5px;
     cursor: pointer;
   }
-  .suggestions button:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
-  .suggestions button:disabled { opacity: 0.45; cursor: not-allowed; }
+  .suggest-nav button:hover {
+    border-color: var(--accent);
+    color: var(--text);
+  }
+  @keyframes suggestIn {
+    from { opacity: 0; transform: translateX(-14px); }
+    to { opacity: 1; transform: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .suggest-card { animation: none; }
+  }
 
   .bubble-row {
     display: flex;
