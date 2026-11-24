@@ -1965,8 +1965,8 @@ fn validated_local_env(
         if value.is_empty() || value.len() > 16 * 1024 || value.chars().any(char::is_control) {
             return Err("Invalid OpenCode config content".into());
         }
-        let json: serde_json::Value =
-            serde_json::from_str(&value).map_err(|_| "Invalid OpenCode config content".into())?;
+        let json: serde_json::Value = serde_json::from_str(&value)
+            .map_err(|_| "Invalid OpenCode config content".to_string())?;
         if !json.is_object() {
             return Err("Invalid OpenCode config content".into());
         }

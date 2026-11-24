@@ -145,9 +145,15 @@ impl JsonSyncDoc {
     /// Verifies the whole envelope before any merge/adoption. Missing MACs
     /// (legacy documents) fail closed rather than being treated as trusted.
     pub fn verify_integrity(&self, key: &SecretKey) -> Result<(), BridgeError> {
-        let raw = self.mac.strip_prefix(MAC_PREFIX).unwrap_or("");
-        if raw.is_empty() {
+        if self.mac.is_empty() {
             return Err(BridgeError::MissingMac);
+        }
+        let raw = self
+            .mac
+            .strip_prefix(MAC_PREFIX)
+            .ok_or(BridgeError::InvalidMac)?;
+        if raw.is_empty() {
+            return Err(BridgeError::InvalidMac);
         }
         let supplied = hex::decode(raw).map_err(|_| BridgeError::InvalidMac)?;
         if supplied.len() != 32 {

@@ -607,14 +607,14 @@ pub(crate) fn redact_secrets(input: &str) -> String {
         let header_end = start + rel_end + "PRIVATE KEY-----".len();
         let end_marker = format!("-----END{}", &work[start + "-----BEGIN".len()..header_end]);
         let Some(end_rel) = work[header_end..].find(&end_marker) else {
-            work.replace_range(start.., "[REDACTED PRIVATE KEY]");
+            work.replace_range(start.., "[REDACTED]");
             break;
         };
         let mut end = header_end + end_rel + end_marker.len();
         while work[end..].starts_with('\r') || work[end..].starts_with('\n') {
             end += 1;
         }
-        work.replace_range(start..end, "[REDACTED PRIVATE KEY]");
+        work.replace_range(start..end, "[REDACTED]");
     }
 
     // 2. `key: value`, `key=value`, `--key value`, and `Bearer value`.
@@ -1527,8 +1527,9 @@ fn tokenize_shell(input: &str) -> Vec<ShellToken> {
                         op.push(*next);
                     }
                 }
+                let op_len = op.chars().count();
                 tokens.push(ShellToken::Operator(op));
-                index += op.chars().count();
+                index += op_len;
             }
             _ => {
                 word.push(c);

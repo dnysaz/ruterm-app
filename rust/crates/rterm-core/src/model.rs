@@ -478,7 +478,7 @@ impl Vault {
         };
         for host in &self.hosts {
             check(host.id, "host", Some(host.updated_at))?;
-            validate_sync_time(host.created_at, "host created_at")?;
+            validate_sync_time(Some(host.created_at), "host created_at")?;
             validate_sync_time(host.last_used_at, "host last_used_at")?;
             if !host.deleted && (host.address.trim().is_empty() || host.port == 0) {
                 return Err("A host needs an address and port".into());
@@ -486,7 +486,7 @@ impl Vault {
         }
         for identity in &self.identities {
             check(identity.id, "identity", Some(identity.updated_at))?;
-            validate_sync_time(identity.created_at, "identity created_at")?;
+            validate_sync_time(Some(identity.created_at), "identity created_at")?;
         }
         for group in &self.groups {
             check(group.id, "group", Some(group.updated_at))?;
@@ -496,7 +496,7 @@ impl Vault {
         }
         for note in &self.notes {
             check(note.id, "note", Some(note.updated_at))?;
-            validate_sync_time(note.created_at, "note created_at")?;
+            validate_sync_time(Some(note.created_at), "note created_at")?;
         }
         for forward in &self.port_forwards {
             check(forward.id, "port forward", Some(forward.updated_at))?;
