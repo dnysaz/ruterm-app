@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generated_at": "2026-11-23T09:33:10.220Z",
+  "generated_at": "2026-11-24T03:47:10.270Z",
   "entries": [
     {
       "file": "2026-11-23-notes-code-blocks.md",
@@ -96,7 +96,7 @@
       "file": "2026-11-19-notes.md",
       "date": "2026-11-19",
       "title": "Notes, synced with everything else",
-      "summary": "RuTerm now has free-form Markdown notes, stored in the same sealed vault as"
+      "summary": "RuTerm now has free-form Markdown notes, stored in the same vault as your"
     },
     {
       "file": "2026-11-19-macos-native.md",

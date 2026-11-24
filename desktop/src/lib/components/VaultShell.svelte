@@ -14,6 +14,7 @@
   } from '#lib/api';
   import { background, backgroundStyle, frostStyle } from '#lib/background.svelte';
   import { imageMimeForPath } from '#lib/images';
+  import { noteTitle } from '#lib/note-title';
   import { ui } from '#lib/ui.svelte';
   import {
     app,
@@ -468,17 +469,27 @@
     }
   });
 
+  // All, Favorite and Note all search notes; Favorite narrows them to the
+  // starred ones. Hosts keep their own `visible` list below.
   const noteList = $derived(
     notes()
       .filter(n => (filter === 'favorite' ? n.favorite : true))
       .filter(n => {
         const q = query.trim().toLowerCase();
-        return !q || n.body.toLowerCase().includes(q);
+        return !q || noteTitle(n.body).toLowerCase().includes(q) || n.body.toLowerCase().includes(q);
       })
-      .sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || '')),
+      .sort((a, b) => Number(b.favorite) - Number(a.favorite) || (b.updated_at || '').localeCompare(a.updated_at || '')),
   );
 
   const visibleNotes = $derived(noteList.slice(0, noteLimit));
+
+  const searchLabel = $derived(
+    filter === 'note'
+      ? 'Search notes'
+      : filter === 'favorite'
+        ? 'Search favorite hosts and notes'
+        : 'Search hosts and notes',
+  );
 
   const focusedPane = $derived(panes.find(p => p.id === focusedPaneId) ?? panes[0]);
   const focusedActiveTabId = $derived(focusedPane?.active ?? null);
@@ -668,43 +679,17 @@
   }
 
   // ---------------------------------------------------------------- notes
-  /// A note's tab title is the first 2-3 sentences of its own body.
-  function noteTitle(note: Note): string {
-    const clean = note.body
-      .replace(/\\([\\`*_{}\[\]()#+\-.!])/g, '$1')
-      .replace(/^[\s#>*+\-`_]+/gm, '')
-      .replace(/\*\*|__|`/g, '')
-      .trim();
-    if (!clean) return 'Untitled note';
-
-    // A newline also ends a sentence here: headings often have no full stop.
-    const sentences: string[] = [];
-    let current = '';
-    for (const char of clean) {
-      current += char;
-      if (char === '\n' || char === '.' || char === '!' || char === '?') {
-        const piece = current.trim();
-        if (piece) sentences.push(piece);
-        current = '';
-        if (sentences.length === 3) break;
-      }
-    }
-    if (sentences.length < 3 && current.trim()) sentences.push(current.trim());
-
-    let title = sentences.join(' ').replace(/\s+/g, ' ').trim();
-    if (!title) title = clean.replace(/\s+/g, ' ').trim();
-    const limit = 52;
-    return title.length > limit ? `${title.slice(0, limit - 3).trimEnd()}...` : title;
-  }
+  // `noteTitle` lives in #lib/note-title so Rust agent replies can use the
+  // exact same algorithm (see note-title-fixtures.json).
 
   function displayTabTitle(tab: Tab): string {
     if (tab.kind !== 'note') return tab.title;
     const note = notes().find(candidate => candidate.id === tab.hostId);
-    return note ? noteTitle(note) : tab.title;
+    return note ? noteTitle(note.body) : tab.title;
   }
 
   function syncNoteTabTitle(note: Note) {
-    const title = noteTitle(note);
+    const title = noteTitle(note.body);
     const isNoteTab = (candidate: Tab) => candidate.kind === 'note' && candidate.hostId === note.id;
     const matches = tabs.filter(isNoteTab);
     if (!matches.length || matches.every(candidate => candidate.title === title)) return;
@@ -734,7 +719,7 @@
     const tab: Tab = {
       id,
       hostId: note.id,
-      title: noteTitle(note),
+      title: noteTitle(note.body),
       status: 'connected',
       kind: 'note',
     };
@@ -768,6 +753,21 @@
       await saveNote({ ...note, body });
       syncNoteTabTitle({ ...note, body });
       void syncQuiet();
+    } catch (error) {
+      fail(error);
+    }
+  }
+
+  async function toggleNoteFavorite(note: Note) {
+    const favorite = !note.favorite;
+    try {
+      await saveNote({ ...note, favorite });
+      void syncQuiet();
+      notify(
+        favorite
+          ? `Note '${noteTitle(note.body)}' added to favorites`
+          : `Note '${noteTitle(note.body)}' removed from favorites`,
+      );
     } catch (error) {
       fail(error);
     }
@@ -1616,7 +1616,7 @@
       .then(fn => (disposed ? fn() : (unlistenOpenHost = fn)))
       .catch(() => {});
 
-    // The AI chat's `create_note` tool writes directly to the encrypted vault.
+    // The AI chat's `create_note` tool writes directly to the vault.
     // Adopt the payload, then open the new note in a tab just like the + button.
     void listen<{ id: string; payload: VaultPayload }>('rterm:note-created', event => {
       if (disposed) return;
@@ -1625,7 +1625,7 @@
       if (!note) return;
       filter = 'note';
       openNote(note);
-      notify(`Note '${noteTitle(note)}' saved and opened`);
+      notify(`Note '${noteTitle(note.body)}' saved and opened`);
     })
       .then(fn => (disposed ? fn() : (unlistenNote = fn)))
       .catch(() => {});
@@ -1638,13 +1638,13 @@
       if (!note) return;
       filter = 'note';
       openNote(note);
-      notify(`Note '${noteTitle(note)}' opened`);
+      notify(`Note '${noteTitle(note.body)}' opened`);
     })
       .then(fn => (disposed ? fn() : (unlistenNoteOpen = fn)))
       .catch(() => {});
 
     // `close_note` / `ruterm_close_note` only close the tab; the note stays in
-    // the encrypted vault and in the sidebar.
+    // the vault and in the sidebar.
     void listen<{ id: string }>('rterm:close-note', event => {
       if (disposed) return;
       closeTab(`note-${event.payload.id}`);
@@ -1673,7 +1673,7 @@
       if (!note) return;
       filter = 'note';
       openNote(note);
-      notify(`Note '${noteTitle(note)}' updated`);
+      notify(`Note '${noteTitle(note.body)}' updated`);
     })
       .then(fn => (disposed ? fn() : (unlistenNoteUpdated = fn)))
       .catch(() => {});
@@ -1798,6 +1798,56 @@
   </button>
 {/snippet}
 
+{#snippet noteRow(note: Note)}
+  <div
+    class="host note"
+    class:active={activeNoteId === note.id}
+    role="button"
+    tabindex="0"
+    title={collapsed ? noteTitle(note.body) : note.body.slice(0, 120)}
+    onclick={() => openNote(note)}
+    onkeydown={event => event.key === 'Enter' && openNote(note)}
+  >
+    {#if !collapsed}
+      <span class="meta">
+        <span class="name">{noteTitle(note.body)}</span>
+        <span class="sub">{noteTime(note)}</span>
+      </span>
+      <button
+        class="more star-toggle"
+        class:fav={note.favorite}
+        type="button"
+        title={note.favorite ? 'Remove from favorites' : 'Add to favorites'}
+        aria-label={note.favorite
+          ? `Remove '${noteTitle(note.body)}' from favorites`
+          : `Add '${noteTitle(note.body)}' to favorites`}
+        aria-pressed={note.favorite}
+        onclick={event => {
+          event.stopPropagation();
+          void toggleNoteFavorite(note);
+        }}
+      >
+        <span aria-hidden="true">{note.favorite ? '★' : '☆'}</span>
+      </button>
+      <button
+        class="more"
+        type="button"
+        title="Delete note"
+        aria-label="Delete note"
+        onclick={event => {
+          event.stopPropagation();
+          noteToDelete = note;
+        }}
+      >
+        <Icon name="trash" size={16} />
+      </button>
+    {:else}
+      <span class="note-mark" aria-hidden="true">✎</span>
+      {#if note.favorite}<span class="rail-star" aria-hidden="true">★</span>{/if}
+    {/if}
+  </div>
+{/snippet}
+
 <div
   class="shell"
   class:collapsed
@@ -1844,7 +1894,7 @@
     {#if !collapsed}
       <div class="search">
         <span class="search-icon"><Icon name="search" size={18} /></span>
-        <input autocapitalize="off" autocorrect="off" spellcheck="false" bind:value={query} placeholder="Search hosts" aria-label="Search hosts" />
+        <input autocapitalize="off" autocorrect="off" spellcheck="false" bind:value={query} placeholder={searchLabel} aria-label={searchLabel} />
       </div>
 
       <div class="filters">
@@ -1870,37 +1920,7 @@
     <div class="list">
       {#if filter === 'note'}
         {#each visibleNotes as note (note.id)}
-          <div
-            class="host note"
-            class:active={activeNoteId === note.id}
-            role="button"
-            tabindex="0"
-            title={note.body.slice(0, 120)}
-            onclick={() => openNote(note)}
-            onkeydown={event => event.key === 'Enter' && openNote(note)}
-          >
-            {#if !collapsed}
-              <span class="meta">
-                <span class="name">{noteTitle(note)}</span>
-                <span class="sub">{noteTime(note)}</span>
-              </span>
-              {#if note.favorite}<span class="star" aria-label="Favorite">★</span>{/if}
-              <button
-                class="more"
-                type="button"
-                title="Delete note"
-                aria-label="Delete note"
-                onclick={event => {
-                  event.stopPropagation();
-                  noteToDelete = note;
-                }}
-              >
-                <Icon name="trash" size={16} />
-              </button>
-            {:else}
-              <span class="note-mark" aria-hidden="true">✎</span>
-            {/if}
-          </div>
+          {@render noteRow(note)}
         {:else}
           {#if !collapsed}
             <div class="empty">
@@ -1928,62 +1948,99 @@
           </button>
         {/if}
       {:else}
-        {#each visible as host (host.id)}
-        <div
-          class="host"
-          class:active={activeHostId === host.id}
-          role="button"
-          tabindex="0"
-          title={collapsed ? `${host.label || host.address} — ${host.username}@${host.address}:${host.port}` : ''}
-          onclick={() => connect(host)}
-          onkeydown={event => event.key === 'Enter' && connect(host)}
-          ondblclick={() => openHostFormTab(host)}
-        >
-          <HostAvatar host={host} size={collapsed ? 32 : 28} />
+        {#if visibleNotes.length}
           {#if !collapsed}
-            <span class="meta">
-              <span class="name">
-                {#if host.favorite}<span class="star" aria-label="Favorite">★</span>{/if}
-                {host.label || host.address}
-              </span>
-              <span class="sub mono">{host.username}@{host.address}:{host.port}</span>
-            </span>
-            <button
-              class="more sftp"
-              type="button"
-              title="Files (SFTP)"
-              aria-label="Browse files on {host.label || host.address} over SFTP"
-              onclick={event => {
-                event.stopPropagation();
-                openSftpHost(host);
-              }}
-            >
-              <Icon name="folder" size={16} />
-            </button>
-            <button
-              class="more"
-              type="button"
-              title="Edit host"
-              aria-label="Edit host"
-              onclick={event => {
-                event.stopPropagation();
-                openHostFormTab(host);
-              }}
-            >
-              <Icon name="ellipsis" size={17} />
+            <div class="list-heading">{filter === 'favorite' ? 'Favorite notes' : 'Notes'}</div>
+          {/if}
+          {#each visibleNotes as note (note.id)}
+            {@render noteRow(note)}
+          {/each}
+          {#if !collapsed && noteList.length > noteLimit}
+            <button class="load-more" type="button" onclick={() => (noteLimit += 10)}>
+              Load more notes ({noteList.length - noteLimit})
             </button>
           {/if}
-        </div>
-      {:else}
-        {#if !collapsed}
+        {/if}
+
+        {#if visible.length}
+          {#if !collapsed}
+            <div class="list-heading">{filter === 'favorite' ? 'Favorite hosts' : 'Hosts'}</div>
+          {/if}
+          {#each visible as host (host.id)}
+            <div
+              class="host"
+              class:active={activeHostId === host.id}
+              role="button"
+              tabindex="0"
+              title={collapsed ? `${host.label || host.address} — ${host.username}@${host.address}:${host.port}` : ''}
+              onclick={() => connect(host)}
+              onkeydown={event => event.key === 'Enter' && connect(host)}
+              ondblclick={() => openHostFormTab(host)}
+            >
+              <HostAvatar host={host} size={collapsed ? 32 : 28} />
+              {#if !collapsed}
+                <span class="meta">
+                  <span class="name">
+                    {#if host.favorite}<span class="star" aria-label="Favorite">★</span>{/if}
+                    {host.label || host.address}
+                  </span>
+                  <span class="sub mono">{host.username}@{host.address}:{host.port}</span>
+                </span>
+                <button
+                  class="more sftp"
+                  type="button"
+                  title="Files (SFTP)"
+                  aria-label="Browse files on {host.label || host.address} over SFTP"
+                  onclick={event => {
+                    event.stopPropagation();
+                    openSftpHost(host);
+                  }}
+                >
+                  <Icon name="folder" size={16} />
+                </button>
+                <button
+                  class="more"
+                  type="button"
+                  title="Edit host"
+                  aria-label="Edit host"
+                  onclick={event => {
+                    event.stopPropagation();
+                    openHostFormTab(host);
+                  }}
+                >
+                  <Icon name="ellipsis" size={17} />
+                </button>
+              {/if}
+            </div>
+          {/each}
+        {/if}
+
+        {#if !collapsed && !visibleNotes.length && !visible.length}
           <div class="empty">
-            <p class="muted">{query ? 'No hosts match your search.' : 'No hosts yet.'}</p>
-            <button class="btn sm" onclick={startBlank}>Add host</button>
+            <p class="muted">
+              {query
+                ? 'No hosts or notes match your search.'
+                : filter === 'favorite'
+                  ? 'No favorites yet.'
+                  : 'Nothing here yet.'}
+            </p>
+            <div class="empty-actions">
+              <button class="btn sm" onclick={startBlank}>Add host</button>
+              <button class="btn sm" onclick={() => void openNewNote()}>New note</button>
+            </div>
           </div>
         {/if}
-        {/each}
 
         {#if collapsed}
+          <button
+            class="rail-add"
+            type="button"
+            title="New note"
+            aria-label="New note"
+            onclick={() => void openNewNote()}
+          >
+            <Icon name="plus" size={18} />
+          </button>
           <button
             class="rail-add"
             type="button"
@@ -2689,7 +2746,7 @@
       oncancel={() => (noteToDelete = null)}
       onconfirm={() => void confirmDeleteNote()}
     >
-      <p>The note <strong>{noteTitle(noteToDelete)}</strong> will be removed from your vault — on this device and everywhere it syncs.</p>
+      <p>The note <strong>{noteTitle(noteToDelete.body)}</strong> will be removed from your vault — on this device and everywhere it syncs.</p>
     </ConfirmDialog>
   {/if}
 
@@ -3055,6 +3112,37 @@
     color: var(--warn);
     font-size: 11.5px;
     margin-right: 5px;
+  }
+  .star-toggle {
+    font-size: 14px;
+    line-height: 1;
+  }
+  .star-toggle.fav {
+    opacity: 1;
+    color: var(--warn);
+  }
+  .star-toggle.fav:hover {
+    color: var(--text);
+  }
+  .rail-star {
+    position: absolute;
+    top: 2px;
+    right: 3px;
+    color: var(--warn);
+    font-size: 9px;
+  }
+  .list-heading {
+    padding: 10px 8px 4px;
+    color: var(--text-tertiary);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .empty-actions {
+    display: flex;
+    justify-content: center;
+    gap: 8px;
   }
   .sub {
     font-size: 12px;

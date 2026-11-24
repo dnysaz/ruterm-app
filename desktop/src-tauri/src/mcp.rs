@@ -913,7 +913,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "list_hosts",
-            "description": "List ALL SAVED SSH hosts in the encrypted RuTerm vault with label, address, port, user, group, tags and notes. Use this for 'which VPS hosts do I have?' — list_targets only shows currently OPEN tabs. Passwords, keys and env values are never returned.",
+            "description": "List ALL SAVED SSH hosts in the RuTerm vault with label, address, port, user, group, tags and notes. Use this for 'which VPS hosts do I have?' — list_targets only shows currently OPEN tabs. Passwords, keys and env values are never returned.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
         },
         {
@@ -928,7 +928,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "list_notes",
-            "description": "List notes in the encrypted vault with their id and opening words. Call this before read_note or update_note to find the right note.",
+            "description": "List notes in the RuTerm vault with their id and opening words. Call this before read_note or update_note to find the right note.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
         },
         {
@@ -945,7 +945,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "create_note",
-            "description": "Create a new note in the encrypted RuTerm vault and open it in a new tab — exactly like RuTerm's native AI chat. Use this immediately when the user asks to record, recap or save a result into a note. No approval dialog is needed.",
+            "description": "Create a new note in the RuTerm vault and open it in a new tab — exactly like RuTerm's native AI chat. Use this immediately when the user asks to record, recap or save a result into a note. No approval dialog is needed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -959,7 +959,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "open_note",
-            "description": "Open an existing note from the encrypted vault in a new RuTerm tab. Find its id with list_notes or read_note first. Use this when the user asks to open/show/view a saved note — not only after creating one.",
+            "description": "Open an existing note from the RuTerm vault in a new RuTerm tab. Find its id with list_notes or read_note first. Use this when the user asks to open/show/view a saved note — not only after creating one.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -998,7 +998,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "delete_note",
-            "description": "Delete an existing note from the encrypted vault by id (from list_notes). Use this when the user asks to delete/remove a note.",
+            "description": "Delete an existing note from the RuTerm vault by id (from list_notes). Use this when the user asks to delete/remove a note.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "id": { "type": "string", "description": "Note id from list_notes." } },
@@ -1879,7 +1879,7 @@ pub(crate) fn call_tool(
                 let payload = crate::commands::persist_vault(&state, vault).await?;
                 let _ = app.emit("rterm:note-created", json!({ "id": note_id, "payload": payload }));
                 Ok(format!(
-                    "Note '{label}' saved in your encrypted vault and opened in a new tab."
+                    "Note '{label}' saved in your RuTerm vault and opened in a new tab."
                 ))
             })
             .map_err(|error| (-32000, error))?
@@ -2034,7 +2034,7 @@ pub(crate) fn call_tool(
                 let payload = crate::commands::persist_vault(&state, vault).await?;
                 let _ = app.emit("rterm:note-updated", json!({ "id": note_id, "payload": payload }));
                 Ok(format!(
-                    "Note '{label}' updated in your encrypted vault. Its tab has been refreshed."
+                    "Note '{label}' updated in your RuTerm vault. Its tab has been refreshed."
                 ))
             })
             .map_err(|error| (-32000, error))?
@@ -2060,7 +2060,7 @@ pub(crate) fn call_tool(
                 let note_id = note.id.to_string();
                 let payload = crate::commands::persist_vault(&state, vault).await?;
                 let _ = app.emit("rterm:note-deleted", json!({ "id": note_id, "payload": payload }));
-                Ok(format!("Note '{label}' deleted from your encrypted vault."))
+                Ok(format!("Note '{label}' deleted from your RuTerm vault."))
             })
             .map_err(|error| (-32000, error))?
         }
@@ -3081,5 +3081,12 @@ mod tests {
         assert!(VAULT_TOOLS_HINT.contains("ruterm_close_terminal"));
         assert!(VAULT_TOOLS_HINT.contains("ruterm_update_note"));
         assert!(VAULT_TOOLS_HINT.contains("ruterm_delete_note"));
+    }
+
+    #[test]
+    fn agent_tool_copy_does_not_claim_notes_are_encrypted() {
+        let copy = format!("{}{}", tool_definitions(), VAULT_TOOLS_HINT);
+        assert!(!copy.contains("encrypted vault"), "{copy}");
+        assert!(!copy.contains("encrypted RuTerm vault"), "{copy}");
     }
 }

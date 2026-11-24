@@ -1,12 +1,12 @@
 //! BYOK AI chat backed by OpenRouter.
 //!
-//! The API key lives in the encrypted vault: Rust opens it at call time and
+//! The API key is sealed in the vault: Rust opens it at call time and
 //! never sends it to the renderer. Tools give the model read access to saved
 //! hosts, notes, snippets and per-VPS work logs; credentials and config writes
 //! need an explicit approval in the UI.
 
 use crate::{commands, state::AppState};
-use chrono::Utc;
+use chrono::{Local, Utc};
 use rterm_core::model::{now, AuthMethod, Host, Note, Snippet};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -346,6 +346,18 @@ fn vps_target_ready(app: &AppHandle, state: &AppState) -> bool {
 }
 
 fn system_prompt_for(allow_vps: bool, has_target: bool) -> String {
+    // The model has no reliable clock of its own. Anchor "today" to the device
+    // on every request so a free model cannot invent a stale date and then
+    // "confirm" it with a web search for that invented date.
+    let device_time = Local::now().format("%A, %Y-%m-%d %H:%M %Z").to_string();
+    let date_context = format!(
+        "The user's device date and local time right now is {device_time}. Treat this as the \
+         definitive source for 'today', 'hari ini', 'tanggal hari ini', 'what day is it' and \
+         similar questions — never recall or guess a different date. If you call `web_search` \
+         about today, put this exact date in the query and never invent another one. If the user \
+         states a different date, their correction wins for what they mean, but tell them the \
+         device date."
+    );
     let base = "You are RuTerm's built-in assistant. You can read the user's saved SSH hosts, notes, \
      snippets, groups, per-VPS work logs, app preferences, Google/sync status and the AI agent \
      CLIs installed on this Mac. You can also switch the interface theme between dark and light, \
@@ -391,7 +403,7 @@ fn system_prompt_for(allow_vps: bool, has_target: bool) -> String {
              a current result."
         };
         format!(
-            "{base} VPS control is enabled and NATIVE: you drive the focused SSH tab through \
+            "{base} {date_context} VPS control is enabled and NATIVE: you drive the focused SSH tab through \
              RuTerm's embedded MCP bridge. The only valid target is the tab the user is looking \
              at; you cannot switch tabs or pass a `session`. WORKFLOW — follow it every time: \
              (1) If the user asks to open a SAVED host in a new tab, call `vps_open_host` with its \
@@ -433,7 +445,7 @@ fn system_prompt_for(allow_vps: bool, has_target: bool) -> String {
         )
     } else {
         format!(
-            "{base} VPS control is disabled in Settings. Never try to run server commands and \
+            "{base} {date_context} VPS control is disabled in Settings. Never try to run server commands and \
              never call any `vps_*` tool; tell the user to enable `Allow AI Chat to control SSH \
              tabs` in Settings if they want that."
         )
@@ -485,7 +497,7 @@ fn tools_for(allow_vps: bool, has_target: bool) -> Value {
         "type": "function",
         "function": {
           "name": "create_note",
-          "description": "Create a new note in the encrypted RuTerm vault and open it in a new tab. Use this immediately whenever the user asks to record, recap, or save a result/check into a note. No approval dialog is needed for a note.",
+          "description": "Create a new note in the RuTerm vault and open it in a new tab. Use this immediately whenever the user asks to record, recap, or save a result/check into a note. No approval dialog is needed for a note.",
           "parameters": { "type": "object", "properties": {
             "title": { "type": "string", "description": "Short title; it becomes the first line of the note." },
             "body": { "type": "string", "description": "Full note content, written from the facts just obtained from tools." },
@@ -497,7 +509,7 @@ fn tools_for(allow_vps: bool, has_target: bool) -> Value {
         "type": "function",
         "function": {
           "name": "open_note",
-          "description": "Open an EXISTING note from the encrypted vault in a new RuTerm tab. Find its id with list_notes or read_note first. Use this whenever the user asks to open/show/view a saved note — never say you cannot open notes.",
+          "description": "Open an EXISTING note from the RuTerm vault in a new RuTerm tab. Find its id with list_notes or read_note first. Use this whenever the user asks to open/show/view a saved note — never say you cannot open notes.",
           "parameters": { "type": "object", "properties": {
             "id": { "type": "string", "description": "Note id from list_notes/read_note, or a unique title/body query." }
           }, "required": ["id"] }
@@ -517,7 +529,7 @@ fn tools_for(allow_vps: bool, has_target: bool) -> Value {
         "type": "function",
         "function": {
           "name": "update_note",
-          "description": "Edit an EXISTING note in the encrypted vault. Find its id with list_notes or read_note. Use append:true to add text at the end; otherwise body replaces the whole note. Use this whenever the user asks to edit, update, add to, or fix a note — never say you cannot edit notes.",
+          "description": "Edit an EXISTING note in the RuTerm vault. Find its id with list_notes or read_note. Use append:true to add text at the end; otherwise body replaces the whole note. Use this whenever the user asks to edit, update, add to, or fix a note — never say you cannot edit notes.",
           "parameters": { "type": "object", "properties": {
             "id": { "type": "string", "description": "Note id from list_notes/read_note, or a unique title/body query." },
             "body": { "type": "string", "description": "New full body, or the text to append." },
@@ -531,7 +543,7 @@ fn tools_for(allow_vps: bool, has_target: bool) -> Value {
         "type": "function",
         "function": {
           "name": "delete_note",
-          "description": "Delete an existing note from the encrypted vault. Find its id with list_notes or read_note. Requires confirmation. Use this when the user asks to delete/remove a note.",
+          "description": "Delete an existing note from the RuTerm vault. Find its id with list_notes or read_note. Requires confirmation. Use this when the user asks to delete/remove a note.",
           "parameters": { "type": "object", "properties": {
             "id": { "type": "string", "description": "Note id, or a unique title/body query." }
           }, "required": ["id"] }
@@ -549,7 +561,7 @@ fn tools_for(allow_vps: bool, has_target: bool) -> Value {
         "type": "function",
         "function": {
           "name": "web_search",
-          "description": "Search the public web for current, recent or uncertain facts (news, docs, versions, prices). Returns titles, URLs and snippets; cite the URLs in your answer. No API key or user credential is used.",
+          "description": "Search the public web for current, recent or uncertain facts (news, docs, versions, prices). Returns titles, URLs and snippets; cite the URLs in your answer. No API key or user credential is used. For 'today'/'hari ini' questions, use the exact device date from your system prompt in the query — never invent or assume a date.",
           "parameters": { "type": "object", "properties": {
             "query": { "type": "string", "description": "Search query in the user's language or English." },
             "limit": { "type": "integer", "description": "How many results to return (1-8, default 5)." }
@@ -584,7 +596,7 @@ fn tools_for(allow_vps: bool, has_target: bool) -> Value {
         "type": "function",
         "function": {
           "name": "create_snippet",
-          "description": "Create a reusable snippet in the encrypted vault. Requires approval; the snippet syncs with the vault.",
+          "description": "Create a reusable snippet in the RuTerm vault. Requires approval; the snippet syncs with the vault.",
           "parameters": { "type": "object", "properties": {
             "label": { "type": "string" }, "content": { "type": "string" },
             "tags": { "type": "array", "items": { "type": "string" } }
@@ -621,7 +633,7 @@ fn tools_for(allow_vps: bool, has_target: bool) -> Value {
         "type": "function",
         "function": {
           "name": "create_host",
-          "description": "Save a real SSH host (IP or hostname) in the encrypted vault and open it in a terminal tab. NEVER use this for AI agent names — use launch_agent instead. port defaults to 22, user defaults to root. Requires approval: the password is masked in the dialog and never appears in a tool result. Duplicate address/port/user is rejected.",
+          "description": "Save a real SSH host (IP or hostname) in the RuTerm vault and open it in a terminal tab. NEVER use this for AI agent names — use launch_agent instead. port defaults to 22, user defaults to root. Requires approval: the password is masked in the dialog and never appears in a tool result. Duplicate address/port/user is rejected.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -1689,15 +1701,153 @@ pub(crate) fn normalize_note_body(body: &str) -> String {
     out.trim().to_string()
 }
 
-pub(crate) fn note_preview(body: &str) -> String {
-    let first = body
+/// Chat models often put the requested title at the top of `body` as well as
+/// in the `title` argument. Since notes have no title field, the writer adds a
+/// single `# title` heading — drop any leading copies first so the live note
+/// does not show the same title twice.
+fn strip_leading_title(content: &str, title: &str) -> String {
+    let wanted = title.trim().trim_start_matches('#').trim().to_lowercase();
+    if wanted.is_empty() {
+        return content.to_string();
+    }
+    let mut lines: Vec<&str> = content.lines().collect();
+    while lines.first().is_some_and(|line| line.trim().is_empty()) {
+        lines.remove(0);
+    }
+    let mut removed = false;
+    while let Some(line) = lines.first() {
+        let plain = line.trim().trim_start_matches('#').trim();
+        if plain.eq_ignore_ascii_case(&wanted) {
+            lines.remove(0);
+            removed = true;
+        } else {
+            break;
+        }
+    }
+    if !removed {
+        return content.to_string();
+    }
+    while lines.first().is_some_and(|line| line.trim().is_empty()) {
+        lines.remove(0);
+    }
+    lines.join("\n")
+}
+
+/// Mirror of `desktop/src/lib/note-title.ts`. The same fixtures in
+/// `note-title-fixtures.json` are checked on both sides so a tab title and an
+/// agent reply can never disagree again.
+pub(crate) fn note_title(body: &str) -> String {
+    let normalized = normalize_title_escapes(body);
+    let normalized = normalized.trim();
+    if normalized.is_empty() {
+        return "Untitled note".into();
+    }
+
+    let clean = normalized
         .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("Untitled note")
-        .trim_start_matches('#')
-        .trim();
-    compact_entry(if first.is_empty() { "Untitled note" } else { first }, 56)
+        .map(|line| {
+            let line = line.trim();
+            let line = line.trim_start_matches(|c: char| {
+                c.is_whitespace() || "#>*+-`_".contains(c)
+            });
+            line.replace("**", "")
+                .replace("__", "")
+                .replace('`', "")
+                .trim()
+                .to_string()
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if clean.is_empty() {
+        return "Untitled note".into();
+    }
+
+    let mut sentences: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut chars = clean.chars().peekable();
+    let finish = |current: &mut String, sentences: &mut Vec<String>| {
+        let piece = current.trim().to_string();
+        if !piece.is_empty() && sentences.last() != Some(&piece) {
+            sentences.push(piece);
+        }
+        current.clear();
+    };
+
+    while let Some(ch) = chars.next() {
+        let punctuation = matches!(ch, '.' | '!' | '?');
+        // IPs, versions and decimals keep their dots; only real sentence
+        // boundaries end a piece (same rule as the TypeScript version).
+        let inside_number = ch == '.'
+            && current.chars().last().is_some_and(|c| c.is_ascii_digit())
+            && chars.peek().is_some_and(|c| c.is_ascii_digit());
+        if ch == '\n' || (punctuation && !inside_number) {
+            if ch == '\n' {
+                current.push('\n');
+                while chars.peek() == Some(&'\n') {
+                    current.push(chars.next().unwrap_or('\n'));
+                }
+            } else {
+                current.push(ch);
+                while chars.peek().is_some_and(|c| matches!(*c, '.' | '!' | '?')) {
+                    current.push(chars.next().unwrap_or('.'));
+                }
+            }
+            finish(&mut current, &mut sentences);
+            if sentences.len() == 3 {
+                break;
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if sentences.len() < 3 {
+        finish(&mut current, &mut sentences);
+    }
+
+    let flat = sentences
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if flat.is_empty() {
+        return "Untitled note".into();
+    }
+    if flat.chars().count() > 52 {
+        let head: String = flat.chars().take(49).collect();
+        format!("{}...", head.trim_end())
+    } else {
+        flat
+    }
+}
+
+fn normalize_title_escapes(text: &str) -> String {
+    const ESCAPED: &[char] = &[
+        '\\', '`', '*', '_', '{', '}', '[', ']', '(', ')', '#', '+', '-', '.', '!',
+    ];
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        while chars.peek() == Some(&'\\') {
+            chars.next();
+        }
+        match chars.peek().copied() {
+            Some(next) if ESCAPED.contains(&next) => {
+                out.push(next);
+                chars.next();
+            }
+            _ => out.push('\\'),
+        }
+    }
+    out
+}
+
+pub(crate) fn note_preview(body: &str) -> String {
+    note_title(body)
 }
 
 /// Resolve a note for the write tools. An exact id always wins; a short query
@@ -2153,6 +2303,7 @@ async fn run_tool(
             if content.is_empty() {
                 return Err("body must not be empty".into());
             }
+            let content = strip_leading_title(&content, &title);
             let body = if title.is_empty() {
                 content
             } else {
@@ -2191,7 +2342,7 @@ async fn run_tool(
             let payload = commands::persist_vault(state, vault).await?;
             let _ = app.emit("rterm:note-created", json!({ "id": note_id, "payload": payload }));
             Ok(format!(
-                "Note '{label}' saved in your encrypted vault and opened in a new tab."
+                "Note '{label}' saved in your RuTerm vault and opened in a new tab."
             ))
         }
         "close_note" => {
@@ -2237,7 +2388,7 @@ async fn run_tool(
             let title = args.get("title").and_then(Value::as_str).unwrap_or("").trim();
             if !append && !title.is_empty() {
                 let clean = title.chars().take(80).collect::<String>();
-                content = format!("# {clean}\n\n{content}");
+                content = format!("# {clean}\n\n{}", strip_leading_title(&content, &clean));
             }
             let favorite = args.get("favorite").and_then(Value::as_bool);
             let mut vault = state.unlocked_vault().await?;
@@ -2267,7 +2418,7 @@ async fn run_tool(
             let payload = commands::persist_vault(state, vault).await?;
             let _ = app.emit("rterm:note-updated", json!({ "id": note_id, "payload": payload }));
             Ok(format!(
-                "Note '{label}' updated in your encrypted vault and refreshed in its tab."
+                "Note '{label}' updated in your RuTerm vault and refreshed in its tab."
             ))
         }
         "delete_note" => {
@@ -2285,7 +2436,7 @@ async fn run_tool(
                 &format!("delete:note:{note_id}"),
                 "write",
                 "Delete this note?",
-                &format!("Note '{label}' will be removed from your encrypted vault and sync."),
+                &format!("Note '{label}' will be removed from your RuTerm vault and sync."),
                 &label,
             )
             .await?;
@@ -2301,7 +2452,7 @@ async fn run_tool(
             note.updated_at = now();
             let payload = commands::persist_vault(state, vault).await?;
             let _ = app.emit("rterm:note-deleted", json!({ "id": note_id, "payload": payload }));
-            Ok(format!("Note '{label}' deleted from your encrypted vault."))
+            Ok(format!("Note '{label}' deleted from your RuTerm vault."))
         }
         "clear_chat_history" => {
             let _ = app.emit("chat://clear-request", json!({ "session": session }));
@@ -2411,7 +2562,7 @@ async fn run_tool(
                 &format!("write:snippet:{}", label.to_lowercase()),
                 "write",
                 "Create this snippet?",
-                &format!("Snippet '{label}' will be saved in your encrypted vault and synced."),
+                &format!("Snippet '{label}' will be saved in your RuTerm vault and synced."),
                 &content,
             )
             .await?;
@@ -2593,7 +2744,7 @@ async fn run_tool(
                 if has_password {
                     "The password will be stored encrypted in your vault and opened in a new SSH tab."
                 } else {
-                    "The host will be saved in your encrypted vault and opened in a new SSH tab."
+                    "The host will be saved in your RuTerm vault and opened in a new SSH tab."
                 },
                 &preview,
             )
@@ -3221,6 +3372,30 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_anchors_today_to_the_device_clock() {
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        for prompt in [
+            system_prompt_for(false, true),
+            system_prompt_for(true, true),
+            system_prompt_for(true, false),
+        ] {
+            assert!(prompt.contains(&today), "missing device date {today}");
+            assert!(prompt.contains("definitive source for 'today'"));
+        }
+        let tools = tools_for(false, true);
+        let web_search = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["function"]["name"] == "web_search")
+            .expect("web_search tool");
+        assert!(web_search["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("never invent or assume a date"));
+    }
+
+    #[test]
     fn tools_cover_app_reads_and_theme_switch() {
         let list = tools_for(false, true);
         let names: Vec<&str> = list
@@ -3250,6 +3425,13 @@ mod tests {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
         assert!(!names.iter().any(|name| name.starts_with("vps_")));
+    }
+
+    #[test]
+    fn tool_copy_does_not_claim_notes_are_encrypted() {
+        let copy = format!("{}{}", tools_for(false, true), tools_for(true, true));
+        assert!(!copy.contains("encrypted vault"), "{copy}");
+        assert!(!copy.contains("encrypted RuTerm vault"), "{copy}");
     }
 
     #[test]
@@ -3328,8 +3510,37 @@ mod tests {
 
     #[test]
     fn note_preview_matches_the_ui_title() {
-        assert_eq!(note_preview("# Rekap nginx\n\nDetail ..."), "Rekap nginx");
-        assert_eq!(note_preview("\n\nfirst body line"), "first body line");
+        let raw = include_str!("../../src/lib/note-title-fixtures.json");
+        #[derive(Deserialize)]
+        struct TitleFixture {
+            body: String,
+            title: String,
+        }
+        let fixtures: Vec<TitleFixture> = serde_json::from_str(raw).expect("title fixtures");
+        assert!(!fixtures.is_empty());
+        for fixture in fixtures {
+            assert_eq!(
+                note_title(&fixture.body),
+                fixture.title,
+                "fixture body: {:?}",
+                fixture.body
+            );
+            assert_eq!(note_preview(&fixture.body), fixture.title);
+        }
+    }
+
+    #[test]
+    fn leading_title_copies_are_removed_before_the_heading_is_added() {
+        let title = "Validasi Sesi Auth di JavaScript";
+        let body = format!(
+            "{title}\n{title}\nKode 1 baris (versi ringkas)\nconst isSessionValid = true;"
+        );
+        assert_eq!(
+            strip_leading_title(&body, title),
+            "Kode 1 baris (versi ringkas)\nconst isSessionValid = true;"
+        );
+        assert_eq!(strip_leading_title(&format!("# {title}\n\nDetail"), title), "Detail");
+        assert_eq!(strip_leading_title("Detail tanpa judul", title), "Detail tanpa judul");
     }
 
     #[test]

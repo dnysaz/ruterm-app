@@ -1,7 +1,8 @@
-//! Domain model for the encrypted vault.
+//! Domain model for the local JSON vault.
 //!
-//! Everything in here is *client side* data: it is serialised to JSON, then
-//! encrypted with the user's vault key before it ever reaches the sync server.
+//! Everything in here is *client side* data: it is serialised to JSON. Secret
+//! fields are sealed before they reach the local file or any sync destination;
+//! self-hosted bridges additionally seal the whole payload.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -16,7 +17,7 @@ pub fn now() -> DateTime<Utc> {
 
 /// How we authenticate to a host.
 ///
-/// Secrets live inside the encrypted vault, never on the sync server in clear.
+/// Secret fields are sealed client-side, never sent to a sync server in clear.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthMethod {

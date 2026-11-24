@@ -285,7 +285,7 @@ One document, on disk and on the bridge (field-level ciphertext inside):
 | Session restore across reload & restart (tabs, panes, scrollback, quick-connect, notes) | working |
 | Backgrounds (bundled photos/patterns, custom upload, Frost & Terminal) | working |
 | Scrollback restore (local, never synced) | working |
-| Notes (Markdown, in the sealed vault, synced) | working |
+| Notes (Markdown, in the vault, synced; credentials sealed) | working |
 | What's New (News/ → in-app tab + unread badge) | working |
 | Bridge sync | `bridge/` (Worker + D1) — hosted experimental instance at sync.lagitest.xyz |
 | Windows / Linux builds | source is portable; bundles not set up yet |
