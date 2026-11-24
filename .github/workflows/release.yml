@@ -56,7 +56,8 @@ jobs:
       - name: Install Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          # Vite 8 needs Promise.withResolvers, which landed in Node 22.
+          node-version: 24
           cache: npm
           cache-dependency-path: desktop/package-lock.json
 
