@@ -2004,15 +2004,14 @@ fn append_action(path: &PathBuf, entry: &str) {
     let _ = crate::mcp::write_atomic_private(path, &content);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(unix, target_os = "macos"))]
 const O_NOFOLLOW: i32 = 0x10000;
-#[cfg(target_os = "linux")]
+#[cfg(all(unix, target_os = "linux"))]
 const O_NOFOLLOW: i32 = 0x80000;
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-const O_NOFOLLOW: i32 = 0;
 
 /// The home directory is owned by the unlocked user; compare config ownership
 /// against it without pulling in a new dependency just to call `getuid()`.
+#[cfg(unix)]
 fn home_owner_uid() -> Result<u32, String> {
     use std::os::unix::fs::MetadataExt;
     let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
@@ -2020,6 +2019,14 @@ fn home_owner_uid() -> Result<u32, String> {
     Ok(meta.uid())
 }
 
+/// Windows has no Unix uid. The path checks below still reject reparse points
+/// and non-files, which covers the same attack shape on NTFS.
+#[cfg(not(unix))]
+fn home_owner_uid() -> Result<u32, String> {
+    Ok(0)
+}
+
+#[cfg(unix)]
 fn read_owned_no_follow(path: &std::path::Path, expected_uid: u32) -> Result<String, String> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let mut options = fs::OpenOptions::new();
@@ -2037,6 +2044,19 @@ fn read_owned_no_follow(path: &std::path::Path, expected_uid: u32) -> Result<Str
     Ok(body)
 }
 
+#[cfg(not(unix))]
+fn read_owned_no_follow(path: &std::path::Path, _expected_uid: u32) -> Result<String, String> {
+    let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !meta.file_type().is_file() || meta.file_type().is_symlink() {
+        return Err(format!(
+            "Refusing to read an untrusted file: {}",
+            path.display()
+        ));
+    }
+    fs::read_to_string(path).map_err(|e| e.to_string())
+}
+
+#[cfg(unix)]
 fn ensure_owned_private_dir(path: &std::path::Path, expected_uid: u32) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     fs::create_dir_all(path).map_err(|e| e.to_string())?;
@@ -2051,6 +2071,20 @@ fn ensure_owned_private_dir(path: &std::path::Path, expected_uid: u32) -> Result
     Ok(())
 }
 
+#[cfg(not(unix))]
+fn ensure_owned_private_dir(path: &std::path::Path, _expected_uid: u32) -> Result<(), String> {
+    fs::create_dir_all(path).map_err(|e| e.to_string())?;
+    let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return Err(format!(
+            "Refusing an untrusted directory: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn write_owned_atomic(path: &std::path::Path, body: &str, expected_uid: u32) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
     if let Ok(meta) = fs::symlink_metadata(path) {
@@ -2065,6 +2099,33 @@ fn write_owned_atomic(path: &std::path::Path, body: &str, expected_uid: u32) -> 
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         let meta = fs::metadata(parent).map_err(|e| e.to_string())?;
         if !meta.is_dir() || meta.uid() != expected_uid {
+            return Err(format!(
+                "Refusing an untrusted directory: {}",
+                parent.display()
+            ));
+        }
+    }
+    crate::mcp::write_atomic_file(path, body)
+}
+
+#[cfg(not(unix))]
+fn write_owned_atomic(
+    path: &std::path::Path,
+    body: &str,
+    _expected_uid: u32,
+) -> Result<(), String> {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "Refusing to write an untrusted file: {}",
+                path.display()
+            ));
+        }
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        let meta = fs::symlink_metadata(parent).map_err(|e| e.to_string())?;
+        if !meta.is_dir() || meta.file_type().is_symlink() {
             return Err(format!(
                 "Refusing an untrusted directory: {}",
                 parent.display()
