@@ -136,10 +136,12 @@ A Termius-class workflow, built in the open.
 
 ### Security posture
 
-- Content Security Policy is enabled with strict sources; inline CSS and the
-  first-party inline bootstrap scripts are allowed because SvelteKit and the
-  theme boot code need them. `withGlobalTauri` is off, and the main window and
-  About window have separate minimal capabilities.
+- Content Security Policy is enabled with strict sources. First-party inline
+  scripts are allowed via Tauri-generated hashes, and inline CSS is enabled by
+  disabling Tauri's `style-src` nonce injection — otherwise CSP ignores
+  `'unsafe-inline'` and xterm.js/Monaco runtime inline styles are blocked.
+  `withGlobalTauri` is off, and the main window and About window have separate
+  minimal capabilities.
 - MCP/chat logs use private 0600 atomic writes with secret redaction, SSH config
   writes use `O_NOFOLLOW` + 0600 rename, `vault_lock` closes live sessions, and
   external links are HTTPS-only.
