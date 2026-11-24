@@ -2,8 +2,10 @@
 
 ![RuTerm icon](desktop/static/app-icon.png)
 
-Ikon aplikasi kanonik ada di `desktop/static/app-icon.png` (salinan dari
-`~/Downloads/RuTerm_.png`) dan dipakai juga di README serta halaman About.
+Ikon aplikasi kanonik ada di `desktop/static/app-icon.png` (berasal dari
+`~/Downloads/RuTerm_.png`, dengan padding transparan 10% dan sudut membulat
+supaya ukurannya standar di Dock macOS) dan dipakai juga di README serta
+halaman About.
 
 Catatan ini dibuat setelah incident **CSS terminal (xterm) dan code editor (Monaco) tidak terload di release bundle**, padahal di `npm run dev`正常. Ikuti persis supaya tidak terulang.
 

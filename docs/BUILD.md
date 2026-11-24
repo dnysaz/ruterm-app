@@ -78,8 +78,9 @@ right-click → Open (Gatekeeper) or `xattr -dr com.apple.quarantine`.
 
 ![RuTerm icon](../desktop/static/app-icon.png)
 
-The canonical artwork is `desktop/static/app-icon.png` (copied from
-`~/Downloads/RuTerm_.png`). Generated bundle icons are in
+The canonical artwork is `desktop/static/app-icon.png` (derived from
+`~/Downloads/RuTerm_.png` with 10% transparent padding and rounded corners so
+it matches standard macOS Dock sizing). Generated bundle icons are in
 `desktop/src-tauri/icons/`. To regenerate the full set from this artwork:
 
 ```bash
