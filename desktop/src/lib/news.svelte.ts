@@ -24,7 +24,7 @@ export interface NewsFeed {
 
 // Mutable `main` could serve a matching index and body together. Pin to an
 // immutable commit; bump this constant only when publishing a release.
-export const NEWS_COMMIT = '1e962ef7ed8c722bd42697caf5ba709a25b4b8a3';
+export const NEWS_COMMIT = '89cb18f697b149388d576617d1aa8ecdd4016910';
 const REPO_RAW = `https://raw.githubusercontent.com/dnysaz/ruterm-app/${NEWS_COMMIT}/news`;
 const CACHE_KEY = 'rterm.news.cache.v1';
 const LAST_SEEN_KEY = 'rterm.news.lastseen.v1';
