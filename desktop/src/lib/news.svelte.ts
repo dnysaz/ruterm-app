@@ -1,14 +1,16 @@
-// What's New — loads release notes from News/*.md.
+// What's New — loads release notes from news/*.md.
 // Preference order per entry: fresh copy from GitHub raw (repo is public once
 // released) → localStorage cache of the last fetch → bundled copy (offline
-// fallback, generated into static/news at dev/build time by News/build-index.mjs).
+// fallback, generated into static/news at dev/build time by news/build-index.mjs).
 
 export interface NewsEntry {
-  /** File name inside News/, also the cache key. */
+  /** File name inside news/, also the cache key. */
   file: string;
   date: string; // YYYY-MM-DD (from the file name)
   title: string;
   summary: string;
+  /** SHA-256 of the Markdown body; required before remote/cache bodies render. */
+  sha256: string;
   /** Markdown body, filled in once loaded. */
   markdown?: string;
   /** Where the body came from — useful for the "offline" hint in the UI. */
@@ -20,7 +22,10 @@ export interface NewsFeed {
   source: 'github' | 'cache' | 'bundle' | 'empty';
 }
 
-const REPO_RAW = 'https://raw.githubusercontent.com/dnysaz/ruterm-app/main/News';
+// Mutable `main` could serve a matching index and body together. Pin to an
+// immutable commit; bump this constant only when publishing a release.
+export const NEWS_COMMIT = '1e962ef7ed8c722bd42697caf5ba709a25b4b8a3';
+const REPO_RAW = `https://raw.githubusercontent.com/dnysaz/ruterm-app/${NEWS_COMMIT}/news`;
 const CACHE_KEY = 'rterm.news.cache.v1';
 const LAST_SEEN_KEY = 'rterm.news.lastseen.v1';
 const FETCH_TIMEOUT_MS = 3500;
@@ -34,9 +39,20 @@ const MAX_SUMMARY_CHARS = 300;
 const MAX_CACHE_BYTES = 2 * 1024 * 1024;
 const NEWS_FILE_RE = /^\d{4}-\d{2}-\d{2}-[a-z0-9-]+\.md$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const SHA256_RE = /^[a-f0-9]{64}$/i;
 
 function byteLength(text: string): number {
   return new TextEncoder().encode(text).byteLength;
+}
+
+/** A body is only usable when it matches the digest in the pinned index. */
+async function verifyBody(entry: Omit<NewsEntry, 'markdown' | 'source'>, body: string): Promise<boolean> {
+  if (!SHA256_RE.test(entry.sha256 ?? '')) return false;
+  if (byteLength(body) > MAX_FILE_BYTES) return false;
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(body));
+  return Array.from(new Uint8Array(digest))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('') === entry.sha256.toLowerCase();
 }
 
 export const newsState = $state({
@@ -138,6 +154,7 @@ function validEntry(e: unknown): e is Omit<NewsEntry, 'markdown' | 'source'> {
     && DATE_RE.test(v.date)
     && !Number.isNaN(Date.parse(`${v.date}T00:00:00Z`))
     && typeof v.title === 'string' && v.title.length > 0 && v.title.length <= MAX_TITLE_CHARS
+    && typeof v.sha256 === 'string' && SHA256_RE.test(v.sha256)
     && (v.summary === undefined
         || (typeof v.summary === 'string' && v.summary.length <= MAX_SUMMARY_CHARS));
 }
@@ -157,7 +174,10 @@ async function fromBundle(): Promise<NewsFeed> {
     );
     await Promise.all(
       entries.map(async entry => {
-        entry.markdown = await fetchText(`/news/${entry.file}`).catch(() => '');
+        const body = await fetchText(`/news/${entry.file}`).catch(() => '');
+        // Bundled copies are build-owned, but verify anyway so a tampered
+        // static file can never reach the Markdown sink.
+        entry.markdown = (await verifyBody(entry, body)) ? body : '';
       }),
     );
     return { entries, source: entries.length ? 'bundle' : 'empty' };
@@ -167,36 +187,33 @@ async function fromBundle(): Promise<NewsFeed> {
 }
 
 async function fromGithubOrCache(): Promise<NewsFeed | null> {
-  // Fresh from the repo…
+  // Fresh from the pinned commit…
   try {
     const index = await fetchJson(`${REPO_RAW}/index.json`);
     const raw = validIndex(index.entries) ? index.entries : null;
     if (!raw) throw new Error('news: malformed index.json');
     const files: Record<string, string> = {};
-    const entries = await Promise.all(
-      raw.map(async e => {
-        try {
-          files[e.file] = await fetchText(`${REPO_RAW}/${e.file}`);
-          return { ...e, markdown: files[e.file], source: 'github' as const };
-        } catch {
-          // One missing file shouldn't hide the whole feed.
-          return { ...e, markdown: '', source: 'github' as const };
-        }
-      }),
-    );
+    const entries: NewsEntry[] = [];
+    for (const e of raw) {
+      const body = await fetchText(`${REPO_RAW}/${e.file}`).catch(() => '');
+      // The index and body come from the same remote. A hash mismatch means
+      // the feed is tampered: discard it instead of rendering or caching it.
+      if (!await verifyBody(e, body)) throw new Error(`news: hash mismatch for ${e.file}`);
+      files[e.file] = body;
+      entries.push({ ...e, markdown: body, source: 'github' });
+    }
     writeCache({ fetched_at: new Date().toISOString(), index: { entries: raw }, files });
     return { entries: sortEntries(entries), source: 'github' };
   } catch {
-    // …or the cache of the last successful fetch.
+    // …or the cache of the last successful fetch, re-verified on every read.
     const cache = readCache();
-    if (!cache) return null;
-    const entries = validIndex(cache.index.entries)
-      ? cache.index.entries.map(e => ({
-          ...e,
-          markdown: cache.files[e.file] ?? '',
-          source: 'cache' as const,
-        }))
-      : [];
+    if (!cache || !validIndex(cache.index.entries)) return null;
+    const entries: NewsEntry[] = [];
+    for (const e of cache.index.entries) {
+      const body = cache.files[e.file] ?? '';
+      if (!await verifyBody(e, body)) return null;
+      entries.push({ ...e, markdown: body, source: 'cache' });
+    }
     return entries.length ? { entries: sortEntries(entries), source: 'cache' } : null;
   }
 }

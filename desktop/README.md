@@ -11,5 +11,5 @@ npm run check          # svelte-check + TypeScript
 npm run build          # production frontend only
 ```
 
-Release notes for the app live in [`../News`](../News/README.md) — plain Markdown,
+Release notes for the app live in [`../news`](../news/README.md) — plain Markdown,
 pulled straight from the repository into the in-app **What's New** tab.

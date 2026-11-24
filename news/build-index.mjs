@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 /**
- * Scans News/*.md and regenerates:
- *   - News/index.json            (committed; the app fetches this from GitHub raw)
+ * Scans news/*.md and regenerates:
+ *   - news/index.json            (committed; the app fetches this from GitHub raw)
  *   - desktop/static/news/*.md   (bundled offline copy)
  *   - desktop/static/news/index.json
  *
  * Wired as predev/prebuild in desktop/package.json — no manual step needed.
  */
 import { readdirSync, readFileSync, writeFileSync, mkdirSync, rmSync, copyFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -31,6 +32,8 @@ const entries = files.map(file => {
     date: file.slice(0, 10),
     title: titleMatch ? titleMatch[1].trim() : file.replace(/\.md$/, ''),
     summary: summaryMatch ? summaryMatch.replace(/[#*`_]/g, '').slice(0, 160) : '',
+    // Pinned remote news verifies each body against this digest before render.
+    sha256: createHash('sha256').update(raw).digest('hex'),
   };
 });
 
@@ -42,4 +45,4 @@ mkdirSync(staticDir, { recursive: true });
 for (const file of files) copyFileSync(join(root, file), join(staticDir, file));
 writeFileSync(join(staticDir, 'index.json'), JSON.stringify(index, null, 2) + '\n');
 
-console.log(`news: ${entries.length} entries -> News/index.json + desktop/static/news/`);
+console.log(`news: ${entries.length} entries -> news/index.json + desktop/static/news/`);

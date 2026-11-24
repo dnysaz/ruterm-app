@@ -43,6 +43,14 @@ h1 {
   color: #a1a1a6;
 }
 
+.tagline {
+  margin: 10px 0 0;
+  max-width: 260px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #a1a1a6;
+}
+
 .copyright {
   margin: 12px 0 0;
   font-size: 11px;

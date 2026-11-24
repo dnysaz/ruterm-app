@@ -38,6 +38,27 @@ export function fail(error: unknown) {
 }
 
 /**
+ * Renderer-side cleanup shared by lock, sign-out and account change. No IPC
+ * here: callers have already locked/signed out on the Rust side.
+ */
+function clearVaultAndChatLocally() {
+  clearAllSnapshots();
+  app.vault = null;
+  if (typeof window === 'undefined') return;
+  // The mounted drawer clears its in-memory thread on this event. Sweep the
+  // storage keys here too so a sign-out with no drawer mounted is still safe.
+  window.dispatchEvent(new Event('rterm:clear-chat-history'));
+  try {
+    const prefix = 'rterm:ai-chat:history';
+    for (const key of Object.keys(localStorage)) {
+      if (key.startsWith(prefix)) localStorage.removeItem(key);
+    }
+  } catch {
+    /* storage unavailable — nothing to clear */
+  }
+}
+
+/**
  * Cmd/Ctrl+R dispatch. Kept here (instead of a window event) so a dev HMR
  * update can replace the handler without leaving an old closure registered —
  * the old one used to remount VaultShell and close every open tab.
@@ -163,8 +184,13 @@ export async function signOut() {
   app.busy = true;
   try {
     await api.authSignOut();
-    clearAllSnapshots();
+    clearVaultAndChatLocally();
+    // Safe gate first: even if refreshing status fails, no vault or chat stays
+    // on screen after the identity is gone.
+    app.screen = 'welcome';
     app.status = await api.appStatus();
+    // Sign-out must always land on a locked/unauthenticated screen.
+    app.screen = app.status.has_vault ? 'unlock' : app.status.signed_in ? 'setup' : 'welcome';
     notify('Signed out of Google');
   } catch (error) {
     fail(error);
@@ -180,8 +206,7 @@ export async function changeAccount() {
   try {
     await api.authSignOut();
     await api.vaultLock().catch(() => {});
-    clearAllSnapshots();
-    app.vault = null;
+    clearVaultAndChatLocally();
     app.status = await api.appStatus();
     app.screen = 'welcome';
     const account = await api.authSignIn();
@@ -268,8 +293,7 @@ export async function unlock(passphrase: string) {
 export async function lock() {
   try {
     await api.vaultLock();
-    clearAllSnapshots();
-    app.vault = null;
+    clearVaultAndChatLocally();
     app.screen = 'unlock';
     app.status = await api.appStatus();
     notify('Vault locked');

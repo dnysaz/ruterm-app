@@ -76,11 +76,15 @@ right-click → Open (Gatekeeper) or `xattr -dr com.apple.quarantine`.
 
 ### Icons
 
-Scaffold icons are in `desktop/src-tauri/icons/`. To replace them:
+![RuTerm icon](../desktop/static/app-icon.png)
+
+The canonical artwork is `desktop/static/app-icon.png` (copied from
+`~/Downloads/RuTerm_.png`). Generated bundle icons are in
+`desktop/src-tauri/icons/`. To regenerate the full set from this artwork:
 
 ```bash
 cd ~/Desktop/rterm/desktop
-npm run tauri icon path/to/logo-1024.png
+npm run tauri icon static/app-icon.png
 ```
 
 ## Rust core only

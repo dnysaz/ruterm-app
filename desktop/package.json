@@ -12,8 +12,8 @@
     "check:titles": "node scripts/check-note-title.mjs",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "tauri": "tauri",
-    "predev": "node ../News/build-index.mjs",
-    "prebuild": "node ../News/build-index.mjs"
+    "predev": "node ../news/build-index.mjs",
+    "prebuild": "node ../news/build-index.mjs"
   },
   "license": "MIT",
   "dependencies": {

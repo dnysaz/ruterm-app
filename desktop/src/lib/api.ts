@@ -372,9 +372,11 @@ export const api = {
     invoke<void>('sftp_rename', { sftpId, token, from, to }),
   sftpRemove: (sftpId: string, token: string, path: string, isDir: boolean) =>
     invoke<void>('sftp_remove', { sftpId, token, path, isDir }),
-  /// Native dialog runs in Rust; returns a one-shot handle for `sftpUpload`.
-  sftpPickUpload: () => invoke<string>('sftp_pick_upload'),
-  sftpPickUploads: () => invoke<string[]>('sftp_pick_uploads'),
+  /// Native dialog runs in Rust; returns a one-shot handle bound to this SFTP tab.
+  sftpPickUpload: (sftpId: string, token: string) =>
+    invoke<string>('sftp_pick_upload', { sftpId, token }),
+  sftpPickUploads: (sftpId: string, token: string) =>
+    invoke<string[]>('sftp_pick_uploads', { sftpId, token }),
   /// Uploads a local file (picked in Rust) into `remoteDir`; resolves to the final remote path.
   sftpUpload: (sftpId: string, token: string, localToken: string, remoteDir: string) =>
     invoke<string>('sftp_upload', { sftpId, token, localToken, remoteDir }),
@@ -401,8 +403,11 @@ export const api = {
   /// Replays an existing session after a webview reload.
   sessionAttach: (sessionId: string, token: string) =>
     invoke<SessionAttach | null>('session_attach', { sessionId, token }),
-  sshImportKey: (label: string, pem: string, passphrase: string | null) =>
-    invoke<Identity>('ssh_import_key', { label, pem, passphrase }),
+  /// Rust opens the native key picker and returns a one-shot handle; key bytes
+  /// never cross IPC.
+  sshPickKey: () => invoke<string>('ssh_pick_key'),
+  sshImportKey: (label: string, token: string, passphrase: string | null) =>
+    invoke<Identity>('ssh_import_key', { label, token, passphrase }),
   sshKeygen: (kind: string, label: string) =>
     invoke<Identity>('ssh_keygen', { kind, label }),
 };

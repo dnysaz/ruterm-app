@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
@@ -44,8 +44,7 @@ pub fn restrict_file(_path: &Path) -> Result<(), String> {
 #[cfg(unix)]
 fn sync_parent(path: &Path) -> Result<(), String> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let handle = fs::File::open(dir)
-        .map_err(|e| format!("open {}: {e}", dir.display()))?;
+    let handle = fs::File::open(dir).map_err(|e| format!("open {}: {e}", dir.display()))?;
     handle
         .sync_all()
         .map_err(|e| format!("fsync {}: {e}", dir.display()))
@@ -67,6 +66,11 @@ pub struct VaultFile {
     /// Sealed known string, used to verify a derived key.
     #[serde(default)]
     pub canary: String,
+    /// Google account identity that owns this vault's remote copy (`sub`, or a
+    /// normalised email). Stored locally so switching accounts cannot silently
+    /// upload this vault to a different remote (H3).
+    #[serde(default)]
+    pub owner: Option<String>,
     pub vault: Vault,
 }
 
@@ -79,6 +83,7 @@ impl VaultFile {
             updated_at: Utc::now(),
             kdf,
             canary,
+            owner: None,
             vault: Vault::default(),
         }
     }
@@ -133,6 +138,40 @@ pub fn write_atomic(path: &Path, file: &VaultFile) -> Result<(), String> {
     Ok(())
 }
 
+/// Path of the rolling backup kept by [`write_atomic`].
+pub fn backup_path(vault_path: &Path) -> PathBuf {
+    vault_path.with_extension("json.bak")
+}
+
+/// Drops a stale backup. Used by reset / sign-out, where keeping an encrypted
+/// copy of the discarded vault would be misleading (and by L2 cleanup).
+pub fn delete_backup(vault_path: &Path) -> Result<(), String> {
+    let backup = backup_path(vault_path);
+    match fs::remove_file(&backup) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("failed to remove {}: {e}", backup.display())),
+    }
+}
+
+/// Removes `.tmp.<pid>.<seq>` files left behind by a crashed write. Called once
+/// at startup so a half-written temp file can never accumulate or be mistaken
+/// for user data (L2).
+pub fn clean_orphaned_temp_files(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("vault.json.tmp.") || name.starts_with("tofu.json.tmp.") {
+            if entry.path().is_file() {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 /// Small key/value file for app preferences (client id, device id, …).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AppSettings {
@@ -149,6 +188,15 @@ pub struct AppSettings {
     /// keychain (and macOS does not prompt) before the user ever linked one.
     #[serde(default)]
     pub google_linked: bool,
+    /// Google account identity allowed to sync this vault (`sub`, or a
+    /// normalised email). A different signed-in account requires an explicit
+    /// reset or adoption before any upload (H3).
+    #[serde(default)]
+    pub vault_owner: Option<String>,
+    /// Set once the local vault has been re-sealed with the current field AAD.
+    /// After that the legacy empty-AAD compatibility path is disabled (L1).
+    #[serde(default)]
+    pub aad_migration_complete: bool,
     /// The vault key is cached in the OS keychain, so the unlock screen can
     /// offer "unlock with saved key" instead of prompting on every launch.
     #[serde(default)]
@@ -179,6 +227,8 @@ impl Default for AppSettings {
             bridge_url: String::new(),
             device_id: uuid::Uuid::new_v4().to_string(),
             google_linked: false,
+            vault_owner: None,
+            aad_migration_complete: false,
             key_saved: false,
             synced_revision: 0,
             last_synced_at: None,
@@ -219,7 +269,8 @@ pub fn write_settings(path: &Path, settings: &AppSettings) -> Result<(), String>
             .open(path)
             .map_err(|e| format!("failed to save settings: {e}"))?;
         #[cfg(not(unix))]
-        let mut out = fs::File::create(path).map_err(|e| format!("failed to save settings: {e}"))?;
+        let mut out =
+            fs::File::create(path).map_err(|e| format!("failed to save settings: {e}"))?;
         out.write_all(text.as_bytes())
             .map_err(|e| format!("failed to save settings: {e}"))?;
         out.sync_all()
@@ -245,11 +296,7 @@ pub fn read_tofu(path: &Path) -> HashMap<String, String> {
 /// Persists an observed host-key fingerprint. Never overwrites an existing pin
 /// with a different value: a changed fingerprint must surface as a mismatch,
 /// not be silently accepted (TOFU warning).
-pub fn remember_fingerprint(
-    path: &Path,
-    host_key: &str,
-    fingerprint: &str,
-) -> Result<(), String> {
+pub fn remember_fingerprint(path: &Path, host_key: &str, fingerprint: &str) -> Result<(), String> {
     if host_key.is_empty() || fingerprint.is_empty() {
         return Err("invalid host key or fingerprint".into());
     }

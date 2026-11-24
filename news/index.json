@@ -1,0 +1,167 @@
+{
+  "version": 1,
+  "generated_at": "2026-11-24T06:43:31.367Z",
+  "entries": [
+    {
+      "file": "2026-11-24-security-hardening-26-fixes.md",
+      "date": "2026-11-24",
+      "title": "Security hardening: 26 fixes in one pass",
+      "summary": "A full audit of the webview, IPC commands, vault sync and release pipeline turned into 26 concrete fixes — 4 High, 12 Medium and 10 Low. Your everyday workflow ",
+      "sha256": "2983624b228d4a1a39d41d5af0e00bc16044b189d8ae2dbc22486c1e81f2425c"
+    },
+    {
+      "file": "2026-11-24-notes-chat-and-safer-tabs.md",
+      "date": "2026-11-24",
+      "title": "Notes, chat and sidebar polish — plus safer tab closing",
+      "summary": "A round of small fixes that make the everyday paths feel calmer: notes behave",
+      "sha256": "3e6663b062eaccf60dd2d8d3148c676c6565c5fbf602e9491d6b677f0ac8b2c9"
+    },
+    {
+      "file": "2026-11-23-notes-code-blocks.md",
+      "date": "2026-11-23",
+      "title": "Notes: type code, get a code block — Enter gets you out again",
+      "summary": "Notes now recognise code as you type it. A line like <p> hello </p> becomes a",
+      "sha256": "3f4ae32cd4ce0a510eb2b8e79eeb44e6d14bf9659068b92f0aba59f777a8ead5"
+    },
+    {
+      "file": "2026-11-23-agents-share-vault-tools.md",
+      "date": "2026-11-23",
+      "title": "AI agents now share your vault — and chat got smarter",
+      "summary": "Local agents (OpenCode, Kilo, Freebuff, Claude, Kiro and Command AI) now get the same vault tools as RuTerm's built-in AI chat through the embedded MCP bridge. ",
+      "sha256": "48548fad7894a568f84f520dbb496ba84c7b27e1aa1528a1179d049d52a2145b"
+    },
+    {
+      "file": "2026-11-21-streaming-command-output.md",
+      "date": "2026-11-21",
+      "title": "Long commands now stream progress — and can run without a timeout",
+      "summary": "Agents no longer have to wait until apt-get, a build, or a kernel change finishes before they can see what is happening.",
+      "sha256": "e9eb3538d2c485245b06bc3c7da7e6138695c2c302a80fe1c81b4f57023be8ac"
+    },
+    {
+      "file": "2026-11-21-built-in-ai-chat-byok.md",
+      "date": "2026-11-21",
+      "title": "RuTerm AI Chat: BYOK, tools that know your vault, and a real fullscreen tab",
+      "summary": "RuTerm now ships its own AI chat panel with Bring Your Own OpenRouter key — no extra app, no server, and no agent install on your VPS.",
+      "sha256": "fe5a4a35b19097853fd552e1a96c18f5f671d75bd9a5321fd8b5342dfad9d5ef"
+    },
+    {
+      "file": "2026-11-21-auto-reconnect-and-interactive-tools.md",
+      "date": "2026-11-21",
+      "title": "Dropped SSH sessions reconnect by themselves",
+      "summary": "When a VPS reboots or the network blips, RuTerm now reopens the same tab automatically. You do not need to open a new terminal or tell your agent to reconnect: ",
+      "sha256": "8efe6141086877c7f12b64b845f7d8d3eaeeca54959a0e17f283bd637737b055"
+    },
+    {
+      "file": "2026-11-21-agent-knows-your-vps-name.md",
+      "date": "2026-11-21",
+      "title": "Agents now know which VPS you mean — without a reload",
+      "summary": "Open a VPS tab while an agent is already running in a local shell, and it sees the new tab immediately. No restart, no re-initialisation.",
+      "sha256": "4b1a1b714c2337962d41c82ffccab0265931cf43790bd80894e16870c4b4ea82"
+    },
+    {
+      "file": "2026-11-21-agent-bridge-for-every-agent.md",
+      "date": "2026-11-21",
+      "title": "Your SSH tab is now a tool every AI agent can use",
+      "summary": "RuTerm now embeds the MCP bridge itself, so a local agent can type commands into your VPS tab — no agent install, no config editing, no extra server.",
+      "sha256": "563cb927ed5e9d01aae205bbe34ebd6c97599ba5ca9b19a524243d26913588fc"
+    },
+    {
+      "file": "2026-11-20-vault-recovery-and-workspace.md",
+      "date": "2026-11-20",
+      "title": "Your old key still works — and a calmer home screen",
+      "summary": "Older vaults now open with the correct encryption context, so your existing key is accepted again and re-sealed automatically.",
+      "sha256": "b458f6f143593afe64f60e65383cb5ede81be547bfbb1820d82a07638215b9c7"
+    },
+    {
+      "file": "2026-11-20-sftp-streaming.md",
+      "date": "2026-11-20",
+      "title": "Directory listings, without the surprise memory spike",
+      "summary": "One last security follow-up for the SFTP panel. Listing a folder used to ask the",
+      "sha256": "800d142e78614215eb6b92cd92b97a02db13d7c18ab519307a5540fca6f4fce8"
+    },
+    {
+      "file": "2026-11-20-security-hardening.md",
+      "date": "2026-11-20",
+      "title": "A tougher app under the hood",
+      "summary": "Most of this update is invisible. It closes a long list of ways things could go",
+      "sha256": "80909f0fdfb83a82ca75622e578436cab3a10d6d3d4685dc6d51e06e96de7638"
+    },
+    {
+      "file": "2026-11-20-security-followup.md",
+      "date": "2026-11-20",
+      "title": "Closing the last gaps",
+      "summary": "A short follow-up to today's security update. Three remaining items are now",
+      "sha256": "afd2ee7c716e2d7722faeeea3c33f839e2c099067e1b25f19e00cbfe84832934"
+    },
+    {
+      "file": "2026-11-19-whats-new-editor.md",
+      "date": "2026-11-19",
+      "title": "A real code editor, image previews, and files that hide",
+      "summary": "The SFTP panel grew up: files open in Monaco, images open as images, and the",
+      "sha256": "5558235bcb833f32ada39a90dd53037f79dc6df141d66e168e173d20fa2ffeff"
+    },
+    {
+      "file": "2026-11-19-sync.md",
+      "date": "2026-11-19",
+      "title": "Sync that tells you the truth",
+      "summary": "Your vault's sync status is now honest and visible:",
+      "sha256": "87c221cea5475334308df390a3530a8439f30fe84df29e139679efe4468fcae0"
+    },
+    {
+      "file": "2026-11-19-session-restore.md",
+      "date": "2026-11-19",
+      "title": "Cmd+R is a no-op — and the app picks up where you left off",
+      "summary": "Reload (⌘R) no longer tears down your sessions. Your layout — tab order,",
+      "sha256": "dcd6a013a62844642708aa63ca2de3a3dcd74979e4781103ec2178e1f5016570"
+    },
+    {
+      "file": "2026-11-19-quick-connect.md",
+      "date": "2026-11-19",
+      "title": "Type `ssh you@host:port`, hit Enter — and meet the AI dock",
+      "summary": "Two small things that make RuTerm feel faster every day:",
+      "sha256": "aa419241bc0ed6d2abeccbc30850ddf05512e34819d0f2d50d010ed15950e5f5"
+    },
+    {
+      "file": "2026-11-19-notes.md",
+      "date": "2026-11-19",
+      "title": "Notes, synced with everything else",
+      "summary": "RuTerm now has free-form Markdown notes, stored in the same vault as your",
+      "sha256": "147407ba57d23cecf59fa4d3f5597e6ca83debf47cfc8700bd83cc63a12c0c0b"
+    },
+    {
+      "file": "2026-11-19-macos-native.md",
+      "date": "2026-11-19",
+      "title": "A native macOS look — flat, quiet, two themes",
+      "summary": "The whole interface got a redesign: two themes (Dark and Light) in place of",
+      "sha256": "720e740454f16ac9c90290f5839ed3246bd63e1f4bf5504299fbe6e67c2e4128"
+    },
+    {
+      "file": "2026-11-19-backgrounds.md",
+      "date": "2026-11-19",
+      "title": "Wallpaper, your way — photos, patterns, and your own image",
+      "summary": "Settings → Background now lets you set the backdrop for the whole app:",
+      "sha256": "6c6d5adbd457bbda27a1dad2858409b7c35ed24fb5866f855e33b626534be93f"
+    },
+    {
+      "file": "2026-11-18-whats-new.md",
+      "date": "2026-11-18",
+      "title": "What's New? This very tab",
+      "summary": "RuTerm now has a What's New button on the homepage. Clicking it opens this tab,",
+      "sha256": "de2c8916991946ab68f00c6b2055d9737d06800e571b42b86b7d9f084fa6b091"
+    },
+    {
+      "file": "2026-11-18-page-tabs.md",
+      "date": "2026-11-18",
+      "title": "Settings & host editor became full tabs",
+      "summary": "No more slide-over sheets. Settings and the host editor now open as regular",
+      "sha256": "4cbae2c45236b71cfb6ee920b873b028d869d183999633de2cfff1d1a64effc5"
+    },
+    {
+      "file": "2026-11-18-fresh-look.md",
+      "date": "2026-11-18",
+      "title": "A fresh coat: IBM Plex, ligatures & a calmer homepage",
+      "summary": "The whole UI switched from Manrope to IBM Plex Sans (with IBM Plex Mono for",
+      "sha256": "768ccc633a268b83d92cfbf66eea710e06ffa65cb9342f93f19344ce56edaf56"
+    }
+  ]
+}

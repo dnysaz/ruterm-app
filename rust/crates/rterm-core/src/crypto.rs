@@ -14,6 +14,7 @@ use chacha20poly1305::{
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
 use crate::model::Vault;
@@ -146,7 +147,10 @@ impl KdfParams {
     /// derivation at ~256 MiB / 10 passes (F-07).
     pub fn validate(&self) -> Result<(), CryptoError> {
         if self.alg != "argon2id" {
-            return Err(CryptoError::UnsafeKdf(format!("unsupported algorithm {}", self.alg)));
+            return Err(CryptoError::UnsafeKdf(format!(
+                "unsupported algorithm {}",
+                self.alg
+            )));
         }
         let salt_len = self.salt()?.len();
         if !(SALT_LEN..=64).contains(&salt_len) {
@@ -215,7 +219,13 @@ pub fn seal_bytes(
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = XNonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
-        .encrypt(nonce, Payload { msg: plaintext, aad })
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| CryptoError::Encrypt)?;
     Ok(SealedVault {
         v: SCHEMA,
@@ -242,12 +252,59 @@ pub fn open_bytes(
     cipher
         .decrypt(
             XNonce::from_slice(&nonce_bytes),
-            Payload { msg: ciphertext.as_ref(), aad },
+            Payload {
+                msg: ciphertext.as_ref(),
+                aad,
+            },
         )
         .map_err(|_| CryptoError::Decrypt)
 }
 
-pub fn seal_vault(vault: &Vault, key: &SecretKey, kdf: Option<KdfParams>) -> Result<SealedVault, CryptoError> {
+/// HMAC-SHA256 over an arbitrary byte string, keyed with the vault key.
+///
+/// Used for the sync-document integrity MAC: field-level AEAD protects the
+/// secrets, but the surrounding metadata (revision, tombstones, timestamps,
+/// settings) also needs to be authenticated before a remote document is merged.
+/// Keeping the primitive here means the MAC is always derived from the same
+/// `SecretKey` that opens the vault, never from a renderer-supplied value.
+pub fn sync_mac(key: &SecretKey, message: &[u8]) -> [u8; 32] {
+    let mut ipad = zeroize::Zeroizing::new([0x36u8; 64]);
+    let mut opad = zeroize::Zeroizing::new([0x5cu8; 64]);
+    let bytes = key.as_bytes();
+    for i in 0..KEY_LEN {
+        ipad[i] ^= bytes[i];
+        opad[i] ^= bytes[i];
+    }
+    let inner = {
+        let mut hasher = Sha256::new();
+        hasher.update(&*ipad);
+        hasher.update(message);
+        hasher.finalize()
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(&*opad);
+    hasher.update(inner);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// Constant-time equality for MACs. Length differences are public.
+pub fn mac_equal(expected: &[u8], actual: &[u8]) -> bool {
+    let mut diff = expected.len() ^ actual.len();
+    for i in 0..expected.len().max(actual.len()) {
+        diff |=
+            (expected.get(i).copied().unwrap_or(0) ^ actual.get(i).copied().unwrap_or(0)) as usize;
+    }
+    diff == 0
+}
+
+pub fn seal_vault(
+    vault: &Vault,
+    key: &SecretKey,
+    kdf: Option<KdfParams>,
+) -> Result<SealedVault, CryptoError> {
     let plaintext = serde_json::to_vec(vault)?;
     // Top-level blobs predate AAD; keep empty AAD so existing vaults stay readable.
     seal_bytes(&plaintext, key, kdf, b"")
@@ -282,7 +339,6 @@ pub fn open_vault_with_passphrase(
     let vault = open_vault(sealed, &key)?;
     Ok((vault, key))
 }
-
 
 const BASE32_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
@@ -395,7 +451,8 @@ mod tests {
         let params = KdfParams::new_default();
         let key = derive_key("correct horse battery staple", &params).unwrap();
         let sealed = seal_vault(&vault, &key, Some(params)).unwrap();
-        let (opened, _) = open_vault_with_passphrase(&sealed, "correct horse battery staple").unwrap();
+        let (opened, _) =
+            open_vault_with_passphrase(&sealed, "correct horse battery staple").unwrap();
         assert_eq!(opened.hosts[0].address, "10.0.0.1");
     }
 
@@ -439,6 +496,18 @@ mod tests {
     }
 
     #[test]
+    fn sync_mac_is_key_dependent_and_detects_changes() {
+        let key = SecretKey::from_bytes([7u8; KEY_LEN]);
+        let other = SecretKey::from_bytes([8u8; KEY_LEN]);
+        let message = br#"{"schema":1,"revision":3,"vault":{"hosts":[]}}"#;
+        let mac = sync_mac(&key, message);
+        assert!(mac_equal(&mac, &sync_mac(&key, message)));
+        assert!(!mac_equal(&mac, &sync_mac(&other, message)));
+        assert!(!mac_equal(&mac, &sync_mac(&key, b"tampered")));
+        assert!(!mac_equal(&mac, &mac[..16]));
+    }
+
+    #[test]
     fn ciphertext_hides_secrets() {
         let vault = sample_vault();
         let key = SecretKey::generate();
@@ -447,5 +516,4 @@ mod tests {
         assert!(!json.contains("s3cret"));
         assert!(!json.contains("10.0.0.1"));
     }
-
 }

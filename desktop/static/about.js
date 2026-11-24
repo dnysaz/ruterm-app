@@ -1,13 +1,14 @@
 const REPO = 'https://github.com/dnysaz/ruterm-app';
 
-function tauri() {
-  return typeof window.__TAURI__ !== 'undefined' ? window.__TAURI__ : null;
-}
-
-async function invoke(command, args) {
-  const api = tauri();
-  if (!api?.core?.invoke) throw new Error('Tauri IPC unavailable');
-  return api.core.invoke(command, args);
+function invoke(command, args) {
+  // `withGlobalTauri` is off, so the public window.__TAURI__ bridge is not
+  // installed. The low-level IPC object injected by the runtime is enough for
+  // this static page's two read-only commands.
+  const internals = window.__TAURI_INTERNALS__;
+  if (typeof internals?.invoke === 'function') return internals.invoke(command, args);
+  const api = window.__TAURI__;
+  if (typeof api?.core?.invoke === 'function') return api.core.invoke(command, args);
+  throw new Error('Tauri IPC unavailable');
 }
 
 async function init() {

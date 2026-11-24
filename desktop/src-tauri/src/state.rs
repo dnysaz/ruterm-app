@@ -31,6 +31,43 @@ pub struct Paths {
     pub tofu: PathBuf,
 }
 
+/// A native-dialog path held for one IPC call. Upload handles are additionally
+/// bound to the requesting SFTP tab and its capability token, so a token from
+/// another tab can never be spent to upload a victim's local file (L7).
+pub struct LocalFileHandle {
+    pub path: PathBuf,
+    pub sftp_id: Option<String>,
+    pub capability: Option<String>,
+}
+
+impl LocalFileHandle {
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            sftp_id: None,
+            capability: None,
+        }
+    }
+
+    pub fn for_upload(path: PathBuf, sftp_id: &str, capability: &str) -> Self {
+        Self {
+            path,
+            sftp_id: Some(sftp_id.to_string()),
+            capability: Some(capability.to_string()),
+        }
+    }
+}
+
+/// Stable, privacy-neutral identity for the signed-in Google account. `sub` is
+/// preferred; older bridges did not return it, so a normalised email is used.
+pub fn account_identity(account: &GoogleAccount) -> String {
+    let sub = account.sub.trim();
+    if !sub.is_empty() {
+        return sub.to_string();
+    }
+    account.email.trim().to_ascii_lowercase()
+}
+
 /// One entry per live or recently finished session: a small rolling buffer of
 /// raw terminal output so a webview reload can replay what xterm missed.
 pub struct StreamEntry {
@@ -44,7 +81,11 @@ const OUTPUT_CAP: usize = 512 * 1024;
 
 impl StreamEntry {
     pub fn new() -> Self {
-        Self { buf: Vec::new(), total: 0, closed: false }
+        Self {
+            buf: Vec::new(),
+            total: 0,
+            closed: false,
+        }
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
@@ -102,7 +143,10 @@ pub struct AppState {
     pub sftp_tokens: Mutex<HashMap<String, String>>,
     /// One-shot handles for local paths chosen in a native dialog. Renderer
     /// never supplies a raw local path to an SFTP command.
-    pub local_file_tokens: Mutex<HashMap<String, PathBuf>>,
+    pub local_file_tokens: Mutex<HashMap<String, LocalFileHandle>>,
+    /// One-shot handles for SSH private keys chosen in a native dialog. The
+    /// renderer sends only the token and passphrase; Rust reads the file (M12).
+    pub ssh_key_tokens: Mutex<HashMap<String, PathBuf>>,
     /// Newly generated/imported private keys awaiting the renderer's next
     /// `vault_save`. Kept in Rust so the plaintext key never crosses IPC.
     pub pending_identities: Mutex<HashMap<Uuid, Identity>>,
@@ -136,6 +180,7 @@ impl AppState {
             session_tokens: Mutex::new(HashMap::new()),
             sftp_tokens: Mutex::new(HashMap::new()),
             local_file_tokens: Mutex::new(HashMap::new()),
+            ssh_key_tokens: Mutex::new(HashMap::new()),
             pending_identities: Mutex::new(HashMap::new()),
             chat_sessions: Mutex::new(HashMap::new()),
             chat_pending: Mutex::new(HashMap::new()),
@@ -165,12 +210,15 @@ impl AppState {
         let local = settings.bridge_url.trim();
         let candidate = if !local.is_empty() {
             local
-        } else if let Some(env_url) =
-            option_env!("RTERM_BRIDGE_URL").map(str::trim).filter(|v| !v.is_empty())
+        } else if let Some(env_url) = option_env!("RTERM_BRIDGE_URL")
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
         {
             env_url
         } else {
-            return Err("Sync bridge is not configured yet — local vault still works offline".into());
+            return Err(
+                "Sync bridge is not configured yet — local vault still works offline".into(),
+            );
         };
         validate_bridge_url(candidate)
     }
@@ -198,14 +246,16 @@ pub fn validate_bridge_url(value: &str) -> Result<String, String> {
     if value.trim().is_empty() {
         return Ok(String::new());
     }
-    let url = tauri::Url::parse(value)
-        .map_err(|_| "Bridge URL must be an absolute URL".to_string())?;
+    let url =
+        tauri::Url::parse(value).map_err(|_| "Bridge URL must be an absolute URL".to_string())?;
     match url.scheme() {
         "https" => {}
         "http" if cfg!(debug_assertions) => {
             let host = url.host_str().unwrap_or("");
             if host != "127.0.0.1" && host != "localhost" {
-                return Err("A plaintext bridge URL is only allowed on loopback in debug builds".into());
+                return Err(
+                    "A plaintext bridge URL is only allowed on loopback in debug builds".into(),
+                );
             }
         }
         other => return Err(format!("Unsupported bridge URL scheme: {other}")),

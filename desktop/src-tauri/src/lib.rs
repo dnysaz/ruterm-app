@@ -37,7 +37,8 @@ fn show_about(app: &tauri::AppHandle) {
     else {
         return;
     };
-    match tauri::WebviewWindowBuilder::from_config(app, &config).and_then(|builder| builder.build()) {
+    match tauri::WebviewWindowBuilder::from_config(app, &config).and_then(|builder| builder.build())
+    {
         Ok(window) => {
             let _ = window.set_focus();
         }
@@ -127,7 +128,10 @@ fn allowed_navigation(url: &Url) -> bool {
         "tauri" | "asset" | "ipc" => true,
         "http" | "https" => {
             let host = url.host_str().unwrap_or("");
-            if matches!(host, "tauri.localhost" | "ipc.localhost" | "asset.localhost") {
+            if matches!(
+                host,
+                "tauri.localhost" | "ipc.localhost" | "asset.localhost"
+            ) {
                 return true;
             }
             // Vite dev server, development builds only.
@@ -159,6 +163,9 @@ pub fn run() {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
             store::restrict_dir(&dir)?;
+            // L2: a crashed atomic write can leave temp files behind. Remove
+            // them before anything else opens the vault directory.
+            store::clean_orphaned_temp_files(&dir);
 
             let settings_path = dir.join("settings.json");
             let settings = store::read_settings(&settings_path);
@@ -204,6 +211,7 @@ pub fn run() {
             commands::ssh_resize,
             commands::ssh_close,
             commands::ssh_keygen,
+            commands::ssh_pick_key,
             commands::ssh_import_key,
             commands::host_probe_os,
             commands::session_attach,

@@ -15,7 +15,10 @@ const ALLOWED_TAGS = [
   'a', 'img', 'table', 'thead', 'tbody', 'tr', 'th', 'td',
 ];
 
-const ALLOWED_ATTR = ['href', 'title', 'alt', 'src', 'width', 'height', 'align', 'class', 'id'];
+// `id` is never needed in rendered markdown and can collide with app chrome;
+// `class` is kept only so the hook below can preserve Monaco's `language-*`
+// hint on <code>. `referrerpolicy` is forced to `no-referrer` on images.
+const ALLOWED_ATTR = ['href', 'title', 'alt', 'src', 'width', 'height', 'align', 'class', 'referrerpolicy'];
 
 let hookInstalled = false;
 
@@ -34,6 +37,25 @@ function installHook(): void {
         node.removeAttribute('href');
       }
     }
+    // Only validated `language-*` tokens on <code> survive; arbitrary classes
+    // (and all ids) are dropped so remote markdown cannot target app styling.
+    const classes = node.getAttribute('class');
+    if (classes !== null) {
+      const languages = classes
+        .trim()
+        .split(/\s+/)
+        .filter(token => /^language-[A-Za-z0-9_+.-]+$/.test(token));
+      if (node.tagName === 'CODE' && languages.length) {
+        node.setAttribute('class', languages.join(' '));
+      } else {
+        node.removeAttribute('class');
+      }
+    }
+    if (node.tagName === 'IMG') {
+      // Never leak the renderer's IP/Referer to an image host, even when the
+      // caller opts into remote images (e.g. release notes).
+      node.setAttribute('referrerpolicy', 'no-referrer');
+    }
     const src = node.getAttribute('src');
     if (src !== null) {
       const value = src.trim();
@@ -44,10 +66,22 @@ function installHook(): void {
   });
 }
 
+/**
+ * Remote images are tracking beacons and can exfiltrate via the URL itself.
+ * Strip them before parsing; inline `data:image/...` art stays available.
+ */
+function stripRemoteImages(source: string): string {
+  return source
+    // Markdown images with an absolute URL (optional title / angle brackets).
+    .replace(/!\[([^\]]*)\]\(\s*<?https?:\/\/[^\s)]+>?(?:\s+["'][^"']*["'])?\s*\)/gi, '')
+    // Raw <img> tags: marked passes inline HTML through, so hide those too.
+    .replace(/<img\b[^>]*\bsrc\s*=\s*(?:"https?:\/\/[^"]*"|'https?:\/\/[^']*'|https?:\/\/[^\s>]+)[^>]*>/gi, '');
+}
+
 /** Returns sanitized HTML, or escaped source if the sanitizer is unavailable. */
 export function renderSafeMarkdown(
   markdown: string,
-  options: { linkBase?: string; imageBase?: string } = {},
+  options: { linkBase?: string; imageBase?: string; allowRemoteImages?: boolean } = {},
 ): string {
   let source = markdown ?? '';
   if (options.linkBase) {
@@ -57,6 +91,8 @@ export function renderSafeMarkdown(
     source = source.replace(/!\[([^\]]*)\]\((?!https?:\/\/|data:)([^)]+)\)/g,
       `![$1](${options.imageBase}$2)`);
   }
+  // Blocked by default: only trusted callers (release notes) opt back in.
+  if (options.allowRemoteImages !== true) source = stripRemoteImages(source);
   let html: string;
   try {
     html = marked.parse(source, { gfm: true, breaks: true }) as string;
@@ -68,12 +104,19 @@ export function renderSafeMarkdown(
   // No `USE_PROFILES` here: in DOMPurify 3.x it overrides ALLOWED_TAGS/ATTR
   // with the full HTML profile and widens the allowlist. The explicit narrow
   // lists above are the intended policy.
-  return DOMPurify.sanitize(html, {
+  const safe = DOMPurify.sanitize(html, {
     ALLOWED_TAGS,
     ALLOWED_ATTR,
     FORBID_TAGS: ['form', 'input', 'button', 'select', 'textarea', 'label', 'fieldset',
       'style', 'iframe', 'object', 'embed', 'svg', 'math', 'audio', 'video', 'link', 'meta'],
     FORBID_ATTR: ['style', 'srcset', 'formaction', 'onerror', 'onload'],
+  });
+  if (options.allowRemoteImages === true) return safe;
+  // Reference-style images are resolved by the parser after the source strip,
+  // so drop any remote src that survived sanitizing as a final backstop.
+  return safe.replace(/<img\b[^>]*>/gi, tag => {
+    if (!/\ssrc\s*=\s*(?:"https?:|'https?:|https?:)/i.test(tag)) return tag;
+    return tag.replace(/\ssrc\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/i, '');
   });
 }
 

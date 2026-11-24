@@ -61,6 +61,8 @@
     <div class="column">
 
       {#if page === 'about'}
+        <img class="brand-mark" src="/app-icon.png" alt="RuTerm" width="56" height="56" />
+
         <section class="section">
           <h3>What is RuTerm</h3>
           <p>
@@ -83,8 +85,13 @@
             <li><strong>Local-first.</strong> The vault is a plain JSON file you can read, diff and back up.</li>
             <li><strong>Field-level encryption.</strong> Hosts and settings stay readable; passwords and private keys are sealed with <span class="mono">XChaCha20-Poly1305</span> + <span class="mono">Argon2id</span>.</li>
             <li><strong>Encrypted credentials.</strong> The optional bridge (Cloudflare Worker + D1) stores sealed credentials plus readable host metadata; the operator cannot read passwords or keys but can see labels, addresses and notes.</li>
-            <li><strong>Native SSH.</strong> russh in Rust, PTY sessions streamed into xterm.js — real terminals, not emulated panes.</li>
+            <li><strong>Native SSH.</strong> russh in Rust, PTY sessions streamed into xterm.js — real terminals, not emulated panes. Closing an SSH, ad-hoc or SFTP tab asks for confirmation first; local shells and info pages close immediately.</li>
+            <li><strong>Files and notes.</strong> An SFTP file manager with a Monaco text editor, plus Markdown notes that open as full tabs — both use the vault you already have.</li>
+            <li><strong>Optional AI chat.</strong> Bring your own OpenRouter key (sealed in the vault) and ask about your hosts and notes, or let the chat drive a focused VPS tab after you approve each action.</li>
+            <li><strong>Coding agents.</strong> One-click, zero-config MCP launch for installed agents. The loopback token stays in a Rust-owned private config file, never in the webview.</li>
+            <li><strong>Signed sync.</strong> Every sync document carries a key-derived integrity MAC; unsigned or tampered copies are rejected before they can change your vault.</li>
             <li><strong>Reload-proof sessions.</strong> Tabs, splits and per-tab scrollback survive a restart; SSH reconnects below the restored text.</li>
+            <li><strong>Release notes in the app.</strong> What's New is pinned to a verified release commit and each entry is hash-checked before it renders.</li>
           </ul>
         </section>
 
@@ -98,6 +105,10 @@
             <div class="row">
               <span class="row-label">Engine</span>
               <span class="value mono">russh · Rust · Argon2id · XChaCha20-Poly1305</span>
+            </div>
+            <div class="row">
+              <span class="row-label">Security</span>
+              <span class="value">Strict CSP · scoped capabilities · native approvals</span>
             </div>
             <div class="row">
               <span class="row-label">UI type</span>
@@ -143,23 +154,42 @@
             <li>Passwords and private keys are sealed in your vault with your vault password. If you lose the vault file or forget the password, the secrets are unrecoverable — by design. Keep your own backups.</li>
             <li>Refresh tokens and keys kept in the OS keychain are as safe as that keychain. Lock your machine.</li>
             <li>Agent forwarding can expose your keys to the remote host. Enable it per host, knowingly.</li>
+            <li>Reset is local-only: it unlinks sync and deletes the local backup, but leaves the remote copy untouched until you explicitly re-adopt it.</li>
+            <li>Sync documents are signed. Unsigned legacy copies are rejected by current builds — update every device, or restore a signed copy instead of mixing versions.</li>
           </ul>
         </section>
 
         <section class="section">
-          <h3>4 · Sync bridge</h3>
+          <h3>4 · AI chat and coding agents</h3>
+          <p>
+            AI chat and agent launching are optional. If you add your own OpenRouter key, RuTerm
+            sends your prompts — and only the vault data you explicitly approve — to that provider.
+            Risky commands, note and snippet reads, and credential access each require a decision in
+            a native dialog. Credential access is single-use; it can never be permanently allowed.
+            Scoped “always for this reply” approvals expire when the assistant finishes.
+          </p>
+          <p>
+            You are responsible for the commands you approve and the keys you paste. Coding agents
+            run locally and reach the MCP bridge over loopback only; their token is kept in a
+            Rust-owned private config file, not exposed to webview scripts.
+          </p>
+        </section>
+
+        <section class="section">
+          <h3>5 · Sync bridge</h3>
           <p>
             Sync is opt-in and self-hosted. The hosted testing instance at
             <span class="mono">sync.lagitest.xyz</span> is experimental, may be reset, and is
             provided without guarantees. For production use, deploy your own bridge from
             <span class="mono">bridge/</span> — it takes minutes and costs nothing at hobby scale.
-            The bridge only ever sees ciphertext; it cannot decrypt, and it cannot help you
-            recover a lost vault password.
+            The bridge stores sealed credentials plus readable host metadata (labels, addresses,
+            usernames, notes and tags); it cannot decrypt the sealed fields and cannot help you
+            recover a lost vault password. Sync documents are signed with a key-derived MAC.
           </p>
         </section>
 
         <section class="section">
-          <h3>5 · No warranty &amp; liability</h3>
+          <h3>6 · No warranty &amp; liability</h3>
           <p>
             RuTerm is provided “as is”, without warranty of any kind, express or implied —
             including merchantability, fitness for a particular purpose and non-infringement.
@@ -170,19 +200,20 @@
         </section>
 
         <section class="section">
-          <h3>6 · Third parties</h3>
+          <h3>7 · Third parties</h3>
           <p>
             Google Sign-In is used only to establish an identity for sync; Google’s own terms
             and privacy policy apply when you sign in. Cloudflare hosts the bridge
-            infrastructure. RuTerm is not affiliated with either company.
+            infrastructure. OpenRouter is used only if you enable BYOK AI chat, and then only for
+            the messages you send. RuTerm is not affiliated with any of them.
           </p>
         </section>
 
         <section class="section">
-          <h3>7 · Changes</h3>
+          <h3>8 · Changes</h3>
           <p>
-            These terms evolve with the project. Material changes will be noted in the release
-            notes. Continued use after a change means you accept the updated terms. If you
+            These terms evolve with the project. Material changes will be noted in the in-app
+            What's New release notes. Continued use after a change means you accept the updated terms. If you
             disagree, stop using RuTerm and delete the vault file — nothing else is stored
             against your identity.
           </p>
@@ -193,8 +224,9 @@
           <h3>The short version</h3>
           <p>
             RuTerm does not collect telemetry, analytics or crash reports. Nothing leaves your
-            machine unless you sign in to sync — and then it leaves only as ciphertext you
-            encrypted on your device, to a bridge you can self-host.
+            machine unless you turn on a feature that needs it: sync sends sealed credentials to a
+            bridge you can self-host, and BYOK AI chat sends your prompts to the provider whose key
+            you entered. Both are opt-in.
           </p>
         </section>
 
@@ -205,6 +237,9 @@
             <li><strong>Scrollback snapshots</strong> — the last lines of each terminal, in local storage as plain text. Never synced, erasable in Settings → Sessions, and deleted per tab when a tab closes.</li>
             <li><strong>Keychain entries</strong> — refresh token (sync) and SSH key material, kept by the operating system, never inside the vault.</li>
             <li><strong>Settings</strong> — theme, sidebar state, bridge URL. Local only, apart from what sync carries as vault fields.</li>
+            <li><strong>AI chat history</strong> — kept in this browser profile, redacted before it is written, and erased on lock, sign-out or account switch. Tool previews keep only the tool name.</li>
+            <li><strong>BYOK API key</strong> — sealed in the vault like any other secret; the raw key is never returned to the webview.</li>
+            <li><strong>Agent bridge token</strong> — held by Rust in a 0600 private file and passed to locally launched agents over loopback, never embedded in webview state.</li>
           </ul>
         </section>
 
@@ -212,7 +247,7 @@
           <h3>Sent to the bridge (only if you sign in)</h3>
           <ul class="list">
             <li>Your Google account email and device name — so the bridge knows which devices may pull revisions.</li>
-            <li>The vault as an <em>opaque ciphertext blob</em> plus a revision number — the bridge cannot read hosts, passwords or keys.</li>
+            <li>Sealed credential fields plus readable host metadata (labels, addresses, usernames, notes, tags) and a signed revision — the bridge cannot read passwords or keys, but the operator can read that metadata.</li>
             <li>Google receives only the OAuth authorization exchange for sign-in, handled by the bridge; RuTerm requests <span class="mono">openid email profile</span> and nothing more.</li>
           </ul>
         </section>
@@ -372,6 +407,14 @@
     width: 100%;
     max-width: 680px;
     margin: 0 auto;
+  }
+
+  .brand-mark {
+    display: block;
+    width: 56px;
+    height: 56px;
+    border-radius: 14px;
+    margin: 4px 0 20px;
   }
 
   .section {

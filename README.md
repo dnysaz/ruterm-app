@@ -1,5 +1,9 @@
 # RuTerm
 
+<p align="center">
+  <img src="desktop/static/app-icon.png" alt="RuTerm icon" width="128" />
+</p>
+
 **RuTerm is an open-source SSH workspace for the desktop.** Hosts, identities,
 keys and terminal preferences live in a single JSON document that stays readable
 on your own machine, secrets are sealed locally, and — if you want it — the whole
@@ -74,11 +78,17 @@ A Termius-class workflow, built in the open.
   tabs in the UI. Notes are readable JSON, so sync metadata stays visible to
   the bridge operator.
 - Atomic writes (tmp → fsync → rename) with the previous file kept as
-  `vault.json.bak`.
+  `vault.json.bak`; stale temp and backup files are cleaned on reset.
 - The vault key is cached in the OS keychain so reopening the app doesn't ask
-  for the passphrase every launch.
+  for the passphrase every launch. The legacy `12345678` fallback only unlocks
+  a local vault once, then re-seals it with the current context.
 - Cross-device merge is last-write-wins per entity with tombstones, so
-  deletions stay deleted after a sync.
+  deletions stay deleted after a sync. Every sync document now carries a
+  key-derived HMAC: unsigned or tampered copies are rejected before merge.
+  Update every device before syncing — older clients cannot read signed
+  documents, and current builds reject unsigned legacy ones.
+- Reset is local-only: it unlinks sync and removes the local backup, but leaves
+  the remote copy untouched until you explicitly re-adopt it.
 
 ### Sync (optional)
 
@@ -88,10 +98,14 @@ A Termius-class workflow, built in the open.
   Credential fields are sealed client-side; host labels, addresses, usernames,
   notes, tags and settings remain readable metadata on the server. The operator
   cannot read sealed credentials, but can read that metadata.
+- The local vault is bound to the Google account that adopted it, and sign-out
+  performs a full local wipe (key, plaintext vault, tokens, chat state and live
+  sessions) rather than only dropping the token.
 - Deploy your own bridge (`bridge/`) in one command, or try the experimental
   hosted instance at `sync.lagitest.xyz`.
 - New device? Point it at the bridge, sign in, enter the same vault passphrase —
-  the vault is adopted and decrypted locally.
+  the vault is adopted and decrypted locally. The legacy passphrase is never
+  used for remote adopt or sync.
 - Sign-in is a real identity: RuTerm shows your **Google profile photo, display
   name and Google account ID** in Settings → Google and sync, and the sidebar
   footer shows your photo + name. The bridge stores and returns the avatar —
@@ -102,13 +116,44 @@ A Termius-class workflow, built in the open.
 - Prefer no cloud at all? RuTerm is fully usable offline with nothing but the
   JSON file.
 
+### AI chat and coding agents
+
+- Optional BYOK chat against OpenRouter: enter your own key in Settings → AI,
+  then use the `< >` button in the sidebar dock. A one-click link opens
+  `https://openrouter.ai/keys`. The raw key is sealed in the vault and never
+  returned to the webview; **Test connection** still verifies with
+  `Connected — AI replied: Hello World!`.
+- Risky commands are denied by default. Notes, snippets and host notes need
+  explicit approval before the assistant can read them, and approvals happen in
+  a native dialog — injected page code cannot answer its own prompt. Credential
+  reads can never be “always allowed”; scoped approvals expire with the reply.
+- Chat bubbles are redacted before `localStorage` and the history is cleared on
+  lock, sign-out and account change.
+- One-click, zero-config MCP launch for installed agents (OpenCode, Claude,
+  Kiro, Kilo Code, Command AI and friends). The loopback token lives in a
+  Rust-owned 0600 config file, never in webview state; the bridge validates
+  `Host`/`Origin` and sends restrictive headers.
+
+### Security posture
+
+- Strict Content Security Policy is enabled (inline styles only, so themes
+  still render), `withGlobalTauri` is off, and the main window and About window
+  have separate minimal capabilities.
+- MCP/chat logs use private 0600 atomic writes with secret redaction, SSH config
+  writes use `O_NOFOLLOW` + 0600 rename, `vault_lock` closes live sessions, and
+  external links are HTTPS-only.
+- Markdown sanitizer strips `class`/`id` and remote images are blocked by
+  default; SFTP upload handles are bound to their tab.
+
 ### What's New, built in
 
 - The **What's New** tab on the homepage shows release notes pulled straight
-  from this repository (`News/*.md`, fetched from GitHub raw at launch, bundled
+  from this repository (`news/*.md`, fetched from GitHub raw at launch, bundled
   offline as fallback).
+- The feed is pinned to an immutable release commit and every entry is SHA-256
+  verified before it renders, so a moved branch cannot swap release notes.
 - A red badge counts unread notes; opening the tab clears it. New entries
-  pushed to the repo appear without an app update. See [News/README.md](News/README.md).
+  appear once the pinned commit is bumped for a release. See [news/README.md](news/README.md).
 
 ### Interface
 
@@ -121,13 +166,16 @@ A Termius-class workflow, built in the open.
   upload your own image (stored on-device, never synced) — with Frost &
   Terminal sliders; *Terminal* makes the terminal and the note editor
   translucent over it.
-- **Home tab** (pinned, always first): one-line **quick connect**
-  (`ssh you@host:port`), recent sessions, and one click to launch any local
-  **AI agent** you have installed (opencode & friends) — auto-detected, agent
-  icon in the bottom-right dock.
+- **Home tab** (pinned, always first): a quiet clock plus **New host**,
+  **Local terminal** and **What's New?** — no cards, gradients or hero section.
+  The bottom-right dock exposes auto-detected local **AI agents** (opencode &
+  friends) and the `< >` AI chat button; clicking the gear opens Settings
+  straight to the AI section.
 - Page tabs instead of modals: Settings, host editor and resource pages
   (About, Terms, Privacy, Contact, GitHub) all open as regular, closable,
-  splittable tabs. Quick-connect and note tabs survive reload and restart.
+  splittable tabs. Closing an SSH, ad-hoc or SFTP tab asks for confirmation;
+  local shells and info pages close immediately. Note tabs survive reload and
+  restart.
 
 ---
 
@@ -142,7 +190,7 @@ rust/crates/rterm-core/ model · crypto · ssh (russh) · bridge client · OAuth
 rust/crates/rterm-cli/  headless harness for the SSH engine (used by tests)
 rust/crates/rterm-server/ legacy, optional — superseded by bridge/
 bridge/                 credential-encrypted sync bridge: Cloudflare Worker + D1 (TypeScript)
-News/                   release notes (.md) — source of the in-app What's New tab
+news/                   release notes (.md) — source of the in-app What's New tab
 docs/                   ARCHITECTURE · BUILD · SYNC · TESTING · GOOGLE_OAUTH
 ```
 
@@ -286,7 +334,7 @@ One document, on disk and on the bridge (field-level ciphertext inside):
 | Backgrounds (bundled photos/patterns, custom upload, Frost & Terminal) | working |
 | Scrollback restore (local, never synced) | working |
 | Notes (Markdown, in the vault, synced; credentials sealed) | working |
-| What's New (News/ → in-app tab + unread badge) | working |
+| What's New (news/ → in-app tab + unread badge) | working |
 | Bridge sync | `bridge/` (Worker + D1) — hosted experimental instance at sync.lagitest.xyz |
 | Windows / Linux builds | source is portable; bundles not set up yet |
 | Port forwarding, snippets, groups UI | modelled in the vault, UI pending |

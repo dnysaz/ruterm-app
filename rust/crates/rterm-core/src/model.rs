@@ -49,7 +49,10 @@ impl std::fmt::Debug for AuthMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Password { .. } => f.write_str("Password { password: [REDACTED] }"),
-            Self::Key { identity_id, passphrase } => f
+            Self::Key {
+                identity_id,
+                passphrase,
+            } => f
                 .debug_struct("Key")
                 .field("identity_id", identity_id)
                 .field("passphrase", &passphrase.as_ref().map(|_| "[REDACTED]"))
@@ -101,7 +104,10 @@ impl std::fmt::Debug for Identity {
             .field("id", &self.id)
             .field("label", &self.label)
             .field("private_key", &"[REDACTED]")
-            .field("passphrase", &self.passphrase.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "passphrase",
+                &self.passphrase.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("kind", &self.kind)
             .field("fingerprint", &self.fingerprint)
             .field("created_at", &self.created_at)
@@ -333,6 +339,42 @@ fn default_openrouter_model() -> String {
     "openai/gpt-4o-mini".into()
 }
 
+impl VaultSettings {
+    /// Reject malformed or hostile settings from a remote document. Bounds are
+    /// deliberately wide: they stop absurd values (DoS / bad terminal state),
+    /// not unusual but legitimate preferences.
+    pub fn validate_for_sync(&self) -> Result<(), String> {
+        if !(8..=72).contains(&self.font_size) {
+            return Err("Invalid font size in synced settings".into());
+        }
+        if self.scrollback > 1_000_000 {
+            return Err("Invalid scrollback in synced settings".into());
+        }
+        if self.sync_interval_secs > 86_400 || self.lock_timeout_secs > 86_400 {
+            return Err("Invalid timer in synced settings".into());
+        }
+        if self.default_term.is_empty() || self.default_term.len() > 64 {
+            return Err("Invalid terminal type in synced settings".into());
+        }
+        if self
+            .default_term
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err("Invalid terminal type in synced settings".into());
+        }
+        if self.font_family.as_deref().is_some_and(|v| v.len() > 128)
+            || self.theme.as_deref().is_some_and(|v| v.len() > 128)
+            || self.openrouter_model.len() > 128
+            || self.openrouter_api_key.len() > 4096
+        {
+            return Err("Oversized value in synced settings".into());
+        }
+        validate_sync_time(self.updated_at, "settings updated_at")?;
+        Ok(())
+    }
+}
+
 impl Default for VaultSettings {
     fn default() -> Self {
         Self {
@@ -396,7 +438,87 @@ impl Default for Vault {
     }
 }
 
+/// How far into the future a synced timestamp may be before the document is
+/// rejected. Generous enough for normal device clock drift, tight enough to
+/// stop a forged tombstone from winning merges forever (R-04/H2).
+const SYNC_TIME_SKEW_SECS: i64 = 15 * 60;
+
+fn validate_sync_time(value: Option<DateTime<Utc>>, label: &str) -> Result<(), String> {
+    if let Some(at) = value {
+        if at.timestamp() > Utc::now().timestamp() + SYNC_TIME_SKEW_SECS {
+            return Err(format!("{label} is in the future"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_id(id: Id, label: &str) -> Result<(), String> {
+    if id.is_nil() {
+        return Err(format!("{label} has an empty id"));
+    }
+    Ok(())
+}
+
 impl Vault {
+    /// Structural validation for any document that arrived from sync (bridge
+    /// or adoption). Run *before* merging, so malformed metadata can never
+    /// influence LWW/tombstone decisions or land in memory first.
+    pub fn validate_for_sync(&self) -> Result<(), String> {
+        if self.schema != 1 {
+            return Err(format!("Unsupported vault schema {}", self.schema));
+        }
+        let mut ids: HashSet<Id> = HashSet::new();
+        let mut check = |id: Id, label: &str, at: Option<DateTime<Utc>>| -> Result<(), String> {
+            validate_id(id, label)?;
+            validate_sync_time(at, label)?;
+            if !ids.insert(id) {
+                return Err(format!("Duplicate {label} id {id}"));
+            }
+            Ok(())
+        };
+        for host in &self.hosts {
+            check(host.id, "host", Some(host.updated_at))?;
+            validate_sync_time(host.created_at, "host created_at")?;
+            validate_sync_time(host.last_used_at, "host last_used_at")?;
+            if !host.deleted && (host.address.trim().is_empty() || host.port == 0) {
+                return Err("A host needs an address and port".into());
+            }
+        }
+        for identity in &self.identities {
+            check(identity.id, "identity", Some(identity.updated_at))?;
+            validate_sync_time(identity.created_at, "identity created_at")?;
+        }
+        for group in &self.groups {
+            check(group.id, "group", Some(group.updated_at))?;
+        }
+        for snippet in &self.snippets {
+            check(snippet.id, "snippet", Some(snippet.updated_at))?;
+        }
+        for note in &self.notes {
+            check(note.id, "note", Some(note.updated_at))?;
+            validate_sync_time(note.created_at, "note created_at")?;
+        }
+        for forward in &self.port_forwards {
+            check(forward.id, "port forward", Some(forward.updated_at))?;
+            if !forward.deleted && (forward.bind_port == 0 || forward.target_port == 0) {
+                return Err("A port forward needs valid ports".into());
+            }
+        }
+        validate_sync_time(self.updated_at, "vault updated_at")?;
+        self.settings.validate_for_sync()?;
+        Ok(())
+    }
+
+    /// Returns a copy safe to merge from a remote document: the two AI-chat
+    /// permission switches are local policy and must never be turned on by
+    /// data that came from another device or a sync server.
+    pub fn without_remote_permissions(&self) -> Vault {
+        let mut out = self.clone();
+        out.settings.chat_allow_credentials = false;
+        out.settings.chat_allow_vps = false;
+        out
+    }
+
     pub fn identity(&self, id: &Id) -> Option<&Identity> {
         self.identities.iter().find(|i| &i.id == id && !i.deleted)
     }
@@ -444,31 +566,55 @@ impl Vault {
     /// live entity and resurrect a deleted secret (F-39).
     pub fn compact_tombstones(&mut self, days: i64) {
         let cutoff = Utc::now() - chrono::Duration::days(days);
-        for host in self.hosts.iter_mut().filter(|h| h.deleted && h.updated_at <= cutoff) {
+        for host in self
+            .hosts
+            .iter_mut()
+            .filter(|h| h.deleted && h.updated_at <= cutoff)
+        {
             host.auth = AuthMethod::Agent;
             host.notes.clear();
             host.tags.clear();
             host.label.clear();
             host.address.clear();
         }
-        for identity in self.identities.iter_mut().filter(|i| i.deleted && i.updated_at <= cutoff) {
+        for identity in self
+            .identities
+            .iter_mut()
+            .filter(|i| i.deleted && i.updated_at <= cutoff)
+        {
             identity.private_key.clear();
             identity.passphrase = None;
             identity.label.clear();
         }
-        for snippet in self.snippets.iter_mut().filter(|s| s.deleted && s.updated_at <= cutoff) {
+        for snippet in self
+            .snippets
+            .iter_mut()
+            .filter(|s| s.deleted && s.updated_at <= cutoff)
+        {
             snippet.content.clear();
             snippet.label.clear();
         }
-        for note in self.notes.iter_mut().filter(|n| n.deleted && n.updated_at <= cutoff) {
+        for note in self
+            .notes
+            .iter_mut()
+            .filter(|n| n.deleted && n.updated_at <= cutoff)
+        {
             note.body.clear();
         }
-        for group in self.groups.iter_mut().filter(|g| g.deleted && g.updated_at <= cutoff) {
+        for group in self
+            .groups
+            .iter_mut()
+            .filter(|g| g.deleted && g.updated_at <= cutoff)
+        {
             group.label.clear();
         }
         // R-04: port-forward tombstones were skipped, leaving bind/target hosts
         // (which can be internal hostnames) in old synced tombstones.
-        for pf in self.port_forwards.iter_mut().filter(|p| p.deleted && p.updated_at <= cutoff) {
+        for pf in self
+            .port_forwards
+            .iter_mut()
+            .filter(|p| p.deleted && p.updated_at <= cutoff)
+        {
             pf.label = None;
             pf.bind_host.clear();
             pf.target_host.clear();
@@ -620,6 +766,47 @@ mod tests {
     }
 
     #[test]
+    fn sync_validation_rejects_corrupt_metadata() {
+        let mut vault = Vault::default();
+        vault.validate_for_sync().unwrap();
+
+        let id = Uuid::new_v4();
+        vault
+            .hosts
+            .push(host(id, "future", Utc::now() + chrono::Duration::hours(1)));
+        assert!(
+            vault.validate_for_sync().is_err(),
+            "future timestamps are rejected"
+        );
+
+        vault.hosts[0].updated_at = Utc::now();
+        vault.hosts.push(host(id, "duplicate", Utc::now()));
+        assert!(
+            vault.validate_for_sync().is_err(),
+            "duplicate ids are rejected"
+        );
+
+        vault.hosts.pop();
+        vault.settings.font_size = 0;
+        assert!(
+            vault.validate_for_sync().is_err(),
+            "bad settings are rejected"
+        );
+    }
+
+    #[test]
+    fn remote_permissions_are_never_trusted() {
+        let mut vault = Vault::default();
+        vault.settings.chat_allow_credentials = true;
+        vault.settings.chat_allow_vps = true;
+        let clean = vault.without_remote_permissions();
+        assert!(!clean.settings.chat_allow_credentials);
+        assert!(!clean.settings.chat_allow_vps);
+        // The source document is untouched so local flags survive locally.
+        assert!(vault.settings.chat_allow_credentials);
+    }
+
+    #[test]
     fn newer_remote_wins() {
         let id = Uuid::new_v4();
         let t0 = Utc::now();
@@ -676,10 +863,15 @@ mod tests {
         local.hosts.push(tombstone);
         let mut remote = Vault::default();
         // A clock-skewed replica's live record is one day newer.
-        remote.hosts.push(host(id, "resurrected", t0 + chrono::Duration::days(1)));
+        remote
+            .hosts
+            .push(host(id, "resurrected", t0 + chrono::Duration::days(1)));
         local.merge(&remote);
         assert_eq!(local.hosts.len(), 1);
-        assert!(local.hosts[0].deleted, "tombstone must remain terminal (R-04)");
+        assert!(
+            local.hosts[0].deleted,
+            "tombstone must remain terminal (R-04)"
+        );
         assert_eq!(local.hosts[0].label, "gone");
         assert_eq!(local.hosts[0].notes, "secret");
     }
@@ -689,13 +881,18 @@ mod tests {
         let id = Uuid::new_v4();
         let t0 = Utc::now();
         let mut local = Vault::default();
-        local.hosts.push(host(id, "alive", t0 + chrono::Duration::days(1)));
+        local
+            .hosts
+            .push(host(id, "alive", t0 + chrono::Duration::days(1)));
         let mut tombstone = host(id, "gone", t0);
         tombstone.deleted = true;
         let mut remote = Vault::default();
         remote.hosts.push(tombstone);
         local.merge(&remote);
-        assert!(local.hosts[0].deleted, "a delete must win even when its clock is behind (R-04)");
+        assert!(
+            local.hosts[0].deleted,
+            "a delete must win even when its clock is behind (R-04)"
+        );
     }
 
     #[test]

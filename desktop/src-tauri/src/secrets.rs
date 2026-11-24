@@ -7,9 +7,7 @@
 //! field name via AEAD associated data, so swapping values between fields or
 //! hosts fails authentication (F-29/F-40).
 
-use rterm_core::crypto::{
-    open_bytes, seal_bytes, CryptoError, KdfParams, SecretKey, SealedVault,
-};
+use rterm_core::crypto::{open_bytes, seal_bytes, CryptoError, KdfParams, SealedVault, SecretKey};
 use rterm_core::model::{AuthMethod, Vault};
 
 pub const PREFIX: &str = "enc:v1:";
@@ -96,11 +94,7 @@ fn constant_time_eq(expected: &str, actual: &str) -> bool {
 
 /// Seals a non-empty secret. An already sealed value is kept only if it
 /// authenticates under the *same* context; otherwise the write is rejected.
-pub fn seal_str(
-    key: &SecretKey,
-    value: &str,
-    aad: &[u8],
-) -> Result<String, CryptoError> {
+pub fn seal_str(key: &SecretKey, value: &str, aad: &[u8]) -> Result<String, CryptoError> {
     if value.is_empty() {
         return Ok(String::new());
     }
@@ -117,11 +111,7 @@ pub fn seal_str(
 
 /// Opens a sealed secret using the current context only. Plaintext values are
 /// rejected (except the empty string, which means "no secret configured").
-pub fn open_str(
-    key: &SecretKey,
-    value: &str,
-    aad: &[u8],
-) -> Result<String, CryptoError> {
+pub fn open_str(key: &SecretKey, value: &str, aad: &[u8]) -> Result<String, CryptoError> {
     if value.is_empty() {
         return Ok(String::new());
     }
@@ -148,6 +138,13 @@ pub fn verify_canary(key: &SecretKey, sealed: &str, expected: &str) -> bool {
     canary_context(key, sealed, expected).is_some()
 }
 
+/// Current-context-only canary check for remote documents. Legacy ciphertext
+/// is never accepted here: migration is a local unlock concern, not something
+/// a bridge copy can trigger (L1).
+pub fn verify_canary_strict(key: &SecretKey, sealed: &str, expected: &str) -> bool {
+    matches!(canary_context(key, sealed, expected), Some(true))
+}
+
 /// True when the canary on disk still uses the legacy empty AAD and should be
 /// re-sealed during the next unlock.
 pub fn canary_is_legacy(key: &SecretKey, sealed: &str, expected: &str) -> bool {
@@ -166,7 +163,10 @@ pub fn seal_vault(vault: &Vault, key: &SecretKey, epoch: &str) -> Result<Vault, 
             AuthMethod::KeyboardInteractive { password } => AuthMethod::KeyboardInteractive {
                 password: seal_str(key, password, &field_aad(epoch, &entity, "password"))?,
             },
-            AuthMethod::Key { identity_id, passphrase } => AuthMethod::Key {
+            AuthMethod::Key {
+                identity_id,
+                passphrase,
+            } => AuthMethod::Key {
                 identity_id: *identity_id,
                 passphrase: match passphrase {
                     Some(value) => Some(seal_str(
@@ -250,7 +250,10 @@ fn open_vault_inner(
                     &mut used_legacy,
                 )?,
             },
-            AuthMethod::Key { identity_id, passphrase } => AuthMethod::Key {
+            AuthMethod::Key {
+                identity_id,
+                passphrase,
+            } => AuthMethod::Key {
                 identity_id: *identity_id,
                 passphrase: match passphrase {
                     Some(value) => Some(open_field(
@@ -258,7 +261,7 @@ fn open_vault_inner(
                         value,
                         &field_aad(epoch, &entity, "passphrase"),
                         allow_legacy,
-                    &mut used_legacy,
+                        &mut used_legacy,
                     )?),
                     None => None,
                 },
@@ -273,7 +276,7 @@ fn open_vault_inner(
             &identity.private_key,
             &field_aad(epoch, &entity, "private_key"),
             allow_legacy,
-                    &mut used_legacy,
+            &mut used_legacy,
         )?;
         if let Some(passphrase) = &identity.passphrase {
             identity.passphrase = Some(open_field(
@@ -281,7 +284,7 @@ fn open_vault_inner(
                 passphrase,
                 &field_aad(epoch, &entity, "passphrase"),
                 allow_legacy,
-                    &mut used_legacy,
+                &mut used_legacy,
             )?);
         }
     }
@@ -305,10 +308,20 @@ pub fn open_vault_with_context(
     open_vault_inner(vault, key, epoch, true)
 }
 
+/// Strict current-context open for remote/adopted documents. Unlike the local
+/// unlock path, this never falls back to the legacy empty-AAD ciphertext.
+pub fn open_vault_strict(
+    vault: &Vault,
+    key: &SecretKey,
+    epoch: &str,
+) -> Result<Vault, CryptoError> {
+    open_vault_inner(vault, key, epoch, false).map(|(vault, _)| vault)
+}
+
 /// Strict current-context open, used by the crypto tests.
 #[cfg(test)]
 pub fn open_vault(vault: &Vault, key: &SecretKey, epoch: &str) -> Result<Vault, CryptoError> {
-    open_vault_inner(vault, key, epoch, false).map(|(vault, _)| vault)
+    open_vault_strict(vault, key, epoch)
 }
 
 #[cfg(test)]
@@ -326,7 +339,9 @@ mod tests {
             address: "10.0.0.1".into(),
             port: 22,
             username: "root".into(),
-            auth: AuthMethod::Password { password: "s3cret".into() },
+            auth: AuthMethod::Password {
+                password: "s3cret".into(),
+            },
             group_id: None,
             tags: vec![],
             color: None,
@@ -381,7 +396,9 @@ mod tests {
     fn plaintext_secret_is_rejected_on_read() {
         let key = SecretKey::generate();
         let mut sealed = seal_vault(&sample(), &key, "epoch-1").unwrap();
-        sealed.hosts[0].auth = AuthMethod::Password { password: "plain".into() };
+        sealed.hosts[0].auth = AuthMethod::Password {
+            password: "plain".into(),
+        };
         assert!(open_vault(&sealed, &key, "epoch-1").is_err());
     }
 
@@ -466,5 +483,29 @@ mod tests {
         let wrong = SecretKey::generate();
         assert!(!verify_canary(&wrong, &canary, "rterm-canary-v1"));
         assert!(open_vault_with_context(&sealed, &wrong, "epoch-1").is_err());
+    }
+
+    #[test]
+    fn remote_open_never_accepts_legacy_aad() {
+        let key = SecretKey::generate();
+        let legacy_canary = legacy_seal(&key, "rterm-canary-v1");
+        let legacy_vault = legacy_sealed_vault(&key);
+
+        assert!(verify_canary(&key, &legacy_canary, "rterm-canary-v1"));
+        assert!(!verify_canary_strict(
+            &key,
+            &legacy_canary,
+            "rterm-canary-v1"
+        ));
+        assert!(open_vault_strict(&legacy_vault, &key, "epoch-1").is_err());
+
+        let current_canary = seal_canary(&key, "rterm-canary-v1").unwrap();
+        let current_vault = seal_vault(&sample(), &key, "epoch-1").unwrap();
+        assert!(verify_canary_strict(
+            &key,
+            &current_canary,
+            "rterm-canary-v1"
+        ));
+        assert!(open_vault_strict(&current_vault, &key, "epoch-1").is_ok());
     }
 }

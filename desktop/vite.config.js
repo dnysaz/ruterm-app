@@ -4,7 +4,18 @@ import adapter from "@sveltejs/adapter-static";
 import { vitePreprocess } from "@sveltejs/vite-plugin-svelte";
 // @ts-expect-error type error without @types/node package
 import process from "node:process";
-const host = process.env.TAURI_DEV_HOST;
+const requestedHost = process.env.TAURI_DEV_HOST;
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
+const LAN_DEV_OPT_IN = process.env.TAURI_ALLOW_LAN_DEV === '1';
+
+// Default to loopback only. Requiring an explicit opt-in keeps the unencrypted
+// Vite HMR socket off the LAN when someone exports TAURI_DEV_HOST=0.0.0.0.
+if (requestedHost && !LOOPBACK_HOSTS.has(requestedHost) && !LAN_DEV_OPT_IN) {
+  throw new Error(
+    `TAURI_DEV_HOST=${requestedHost} is not loopback. Set TAURI_ALLOW_LAN_DEV=1 to opt in.`,
+  );
+}
+const host = requestedHost || '127.0.0.1';
 
 // https://vite.dev/config/
 export default defineConfig(() => ({

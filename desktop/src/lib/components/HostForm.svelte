@@ -23,7 +23,6 @@
   let tagsText = $state((host.tags ?? []).join(', '));
   let localError = $state('');
   let busy = $state(false);
-  let fileInput = $state<HTMLInputElement | null>(null);
   let importing = $state(false);
 
   const existing = $derived(
@@ -61,17 +60,16 @@
     return value;
   }
 
-  async function importKeyFile(event: Event) {
-    const input = event.currentTarget as HTMLInputElement;
-    const file = input.files?.[0];
-    input.value = '';
-    if (!file) return;
+  async function importKeyFile() {
     importing = true;
     localError = '';
     try {
+      // Rust owns the native dialog and reads the file; only a one-shot token
+      // and the optional passphrase cross IPC.
+      const token = await api.sshPickKey();
       const identity: Identity = await api.sshImportKey(
-        file.name.replace(/\.[^.]+$/, ''),
-        await file.text(),
+        '',
+        token,
         keyPassphrase(),
       );
       await addIdentity(identity);
@@ -226,7 +224,7 @@
                   type="button"
                   disabled={busy || importing}
                   title="Import a PEM or OpenSSH private key"
-                  onclick={() => fileInput?.click()}
+                  onclick={() => void importKeyFile()}
                 >
                   <Icon name="key" size={14} />
                   {importing ? 'Reading key…' : 'Import .pem'}
@@ -255,13 +253,6 @@
               </div>
             </div>
 
-            <input
-              bind:this={fileInput}
-              class="file"
-              type="file"
-              accept=".pem,.key,.ppk,.txt,.openssh"
-              onchange={importKeyFile}
-            />
           {/if}
 
           <div class="row top">

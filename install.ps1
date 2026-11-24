@@ -5,7 +5,8 @@
 # What it does:
 #   1. Queries the GitHub API for the latest release of dnysaz/ruterm-app.
 #   2. Downloads the NSIS *-setup.exe installer (silent mode).
-#   3. Verifies it against SHA256SUMS when the release publishes one.
+#   3. Requires a matching entry in the published SHA256SUMS; a missing or
+#      mismatched checksum aborts the install.
 #
 # It NEVER touches your vault, SSH keys or settings: it only runs the app installer.
 # Uninstall: Settings → Apps → RuTerm, or uninstall.exe inside the install dir.
@@ -46,7 +47,7 @@ if ($sums) {
   if ($expected -ne $actual) { throw 'checksum mismatch — refusing to install' }
   Write-Host '==> Checksum OK' -ForegroundColor Green
 } else {
-  Write-Warning 'SHA256SUMS not found — installing without checksum verification'
+  throw 'SHA256SUMS not found — refusing to install an unverified asset'
 }
 
 Write-Host '==> Running installer …' -ForegroundColor Cyan
@@ -54,4 +55,4 @@ Start-Process -FilePath $exe -ArgumentList '/S' -Wait
 Remove-Item -Recurse -Force $tmp
 
 Write-Host ''
-Write-Host '==> Done. SmartScreen may warn on first launch: More info → Run anyway (unsigned build).' -ForegroundColor Green
+Write-Host '==> Done. If this build is unsigned, verify SHA256SUMS before allowing it in SmartScreen.' -ForegroundColor Green

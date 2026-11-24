@@ -22,12 +22,22 @@ pub type LocalSessions = Mutex<HashMap<String, LocalSession>>;
 #[derive(Serialize, Clone)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum LocalEvent {
-    Data { data_b64: String },
+    Data {
+        data_b64: String,
+    },
     #[allow(dead_code)]
-    Banner { message: String },
-    Error { message: String },
-    ExitStatus { code: i32 },
-    Closed { reason: String },
+    Banner {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+    ExitStatus {
+        code: i32,
+    },
+    Closed {
+        reason: String,
+    },
 }
 
 fn shell() -> String {
@@ -39,6 +49,54 @@ fn shell() -> String {
 
 fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// The only environment name a renderer may inject into a local shell.
+/// Everything else is assembled in Rust from a sanitised base environment.
+pub const ALLOWED_IPC_ENV: &str = "OPENCODE_CONFIG_CONTENT";
+
+pub fn is_allowed_env_name(name: &str) -> bool {
+    name == ALLOWED_IPC_ENV
+}
+
+/// Inherit a small, explicitly listed set of trusted process variables, then
+/// add the terminal variables in Rust. No renderer-controlled map reaches the
+/// spawn call except the validated `OPENCODE_CONFIG_CONTENT` value (M8).
+fn sanitized_env(cmd: &mut CommandBuilder) {
+    cmd.env_clear();
+    const INHERIT: &[&str] = &[
+        "HOME",
+        "PATH",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TZ",
+        "TMPDIR",
+        "XDG_RUNTIME_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "SSH_AUTH_SOCK",
+        "SystemRoot",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+    ];
+    for name in INHERIT {
+        if let Ok(value) = std::env::var(name) {
+            if !value.is_empty() && value.len() <= 8192 && !value.chars().any(char::is_control) {
+                cmd.env(name, value);
+            }
+        }
+    }
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd.env("TERM_PROGRAM", "RuTerm");
+    cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
 }
 
 pub fn open(
@@ -68,16 +126,14 @@ pub fn open(
 
     let mut cmd = CommandBuilder::new(shell());
     cmd.arg("-l");
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("COLORTERM", "truecolor");
-    cmd.env("TERM_PROGRAM", "RuTerm");
-    cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+    sanitized_env(&mut cmd);
     // Per-tab environment for AI agents (e.g. OPENCODE_CONFIG_CONTENT). The
-    // variables belong to the login shell, so any command typed into it
-    // inherits them — without touching the user's global config files.
+    // variable belongs to the login shell, so any command typed into it
+    // inherits it — without touching the user's global config files. The
+    // allowlist is enforced again here as defence in depth.
     if let Some(vars) = env {
         for (name, value) in vars {
-            if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            if is_allowed_env_name(&name) {
                 cmd.env(name, value);
             }
         }
@@ -158,10 +214,7 @@ pub fn open(
                 entry.closed = true;
             }
         }
-        let _ = app.emit(
-            &channel,
-            LocalEvent::ExitStatus { code: 0 },
-        );
+        let _ = app.emit(&channel, LocalEvent::ExitStatus { code: 0 });
         let _ = app.emit(
             &channel,
             LocalEvent::Closed {
@@ -181,14 +234,16 @@ pub fn open(
 pub fn write(sessions: &LocalSessions, session_id: &str, bytes: &[u8]) -> Result<(), String> {
     let mut map = sessions.lock().map_err(|_| "state lock".to_string())?;
     let session = map.get_mut(session_id).ok_or("Session is not active")?;
-    session
-        .writer
-        .write_all(bytes)
-        .map_err(|e| e.to_string())?;
+    session.writer.write_all(bytes).map_err(|e| e.to_string())?;
     session.writer.flush().map_err(|e| e.to_string())
 }
 
-pub fn resize(sessions: &LocalSessions, session_id: &str, cols: u32, rows: u32) -> Result<(), String> {
+pub fn resize(
+    sessions: &LocalSessions,
+    session_id: &str,
+    cols: u32,
+    rows: u32,
+) -> Result<(), String> {
     let map = sessions.lock().map_err(|_| "state lock".to_string())?;
     let session = map.get(session_id).ok_or("Session is not active")?;
     session
@@ -210,9 +265,36 @@ pub fn close(sessions: &LocalSessions, session_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Kills every local shell (used when the vault locks). The PTY reader threads
+/// see EOF/errors and their output pumps stop; already-dead sessions are simply
+/// absent and ignored.
+pub fn close_all(sessions: &LocalSessions) {
+    if let Ok(mut map) = sessions.lock() {
+        for (_, mut session) in map.drain() {
+            let _ = session.child.kill();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipc_env_allowlist_is_strict() {
+        assert!(is_allowed_env_name(ALLOWED_IPC_ENV));
+        for name in [
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "PATH",
+            "HOME",
+            "SHELL",
+            "BASH_ENV",
+        ] {
+            assert!(!is_allowed_env_name(name), "{name} must be rejected");
+        }
+        assert!(!is_allowed_env_name("OPENCODE_CONFIG_CONTENT "));
+    }
 
     /// The PTY plumbing is the only part that cannot be checked from the UI
     /// tests, so assert a real shell writes through it.

@@ -21,7 +21,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::KdfParams;
+use crate::crypto::{mac_equal, sync_mac, KdfParams, SecretKey};
 use crate::model::Vault;
 
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +42,12 @@ pub enum BridgeError {
     KeyMismatch,
     #[error("unsafe KDF parameters in the synced vault")]
     UnsafeKdf,
+    #[error("synced vault has no integrity MAC (legacy unsigned document) — unsigned documents are not trusted; create a new vault or restore a signed copy")]
+    MissingMac,
+    #[error("synced vault integrity MAC is invalid — the document was modified or signed with another key")]
+    InvalidMac,
+    #[error("invalid synced vault: {0}")]
+    InvalidSyncDoc(String),
 }
 
 /// Chooses the key state for a merge. A device with a different KDF must not
@@ -60,7 +66,15 @@ fn resolve_key_state(
         (Some(a), Some(b)) if a != b => return Err(BridgeError::KeyMismatch),
         (None, Some(b)) => Ok((Some(b.clone()), remote_canary.to_string())),
         (Some(a), None) => Ok((Some(a.clone()), local_canary.to_string())),
-        (None, None) => Ok((None, if local_canary.is_empty() { remote_canary } else { local_canary }.to_string())),
+        (None, None) => Ok((
+            None,
+            if local_canary.is_empty() {
+                remote_canary
+            } else {
+                local_canary
+            }
+            .to_string(),
+        )),
         (Some(a), Some(_)) => Ok((Some(a.clone()), local_canary.to_string())),
     }
 }
@@ -72,6 +86,10 @@ fn resolve_key_state(
 #[derive(Serialize, Deserialize, Clone)]
 pub struct JsonSyncDoc {
     pub schema: u32,
+    /// Revision this document was written against. Included in the MAC so a
+    /// server (or a tampered client) cannot rewrite the merge clock.
+    #[serde(default)]
+    pub revision: i64,
     pub device_id: String,
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
@@ -79,6 +97,93 @@ pub struct JsonSyncDoc {
     #[serde(default)]
     pub canary: String,
     pub vault: Vault,
+    /// `hmac-sha256:<hex>` over the canonical document below. Field-level
+    /// ciphertext already authenticates secrets; this authenticates the
+    /// *envelope* (revision, timestamps, tombstones and settings) as well.
+    #[serde(default)]
+    pub mac: String,
+}
+
+/// Canonical MAC input. `vault` serialises the complete dataset, including
+/// `settings`, every `deleted` tombstone flag and all entity timestamps, so
+/// changing any of those invalidates the MAC. `mac` itself is excluded.
+#[derive(Serialize)]
+struct SyncDocBody<'a> {
+    schema: u32,
+    revision: i64,
+    device_id: &'a str,
+    updated_at: &'a DateTime<Utc>,
+    kdf: &'a Option<KdfParams>,
+    canary: &'a str,
+    vault: &'a Vault,
+}
+
+const MAC_PREFIX: &str = "hmac-sha256:";
+/// Refuse oversized blobs before deserialising them into memory (H2).
+const MAX_SYNC_BLOB_BYTES: usize = 8 * 1024 * 1024;
+
+impl JsonSyncDoc {
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(&SyncDocBody {
+            schema: self.schema,
+            revision: self.revision,
+            device_id: &self.device_id,
+            updated_at: &self.updated_at,
+            kdf: &self.kdf,
+            canary: &self.canary,
+            vault: &self.vault,
+        })
+    }
+
+    /// Signs this document with the vault key. Every upload goes through here.
+    pub fn sign(&mut self, key: &SecretKey) -> Result<(), BridgeError> {
+        let mac = sync_mac(key, &self.canonical_bytes()?);
+        self.mac = format!("{MAC_PREFIX}{}", hex::encode(mac));
+        Ok(())
+    }
+
+    /// Verifies the whole envelope before any merge/adoption. Missing MACs
+    /// (legacy documents) fail closed rather than being treated as trusted.
+    pub fn verify_integrity(&self, key: &SecretKey) -> Result<(), BridgeError> {
+        let raw = self.mac.strip_prefix(MAC_PREFIX).unwrap_or("");
+        if raw.is_empty() {
+            return Err(BridgeError::MissingMac);
+        }
+        let supplied = hex::decode(raw).map_err(|_| BridgeError::InvalidMac)?;
+        if supplied.len() != 32 {
+            return Err(BridgeError::InvalidMac);
+        }
+        let expected = sync_mac(key, &self.canonical_bytes()?);
+        if !mac_equal(&expected, &supplied) {
+            return Err(BridgeError::InvalidMac);
+        }
+        Ok(())
+    }
+
+    /// Structural checks on a remote document, run before it influences a
+    /// merge. The KDF is validated here so Argon2 never sees attacker costs.
+    pub fn validate(&self) -> Result<(), BridgeError> {
+        if self.schema != 1 {
+            return Err(BridgeError::InvalidSyncDoc(format!(
+                "unsupported sync schema {}",
+                self.schema
+            )));
+        }
+        if self.revision < 0 || self.device_id.is_empty() || self.device_id.len() > 128 {
+            return Err(BridgeError::InvalidSyncDoc("invalid sync envelope".into()));
+        }
+        if let Some(kdf) = &self.kdf {
+            kdf.validate().map_err(|_| BridgeError::UnsafeKdf)?;
+        }
+        self.vault
+            .validate_for_sync()
+            .map_err(BridgeError::InvalidSyncDoc)
+    }
+
+    /// Remote settings cannot enable local-only chat permissions.
+    pub fn remote_vault(&self) -> Vault {
+        self.vault.without_remote_permissions()
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -122,11 +227,13 @@ impl std::fmt::Debug for JsonSyncDoc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JsonSyncDoc")
             .field("schema", &self.schema)
+            .field("revision", &self.revision)
             .field("device_id", &self.device_id)
             .field("updated_at", &self.updated_at)
             .field("kdf", &self.kdf)
             .field("canary", &"<redacted>")
             .field("vault", &"<sealed>")
+            .field("mac", &"<redacted>")
             .finish()
     }
 }
@@ -226,7 +333,12 @@ impl BridgeClient {
         let res = self
             .http
             .post(format!("{}/v1/auth/google", self.base_url))
-            .json(&AuthGoogleBody { code, code_verifier, redirect_uri, device: &device })
+            .json(&AuthGoogleBody {
+                code,
+                code_verifier,
+                redirect_uri,
+                device: &device,
+            })
             .send()
             .await?;
         parse(res).await
@@ -257,8 +369,10 @@ impl BridgeClient {
         Ok(())
     }
 
-    /// The remote document, if this account has one.
-    pub async fn fetch_json(&self) -> Result<Option<(JsonSyncDoc, i64)>, BridgeError> {
+    /// Raw remote document. Callers must run [`JsonSyncDoc::verify_integrity`]
+    /// and [`JsonSyncDoc::validate`] before using any field. Adoption needs the
+    /// raw copy because the KDF (and therefore the key) rides inside it.
+    pub async fn fetch_json_unverified(&self) -> Result<Option<(JsonSyncDoc, i64)>, BridgeError> {
         let res = self
             .auth(self.http.get(format!("{}/v1/vault", self.base_url)))?
             .send()
@@ -270,8 +384,26 @@ impl BridgeClient {
         if remote.revision == 0 || remote.blob.trim().is_empty() {
             return Ok(None);
         }
+        if remote.blob.len() > MAX_SYNC_BLOB_BYTES {
+            return Err(BridgeError::InvalidSyncDoc("document is too large".into()));
+        }
         let doc: JsonSyncDoc = serde_json::from_str(&remote.blob)?;
         Ok(Some((doc, remote.revision)))
+    }
+
+    /// The remote document, if this account has one. The whole envelope is
+    /// authenticated and structurally checked before the caller can merge it
+    /// (H2/L1).
+    pub async fn fetch_json(
+        &self,
+        key: &SecretKey,
+    ) -> Result<Option<(JsonSyncDoc, i64)>, BridgeError> {
+        let Some((doc, revision)) = self.fetch_json_unverified().await? else {
+            return Ok(None);
+        };
+        doc.verify_integrity(key)?;
+        doc.validate()?;
+        Ok(Some((doc, revision)))
     }
 
     /// Pull + merge + push for the field-level encrypted document.
@@ -279,12 +411,20 @@ impl BridgeClient {
     /// remote values are adopted (a device joining an existing vault).
     pub async fn sync_json(
         &self,
+        key: &SecretKey,
         local: &Vault,
         kdf: Option<KdfParams>,
         canary: &str,
         device_id: &str,
         max_attempts: u32,
     ) -> Result<BridgeSyncOutcome, BridgeError> {
+        // Local-only permissions are never part of a sync document, even if a
+        // caller passes a vault that currently has them enabled (H2).
+        let local_sanitized = local.without_remote_permissions();
+        let local = &local_sanitized;
+        local
+            .validate_for_sync()
+            .map_err(BridgeError::InvalidSyncDoc)?;
         let mut merged;
         let mut effective_kdf = kdf;
         let mut effective_canary = canary.to_string();
@@ -295,7 +435,7 @@ impl BridgeClient {
 
         for attempt in 0..max_attempts.max(1) {
             merged = local.clone();
-            let remote = self.fetch_json().await?;
+            let remote = self.fetch_json(key).await?;
             let (mut next_kdf, mut next_canary) =
                 resolve_key_state(starting_kdf.as_ref(), &starting_canary, None, "")?;
             let base_revision = match &remote {
@@ -308,7 +448,12 @@ impl BridgeClient {
                     )?;
                     next_kdf = rk;
                     next_canary = rc;
-                    merged.merge(&doc.vault);
+                    // Integrity + structure were already checked by
+                    // `fetch_json`; still scrub local-only flags before the
+                    // merge so remote settings can never enable them (H2).
+                    merged.merge(&doc.remote_vault());
+                    merged.settings.chat_allow_credentials = local.settings.chat_allow_credentials;
+                    merged.settings.chat_allow_vps = local.settings.chat_allow_vps;
                     *revision
                 }
                 None => 0,
@@ -316,14 +461,17 @@ impl BridgeClient {
             effective_kdf = next_kdf;
             effective_canary = next_canary;
 
-            let doc = JsonSyncDoc {
+            let mut doc = JsonSyncDoc {
                 schema: 1,
+                revision: base_revision,
                 device_id: device_id.to_string(),
                 updated_at: Utc::now(),
                 kdf: effective_kdf.clone(),
                 canary: effective_canary.clone(),
                 vault: merged.clone(),
+                mac: String::new(),
             };
+            doc.sign(key)?;
             let blob = serde_json::to_string(&doc)?;
 
             match self.push(base_revision, &blob).await {
@@ -346,7 +494,10 @@ impl BridgeClient {
     async fn push(&self, base_revision: i64, blob: &str) -> Result<i64, BridgeError> {
         let res = self
             .auth(self.http.put(format!("{}/v1/vault", self.base_url)))?
-            .json(&PutBody { base_revision, blob })
+            .json(&PutBody {
+                base_revision,
+                blob,
+            })
             .send()
             .await?;
         if res.status() == reqwest::StatusCode::CONFLICT {
@@ -400,6 +551,110 @@ mod tests {
         let (kdf, canary) = resolve_key_state(None, "", Some(&b), "remote").unwrap();
         assert_eq!(kdf, Some(b));
         assert_eq!(canary, "remote");
+    }
+
+    fn signed_doc(key: &SecretKey) -> JsonSyncDoc {
+        let mut doc = JsonSyncDoc {
+            schema: 1,
+            revision: 4,
+            device_id: "device-1".into(),
+            updated_at: Utc::now(),
+            kdf: None,
+            canary: String::new(),
+            vault: Vault::default(),
+            mac: String::new(),
+        };
+        doc.sign(key).unwrap();
+        doc
+    }
+
+    #[test]
+    fn mac_covers_the_whole_envelope() {
+        let key = SecretKey::generate();
+        let doc = signed_doc(&key);
+        doc.verify_integrity(&key).unwrap();
+
+        let other = SecretKey::generate();
+        assert!(matches!(
+            doc.verify_integrity(&other),
+            Err(BridgeError::InvalidMac)
+        ));
+
+        let mut changed = doc.clone();
+        changed.revision += 1;
+        assert!(matches!(
+            changed.verify_integrity(&key),
+            Err(BridgeError::InvalidMac)
+        ));
+
+        let mut changed = doc.clone();
+        changed.vault.settings.font_size += 1;
+        assert!(matches!(
+            changed.verify_integrity(&key),
+            Err(BridgeError::InvalidMac)
+        ));
+
+        let mut changed = doc;
+        changed.vault.hosts.push(crate::model::Host {
+            id: uuid::Uuid::new_v4(),
+            label: String::new(),
+            address: String::new(),
+            port: 0,
+            username: String::new(),
+            auth: crate::model::AuthMethod::default(),
+            group_id: None,
+            tags: vec![],
+            color: None,
+            icon: None,
+            favorite: false,
+            notes: String::new(),
+            startup_snippet_id: None,
+            jump_host_id: None,
+            keepalive_secs: None,
+            connect_timeout_secs: None,
+            env: vec![],
+            terminal: crate::model::TerminalPrefs::default(),
+            agent_forwarding: false,
+            compression: false,
+            os: None,
+            host_key_fingerprint: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_used_at: None,
+            deleted: true,
+        });
+        assert!(matches!(
+            changed.verify_integrity(&key),
+            Err(BridgeError::InvalidMac)
+        ));
+    }
+
+    #[test]
+    fn legacy_unsigned_doc_fails_closed() {
+        let key = SecretKey::generate();
+        let mut doc = signed_doc(&key);
+        doc.mac.clear();
+        assert!(matches!(
+            doc.verify_integrity(&key),
+            Err(BridgeError::MissingMac)
+        ));
+        doc.mac = "not-hex".into();
+        assert!(matches!(
+            doc.verify_integrity(&key),
+            Err(BridgeError::InvalidMac)
+        ));
+    }
+
+    #[test]
+    fn remote_permissions_are_stripped_from_synced_documents() {
+        let key = SecretKey::generate();
+        let mut doc = signed_doc(&key);
+        doc.vault.settings.chat_allow_credentials = true;
+        doc.vault.settings.chat_allow_vps = true;
+        doc.sign(&key).unwrap();
+        doc.validate().unwrap();
+        assert!(!doc.remote_vault().settings.chat_allow_credentials);
+        assert!(!doc.remote_vault().settings.chat_allow_vps);
     }
 
     #[test]

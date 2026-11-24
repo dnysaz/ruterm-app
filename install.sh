@@ -6,8 +6,8 @@
 # What it does:
 #   1. Detects OS (macOS / Linux) and architecture (arm64 / x86_64).
 #   2. Queries the GitHub API for the latest release of dnysaz/ruterm-app.
-#   3. Downloads the matching asset and verifies it against SHA256SUMS
-#      (published as a release asset) when available.
+#   3. Downloads the matching asset and requires a matching entry in the
+#      published SHA256SUMS. Missing or mismatched checksums abort the install.
 #   4. Installs:
 #        macOS → RuTerm.app copied into /Applications (fallback: ~/Applications)
 #        Linux → the .deb via apt (root/sudo), else the AppImage into ~/.local/bin
@@ -127,7 +127,7 @@ fi
 if [ "$DRY_RUN" = 1 ]; then
   say ""
   say "DRY RUN — would download: ${ASSET_URL}"
-  say "DRY RUN — would verify against SHA256SUMS (if present) and install."
+  say "DRY RUN — would require a matching SHA256SUMS entry, then install."
   exit 0
 fi
 
@@ -151,7 +151,7 @@ if SUMS="$(curl -fsSL "${API}/releases/tags/${TAG}" | grep -o '"browser_download
   [ "$EXPECTED" = "$ACTUAL" ] || die "checksum mismatch — refusing to install"
   info "Checksum OK"
 else
-  warn "SHA256SUMS not found for ${TAG} — installing without checksum verification"
+  die "SHA256SUMS not found for ${TAG} — refusing to install an unverified asset"
 fi
 
 # ── Install ───────────────────────────────────────────────────────────────────
@@ -170,10 +170,11 @@ case "$OS" in
     rm -rf "${DEST}/$(basename "$APP_PATH")"
     cp -R "$APP_PATH" "$DEST/"
     hdiutil detach "$MOUNT_POINT" >/dev/null
-    # Unsigned app: clear the download quarantine so it can launch.
-    xattr -dr com.apple.quarantine "${DEST}/$(basename "$APP_PATH")" 2>/dev/null || true
+    # Do not strip the quarantine attribute: Gatekeeper stays a real barrier.
     info "Installed to ${DEST}/$(basename "$APP_PATH")"
-    warn "RuTerm is unsigned — first launch: if macOS blocks it, System Settings → Privacy & Security → Open Anyway"
+    if [ -z "$(codesign -dv "${DEST}/$(basename "$APP_PATH")" 2>&1 | grep -i '^Signature=' | grep -iv 'invalid')" ]; then
+      warn "RuTerm is unsigned — verify SHA256SUMS and decide yourself whether to allow it in Gatekeeper"
+    fi
     ;;
   Linux)
     case "$ASSET_NAME" in

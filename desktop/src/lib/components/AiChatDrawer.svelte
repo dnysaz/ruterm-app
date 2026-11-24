@@ -38,6 +38,8 @@
   const SESSION = 'ruterm-drawer';
   /** Chat history lives in this browser profile, scoped to the signed-in account. */
   const HISTORY_KEY = 'rterm:ai-chat:history:v1';
+  /** Prefix sweep also catches older/newer history versions and other accounts. */
+  const HISTORY_PREFIX = HISTORY_KEY.replace(/:v\d+$/, '');
 
   interface Bubble {
     role: 'user' | 'assistant' | 'tool';
@@ -77,12 +79,35 @@
     }
   }
 
-  /** Pasted credentials must not be written to plaintext localStorage. */
-  function redactUserText(text: string): string {
-    return text.replace(
-      /((?:pass(?:word)?|pwd|secret|token|api[_-]?key)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|\S+)/gi,
-      '$1[REDACTED]',
-    );
+  /**
+   * localStorage is plaintext, so every persisted bubble is redacted — replies
+   * can echo back pasted keys just as easily as the prompt that contained them.
+   */
+  function redactForStorage(text: string): string {
+    return text
+      // PEM blocks are multi-line and can contain an entire private key.
+      .replace(
+        /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/g,
+        '[REDACTED PRIVATE KEY]',
+      )
+      // Header-style credentials, including quoted values.
+      .replace(
+        /(Authorization\s*:\s*(?:Bearer|Basic)\s+)(?:"[^"]*"|'[^']*'|\S+)/gi,
+        '$1[REDACTED]',
+      )
+      // key=value secrets: passwords, tokens, API keys, client secrets, ...
+      .replace(
+        /((?:pass(?:word)?|pwd|secret|token|api[_-]?key|apikey|credential|private[_-]?key|access[_-]?key|refresh[_-]?token|client[_-]?secret|auth)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|\S+)/gi,
+        '$1[REDACTED]',
+      )
+      // Bare OpenRouter keys (sk-or-v1-...).
+      .replace(/\bsk-or-[A-Za-z0-9_-]{10,}\b/gi, '[REDACTED]')
+      // Generic long high-entropy strings (hex/base64 tokens, session ids).
+      .replace(/\b[A-Za-z0-9+/_=-]{32,}/g, token => {
+        const classes = [/[a-z]/, /[A-Z]/, /\d/, /[+/_=-]/].filter(re => re.test(token)).length;
+        const highEntropy = classes >= 2 && (/\d/.test(token) || classes >= 3);
+        return highEntropy ? '[REDACTED]' : token;
+      });
   }
 
   function persistHistory(snapshot: Bubble[], key = historyKey()) {
@@ -370,7 +395,31 @@
     });
 
     const onUpdated = () => void refreshConfig();
+    const onClearHistory = () => {
+      // Lock / sign-out / account change: forget every account's chat, not just
+      // the active one, and stop work that could re-persist a stale snapshot.
+      if (saveTimer) clearTimeout(saveTimer);
+      if (copyTimer) clearTimeout(copyTimer);
+      saveTimer = null;
+      copyTimer = null;
+      stopWatchdog();
+      if (busy) void api.chatCancel(SESSION).catch(() => {});
+      messages = [];
+      approval = null;
+      clearConfirm = false;
+      copiedKey = null;
+      error = '';
+      busy = false;
+      try {
+        for (const key of Object.keys(localStorage)) {
+          if (key.startsWith(HISTORY_PREFIX)) localStorage.removeItem(key);
+        }
+      } catch {
+        /* storage unavailable — in-memory chat is still cleared */
+      }
+    };
     window.addEventListener('rterm:chat-updated', onUpdated);
+    window.addEventListener('rterm:clear-chat-history', onClearHistory);
     return () => {
       disposed = true;
       if (saveTimer) clearTimeout(saveTimer);
@@ -378,12 +427,14 @@
       stopWatchdog();
       unlisteners.forEach(fn => fn());
       window.removeEventListener('rterm:chat-updated', onUpdated);
+      window.removeEventListener('rterm:clear-chat-history', onClearHistory);
     };
   });
 
   $effect(() => {
     if (app.screen !== 'vault' && open) {
-      // Keep the conversation in memory and localStorage — only hide the panel.
+      // Hide the panel immediately; lock/sign-out also dispatch a clear-history
+      // event that wipes the thread from memory and storage.
       setOpen(false);
       approval = null;
       busy = false;
@@ -402,16 +453,15 @@
 
   $effect(() => {
     if (!hydrated) return;
-    // Tool previews can contain approved credential snippets, so only the
-    // tool name is persisted — the live chips still show the full preview.
+    // Persist a redacted copy of every message; the live thread is untouched.
     const snapshot = messages
       .filter(bubble => !(bubble.role === 'assistant' && !bubble.text.trim()))
       .map(bubble =>
         bubble.role === 'tool'
-          ? { role: 'tool' as const, name: bubble.name, text: '' }
-          : bubble.role === 'user'
-            ? { role: 'user' as const, text: redactUserText(bubble.text) }
-            : { role: bubble.role, text: bubble.text },
+          ? // Tool previews can contain approved credential snippets: keep the
+            // name only, while the live chips still show the full preview.
+            { role: 'tool' as const, name: bubble.name, text: '' }
+          : { role: bubble.role, text: redactForStorage(bubble.text) },
       );
     const key = historyKey();
     if (saveTimer) clearTimeout(saveTimer);
@@ -665,15 +715,19 @@
     title={approval.title}
     cancelLabel="Deny"
     confirmLabel={approval.kind === 'credential' ? 'Allow once' : 'Allow'}
-    alwaysLabel="Always allow"
+    alwaysLabel={approval.kind === 'credential' ? undefined : 'Always allow'}
     tone="primary"
     oncancel={() => answer('deny')}
     onconfirm={() => answer('allow')}
-    onalways={() => answer('always')}
+    onalways={approval.kind === 'credential' ? undefined : () => answer('always')}
   >
     <p>{approval.detail}</p>
     <pre class="approval-preview">{approval.preview}</pre>
-    <p class="approval-hint">“Always allow” remembers this exact operation for the current RuTerm session.</p>
+    <p class="approval-hint">
+      {approval.kind === 'credential'
+        ? 'Credentials are approved for this one use only.'
+        : '“Always allow” remembers this exact operation for the current RuTerm session.'}
+    </p>
   </ConfirmDialog>
 {/if}
 

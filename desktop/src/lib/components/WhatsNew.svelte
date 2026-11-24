@@ -2,11 +2,11 @@
   import { onMount } from 'svelte';
   import { renderSafeMarkdown } from '#lib/markdown';
   import Icon from './Icon.svelte';
-  import { loadNews, loadUnreadIds, markAllRead, type NewsEntry } from '#lib/news.svelte';
+  import { loadNews, loadUnreadIds, markAllRead, NEWS_COMMIT, type NewsEntry } from '#lib/news.svelte';
 
   let { onclose }: { onclose?: () => void } = $props();
 
-  const REPO_RAW = 'https://raw.githubusercontent.com/dnysaz/ruterm-app/main';
+  const REPO_RAW = `https://raw.githubusercontent.com/dnysaz/ruterm-app/${NEWS_COMMIT}`;
 
   let entries = $state<NewsEntry[]>([]);
   let source = $state<'github' | 'cache' | 'bundle' | 'empty' | 'loading'>('loading');
@@ -27,8 +27,11 @@
   function renderMarkdown(markdown: string): string {
     // Relative links/images in release notes point at the repo — send them to GitHub.
     return renderSafeMarkdown(markdown, {
-      linkBase: 'https://github.com/dnysaz/ruterm-app/blob/main/',
+      linkBase: `https://github.com/dnysaz/ruterm-app/blob/${NEWS_COMMIT}/`,
       imageBase: `${REPO_RAW}/`,
+      // Release-note images are pinned to the same immutable commit and are
+      // hash-checked with their body, so remote loading is opted in here only.
+      allowRemoteImages: true,
     });
   }
 
@@ -98,7 +101,7 @@
         <p class="muted empty">Loading release notes…</p>
       {:else if entries.length === 0}
         <p class="muted empty">
-          Nothing here yet. Notes land in <span class="mono">News/</span> in the repo —
+          Nothing here yet. Notes land in <span class="mono">news/</span> in the repo —
           write one, push, and it shows up here.
         </p>
       {:else}
@@ -114,8 +117,8 @@
           </article>
         {/each}
         <p class="foot muted tiny">
-          Bundled with the app for offline reading · refreshes from
-          <span class="mono">github.com/dnysaz/ruterm-app</span> when online.
+          Bundled with the app for offline reading · online feed is pinned to a
+          verified release commit on <span class="mono">github.com/dnysaz/ruterm-app</span>.
           Unread dots clear when this tab opens.
         </p>
       {/if}

@@ -55,7 +55,9 @@ is visible to the operator; see the <a href="/privacy">privacy policy</a>.</p>
 <ul>
   <li>Field-level encryption: only passwords and private keys are sealed (XChaCha20-Poly1305, Argon2id).</li>
   <li>One JSON vault, kept in sync across devices — or offline, entirely local.</li>
-  <li>Nothing to configure. Sign in with Google and you are synced.</li>
+  <li>Sync documents carry a key-derived integrity MAC; unsigned or tampered copies are rejected.</li>
+  <li>Optional BYOK AI chat and local coding agents never send prompts or keys through this bridge.</li>
+  <li>Sign in with Google to sync; no configuration needed.</li>
 </ul>
 <hr />
 <p class="muted">Source: <a href="https://github.com/dnysaz/ruterm-app">github.com/dnysaz/ruterm-app</a> &middot;
@@ -76,15 +78,18 @@ service does and does not see.</p>
   <li><strong>Account.</strong> When you sign in with Google, the service receives your
       Google account identifier (<code>sub</code>), email address and display name. It is
       used solely to authenticate you and identify your devices.</li>
-  <li><strong>Vault data.</strong> Secrets (passwords, private keys, secret note fields) are
-      sealed on your device before upload. The service stores those sealed values, plus host
-      metadata (addresses, usernames, tags) in plain JSON, a revision counter and timestamps.
-      It cannot decrypt your credentials, keys or notes, but the operator can read your host
-      metadata. This is credential-encrypted sync, not zero-knowledge storage.</li>
+  <li><strong>Vault data.</strong> Passwords and private keys are sealed on your device before
+      upload. The service stores those sealed values, plus host metadata and notes (addresses,
+      usernames, tags, note text) in plain JSON, a signed revision counter and timestamps.
+      It cannot decrypt your credentials or keys, but the operator can read your host metadata
+      and notes. This is credential-encrypted sync, not zero-knowledge storage.</li>
   <li><strong>Devices.</strong> The service records the device name, platform and app
       version you register, so you can see and revoke sessions.</li>
   <li><strong>Refresh tokens.</strong> Stored only as SHA-256 hashes, rotated on every use,
       and never readable by anyone — including the operator.</li>
+  <li><strong>Integrity.</strong> Every sync document is signed with a key-derived MAC.
+      The service stores and forwards it; it cannot forge one. Unsigned legacy documents
+      and documents with a bad MAC are rejected by current clients instead of merged.</li>
   <li><strong>Retention &amp; deletion.</strong> You can delete your account and all
       associated data at any time from the app (Settings → Google and sync), or request it
       via the repository. Deletion removes the account, devices and vault copies, and is
@@ -92,6 +97,9 @@ service does and does not see.</p>
   <li><strong>Sharing.</strong> Data is never sold, shared or used for analytics, ads or
       model training. Google is involved only in the sign-in flow; Google's own privacy
       policy applies to that portion of the process.</li>
+  <li><strong>AI features.</strong> BYOK AI chat talks directly from your machine to the
+      provider whose key you entered, and local coding agents use a loopback-only bridge.
+      Neither your prompts nor your API key pass through this service.</li>
   <li><strong>Changes.</strong> This policy may be updated; material changes will be noted
       in the app release notes.</li>
 </ul>

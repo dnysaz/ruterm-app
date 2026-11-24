@@ -2,7 +2,9 @@
 
 import { invoke } from '@tauri-apps/api/core';
 
-const EXTERNAL = /^(https?|mailto|tel):/i;
+// Plain HTTP is rejected: an external link must never open over an
+// unauthenticated transport. mailto/tel remain allowed.
+const EXTERNAL = /^(https|mailto|tel):/i;
 
 /// Normalize a clicked href or return null when it's not an external link.
 export function toExternalHref(raw: string | null | undefined): string | null {

@@ -13,15 +13,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use uuid::Uuid;
 
 use crate::secrets;
 use crate::state::{
-    keyring_delete, keyring_get, keyring_set, AppState, ReconnectEntry, Session, StreamEntry,
-    KEY_OAUTH, KEY_SYNC, KEY_VAULT,
+    account_identity, keyring_delete, keyring_get, keyring_set, AppState, LocalFileHandle,
+    ReconnectEntry, Session, StreamEntry, KEY_OAUTH, KEY_SYNC, KEY_VAULT,
 };
 use crate::store::{self, AppSettings, VaultFile};
 
@@ -70,10 +70,17 @@ fn tofu_host_key(username: &str, address: &str, port: u16) -> String {
 
 /// Resolves the host-key policy for a target: a previously persisted pin
 /// becomes a strict `Pinned` check; a new host uses TOFU for this first contact.
-fn tofu_policy(state: &AppState, username: &str, address: &str, port: u16) -> rterm_core::ssh::HostKeyPolicy {
+fn tofu_policy(
+    state: &AppState,
+    username: &str,
+    address: &str,
+    port: u16,
+) -> rterm_core::ssh::HostKeyPolicy {
     let pins = store::read_tofu(&state.paths.tofu);
     match pins.get(&tofu_host_key(username, address, port)) {
-        Some(fp) if !fp.is_empty() => rterm_core::ssh::HostKeyPolicy::Pinned { fingerprint: fp.clone() },
+        Some(fp) if !fp.is_empty() => rterm_core::ssh::HostKeyPolicy::Pinned {
+            fingerprint: fp.clone(),
+        },
         _ => rterm_core::ssh::HostKeyPolicy::TrustOnFirstUse,
     }
 }
@@ -102,8 +109,7 @@ fn persist_tofu(
 
 /// Opens external links from Rust so the URL allowlist cannot be bypassed by
 /// injected renderer code calling the opener plugin directly (F-32).
-#[tauri::command]
-pub fn open_external_link(url: String) -> Result<(), String> {
+fn validate_external_link(url: &str) -> Result<(), String> {
     let value = url.trim();
     if value.is_empty() || value.len() > 2048 {
         return Err("invalid link".into());
@@ -119,20 +125,23 @@ pub fn open_external_link(url: String) -> Result<(), String> {
         if body.is_empty() || body.starts_with('/') || body.contains('\\') {
             return Err("invalid mail link".into());
         }
-        tauri_plugin_opener::open_url(value, None::<&str>)
-            .map_err(|e| format!("cannot open link: {e}"))?;
         return Ok(());
     }
     if lower.starts_with("tel:") {
         let body = &value[4..];
-        if body.is_empty() || body.starts_with('/') || !body.chars().all(|c| c.is_ascii_digit() || "+-*#(),; ".contains(c)) {
+        if body.is_empty()
+            || body.starts_with('/')
+            || !body
+                .chars()
+                .all(|c| c.is_ascii_digit() || "+-*#(),; ".contains(c))
+        {
             return Err("invalid tel link".into());
         }
-        tauri_plugin_opener::open_url(value, None::<&str>)
-            .map_err(|e| format!("cannot open link: {e}"))?;
         return Ok(());
     }
-    if !(lower.starts_with("https://") || lower.starts_with("http://")) {
+    // L5: plaintext http links are never opened, not even from a markdown
+    // preview — only the https branch remains.
+    if !lower.starts_with("https://") {
         return Err("unsupported link scheme".into());
     }
     let rest = &value[value.find("://").map(|i| i + 3).unwrap_or(0)..];
@@ -143,9 +152,14 @@ pub fn open_external_link(url: String) -> Result<(), String> {
     if authority.is_empty() {
         return Err("invalid link".into());
     }
-    tauri_plugin_opener::open_url(value, None::<&str>)
-        .map_err(|e| format!("cannot open link: {e}"))?;
     Ok(())
+}
+
+#[tauri::command]
+pub fn open_external_link(url: String) -> Result<(), String> {
+    let value = url.trim();
+    validate_external_link(value)?;
+    tauri_plugin_opener::open_url(value, None::<&str>).map_err(|e| format!("cannot open link: {e}"))
 }
 
 #[derive(Serialize)]
@@ -195,20 +209,21 @@ fn redact_vault(vault: &Vault) -> Vault {
     let mut out = vault.clone();
     for host in &mut out.hosts {
         host.auth = match &host.auth {
-            AuthMethod::Password { password } if !password.is_empty() => {
-                AuthMethod::Password { password: SEALED_PLACEHOLDER.to_string() }
-            }
+            AuthMethod::Password { password } if !password.is_empty() => AuthMethod::Password {
+                password: SEALED_PLACEHOLDER.to_string(),
+            },
             AuthMethod::KeyboardInteractive { password } if !password.is_empty() => {
-                AuthMethod::KeyboardInteractive { password: SEALED_PLACEHOLDER.to_string() }
-            }
-            AuthMethod::Key { identity_id, passphrase }
-                if passphrase.as_deref().is_some_and(|p| !p.is_empty()) =>
-            {
-                AuthMethod::Key {
-                    identity_id: *identity_id,
-                    passphrase: Some(SEALED_PLACEHOLDER.to_string()),
+                AuthMethod::KeyboardInteractive {
+                    password: SEALED_PLACEHOLDER.to_string(),
                 }
             }
+            AuthMethod::Key {
+                identity_id,
+                passphrase,
+            } if passphrase.as_deref().is_some_and(|p| !p.is_empty()) => AuthMethod::Key {
+                identity_id: *identity_id,
+                passphrase: Some(SEALED_PLACEHOLDER.to_string()),
+            },
             other => other.clone(),
         };
     }
@@ -321,7 +336,12 @@ fn validate_vault(vault: &Vault) -> Result<(), String> {
             return Err("A host needs a valid port".into());
         }
         if let AuthMethod::Key { identity_id, .. } = &host.auth {
-            if !host.deleted && !vault.identities.iter().any(|i| i.id == *identity_id && !i.deleted) {
+            if !host.deleted
+                && !vault
+                    .identities
+                    .iter()
+                    .any(|i| i.id == *identity_id && !i.deleted)
+            {
                 return Err("Host references a missing identity".into());
             }
         }
@@ -354,7 +374,10 @@ async fn restore_secrets(state: &AppState, incoming: &mut Vault) {
             .map(|h| &h.auth);
         match (&mut host.auth, old) {
             (AuthMethod::Password { password }, Some(AuthMethod::Password { password: old }))
-                if is_sealed(password) => *password = old.clone(),
+                if is_sealed(password) =>
+            {
+                *password = old.clone()
+            }
             (AuthMethod::Password { password }, None) if is_sealed(password) => password.clear(),
             (
                 AuthMethod::KeyboardInteractive { password },
@@ -365,7 +388,9 @@ async fn restore_secrets(state: &AppState, incoming: &mut Vault) {
             }
             (
                 AuthMethod::Key { passphrase, .. },
-                Some(AuthMethod::Key { passphrase: old, .. }),
+                Some(AuthMethod::Key {
+                    passphrase: old, ..
+                }),
             ) if passphrase.as_deref().is_some_and(is_sealed) => *passphrase = old.clone(),
             (AuthMethod::Key { passphrase, .. }, None)
                 if passphrase.as_deref().is_some_and(is_sealed) =>
@@ -425,12 +450,18 @@ pub async fn app_status(state: tauri::State<'_, AppState>) -> Result<AppStatus, 
 pub async fn auth_sign_in(state: tauri::State<'_, AppState>) -> Result<GoogleAccount, String> {
     let client_id = state.client_id().await?;
     let bridge_url = state.bridge_url().await?;
-    let flow = oauth::authorize_loopback(&client_id, oauth::IDENTITY_SCOPES, Duration::from_secs(300))
-        .await
-        .map_err(|e| e.to_string())?;
+    let flow =
+        oauth::authorize_loopback(&client_id, oauth::IDENTITY_SCOPES, Duration::from_secs(300))
+            .await
+            .map_err(|e| e.to_string())?;
 
     let session = BridgeClient::new(&bridge_url)
-        .auth_google(&flow.code, &flow.code_verifier, &flow.redirect_uri, DeviceInfo::current())
+        .auth_google(
+            &flow.code,
+            &flow.code_verifier,
+            &flow.redirect_uri,
+            DeviceInfo::current(),
+        )
         .await
         .map_err(|e| e.to_string())?;
 
@@ -453,6 +484,12 @@ pub async fn auth_sign_in(state: tauri::State<'_, AppState>) -> Result<GoogleAcc
     {
         let mut settings = state.settings_rw.write().await;
         settings.google_linked = true;
+        // Pin the first account that may sync this vault. A pre-existing owner
+        // is kept so signing in as a different account cannot silently retarget
+        // sync; adoption/reset are the explicit ways to change it (H3).
+        if settings.vault_owner.is_none() {
+            settings.vault_owner = Some(account_identity(&account));
+        }
         store::write_settings(&state.paths.settings, &settings)?;
     }
 
@@ -467,7 +504,9 @@ pub async fn auth_sign_in(state: tauri::State<'_, AppState>) -> Result<GoogleAcc
 
 /// Silent sign-in using the bridge refresh token in the OS keychain.
 #[tauri::command]
-pub async fn auth_restore(state: tauri::State<'_, AppState>) -> Result<Option<GoogleAccount>, String> {
+pub async fn auth_restore(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<GoogleAccount>, String> {
     if !state.settings_rw.read().await.google_linked {
         return Ok(None);
     }
@@ -489,8 +528,8 @@ pub async fn auth_restore(state: tauri::State<'_, AppState>) -> Result<Option<Go
     keyring_set(KEY_SYNC, &session.refresh_token);
     // Bridge older than the picture/sub rollout returns neither — merge with
     // the cached account so the photo doesn't vanish across restarts.
-    let cached: Option<GoogleAccount> = keyring_get("account")
-        .and_then(|raw| serde_json::from_str(&raw).ok());
+    let cached: Option<GoogleAccount> =
+        keyring_get("account").and_then(|raw| serde_json::from_str(&raw).ok());
     let account: GoogleAccount = {
         let fresh_name = Some(session.user.name.clone()).filter(|n| !n.is_empty());
         let fresh_picture = session.user.picture.clone().filter(|p| !p.is_empty());
@@ -506,7 +545,17 @@ pub async fn auth_restore(state: tauri::State<'_, AppState>) -> Result<Option<Go
             picture: fresh_picture.or_else(|| cached.as_ref().and_then(|c| c.picture.clone())),
         }
     };
-    let _ = keyring_set("account", &serde_json::to_string(&account).unwrap_or_default());
+    let _ = keyring_set(
+        "account",
+        &serde_json::to_string(&account).unwrap_or_default(),
+    );
+    {
+        let mut settings = state.settings_rw.write().await;
+        if settings.vault_owner.is_none() {
+            settings.vault_owner = Some(account_identity(&account));
+            let _ = store::write_settings(&state.paths.settings, &settings);
+        }
+    }
     *state.session.write().await = Some(Session {
         access_token: session.access_token,
         refresh_token: session.refresh_token,
@@ -528,10 +577,25 @@ pub async fn auth_sign_out(state: tauri::State<'_, AppState>) -> Result<(), Stri
     }
     keyring_delete(KEY_SYNC);
     keyring_delete(KEY_OAUTH);
+    keyring_delete(KEY_VAULT);
     keyring_delete("account");
     *state.session.write().await = None;
+
+    // H3: signing out is a full wipe, not just an OAuth state change. Drop the
+    // key, plaintext vault, all session/SFTP capabilities, reconnect recipes,
+    // pending keys and chat approvals, and close every live session.
+    *state.key.write().await = None;
+    *state.kdf.write().await = None;
+    *state.vault.write().await = None;
+    wipe_locked_state(state.inner()).await;
+    // The encrypted backup belongs to the discarded unlocked session too.
+    let _ = store::delete_backup(&state.paths.vault);
+
     let mut settings = state.settings_rw.write().await;
     settings.google_linked = false;
+    settings.key_saved = false;
+    // Deliberately keep `vault_owner`: it is what stops a different account
+    // from silently taking over this vault on the next sign-in.
     store::write_settings(&state.paths.settings, &settings)?;
     Ok(())
 }
@@ -558,6 +622,35 @@ async fn ensure_access_token(state: &AppState) -> Result<String, String> {
     Ok(session.access_token.clone())
 }
 
+async fn current_account_id(state: &AppState) -> Result<String, String> {
+    let session = state.session.read().await;
+    let account = session
+        .as_ref()
+        .map(|s| &s.account)
+        .ok_or("Not signed in")?;
+    Ok(account_identity(account))
+}
+
+/// Refuses to sync a local vault to a different Google account. Both the
+/// settings file and the vault file are checked, so editing only one of them
+/// cannot bypass the owner binding (H3).
+async fn ensure_sync_owner(state: &AppState, file_owner: Option<&str>) -> Result<String, String> {
+    let id = current_account_id(state).await?;
+    let settings = state.settings_rw.read().await;
+    if settings
+        .vault_owner
+        .as_deref()
+        .is_some_and(|owner| owner != id)
+        || file_owner.is_some_and(|owner| owner != id)
+    {
+        return Err(
+            "This vault belongs to a different Google account. Sign out, then reset the local vault or explicitly adopt the vault for this account."
+                .into(),
+        );
+    }
+    Ok(id)
+}
+
 // ------------------------------------------------------------------ vault
 
 #[tauri::command]
@@ -577,9 +670,24 @@ pub async fn vault_create(
 
     let vault = Vault::default();
     let mut file = VaultFile::new(&state.settings.device_id, Some(kdf.clone()), canary);
+    let owner = state
+        .session
+        .read()
+        .await
+        .as_ref()
+        .map(|s| account_identity(&s.account));
+    file.owner = owner.clone();
     file.vault = secrets::seal_vault(&vault, &key, &secrets::kdf_epoch(Some(&kdf)))
         .map_err(|e| e.to_string())?;
     store::write_atomic(&state.paths.vault, &file)?;
+    {
+        let mut settings = state.settings_rw.write().await;
+        if owner.is_some() {
+            settings.vault_owner = owner;
+        }
+        settings.aad_migration_complete = true;
+        let _ = store::write_settings(&state.paths.settings, &settings);
+    }
 
     *state.key.write().await = Some(key);
     *state.kdf.write().await = Some(kdf);
@@ -606,19 +714,39 @@ pub async fn vault_reset(
         return Err("Lock the vault before resetting it".into());
     }
 
+    // A reset discards the remote relationship as well: keeping `google_linked`
+    // would let the next background sync overwrite (or be overwritten by) the
+    // old bridge copy. Any live handles are already gone while locked, but the
+    // wipe also clears stale one-shot tokens and pending approvals.
+    wipe_locked_state(state.inner()).await;
+
     let kdf = KdfParams::new_default();
     let key = derive_key(&passphrase, &kdf).map_err(|e| e.to_string())?;
     let canary = secrets::seal_canary(&key, CANARY).map_err(|e| e.to_string())?;
     let vault = Vault::default();
     let mut file = VaultFile::new(&state.settings.device_id, Some(kdf.clone()), canary);
+    file.owner = None;
     file.vault = secrets::seal_vault(&vault, &key, &secrets::kdf_epoch(Some(&kdf)))
         .map_err(|e| e.to_string())?;
     store::write_atomic(&state.paths.vault, &file)?;
+    // write_atomic made a backup of the discarded vault; a reset must not
+    // leave that stale copy behind (M6/L2).
+    let _ = store::delete_backup(&state.paths.vault);
 
-    // A stale saved key would keep pointing at the discarded vault.
+    // A stale saved key would keep pointing at the discarded vault. Linking is
+    // explicitly unlinked; the user must sign in again and adopt a remote copy.
     keyring_delete(KEY_VAULT);
+    keyring_delete(KEY_SYNC);
+    keyring_delete(KEY_OAUTH);
+    *state.session.write().await = None;
+    eprintln!(
+        "Vault reset is local only. Google sync was unlinked; sign in and explicitly adopt a remote vault to resume syncing."
+    );
     let mut settings = state.settings_rw.write().await;
     settings.key_saved = false;
+    settings.google_linked = false;
+    settings.vault_owner = None;
+    settings.aad_migration_complete = true;
     settings.synced_revision = 0;
     settings.last_synced_at = None;
     store::write_settings(&state.paths.settings, &settings)?;
@@ -637,10 +765,7 @@ pub async fn vault_unlock(
     passphrase: String,
 ) -> Result<VaultPayload, String> {
     let file = store::read(&state.paths.vault)?.ok_or("No vault on this device yet")?;
-    let kdf = file
-        .kdf
-        .clone()
-        .ok_or("vault.json has no KDF parameters")?;
+    let kdf = file.kdf.clone().ok_or("vault.json has no KDF parameters")?;
     let key = derive_key(&passphrase, &kdf).map_err(|_| "Wrong passphrase".to_string())?;
     unlock_with_key(&state, &file, key).await
 }
@@ -654,40 +779,83 @@ pub async fn vault_adopt_remote(
     state: tauri::State<'_, AppState>,
     passphrase: String,
 ) -> Result<VaultPayload, String> {
+    let account_id = current_account_id(&state).await?;
+    {
+        let settings = state.settings_rw.read().await;
+        if settings
+            .vault_owner
+            .as_deref()
+            .is_some_and(|owner| owner != account_id)
+            && state.paths.vault.exists()
+        {
+            return Err(
+                "This vault belongs to a different Google account. Reset the local vault before adopting another account's copy."
+                    .into(),
+            );
+        }
+    }
     let token = ensure_access_token(&state).await?;
     let bridge_url = state.bridge_url().await?;
     let mut client = BridgeClient::new(&bridge_url);
     client.set_token(Some(token));
     let (doc, revision) = client
-        .fetch_json()
+        // Adoption needs the raw envelope because the KDF lives inside it.
+        // Nothing is decrypted, merged or written until the MAC and structure
+        // have been verified below (H2/L1).
+        .fetch_json_unverified()
         .await
         .map_err(|e| e.to_string())?
         .ok_or("No vault found for this account yet")?;
 
+    // Validate before deriving: the KDF parameters came from an untrusted
+    // remote envelope and must never reach Argon2 without bounds checks.
+    doc.validate().map_err(|e| e.to_string())?;
     let kdf = doc
         .kdf
         .clone()
         .ok_or("The synced vault has no KDF parameters")?;
     let key = derive_key(&passphrase, &kdf).map_err(|e| e.to_string())?;
-    if !secrets::verify_canary(&key, &doc.canary, CANARY) {
-        return Err("Wrong passphrase".into());
+    doc.verify_integrity(&key).map_err(|e| e.to_string())?;
+    if !secrets::verify_canary_strict(&key, &doc.canary, CANARY) {
+        return Err("Wrong passphrase or an obsolete synced vault".into());
     }
     let epoch = secrets::kdf_epoch(Some(&kdf));
-    let (vault, _) =
-        secrets::open_vault_with_context(&doc.vault, &key, &epoch).map_err(|e| e.to_string())?;
-    // R-13: a remote vault is untrusted input too — apply the same structural
-    // checks before it touches disk or memory.
+    // Remote documents never get the local legacy-AAD migration fallback.
+    let vault = secrets::open_vault_strict(&doc.vault, &key, &epoch).map_err(|e| {
+        format!("The synced vault cannot be opened with the current encryption context ({e})")
+    })?;
+    // Even a properly signed remote copy cannot enable local-only AI chat
+    // permissions on this device (H2).
+    let vault = vault.without_remote_permissions();
+    // R-13/H2: a remote vault is untrusted input too. The envelope was checked
+    // above; re-check the decrypted copy before it touches disk or memory.
     validate_vault(&vault)?;
+    vault
+        .validate_for_sync()
+        .map_err(|e| format!("Invalid synced vault: {e}"))?;
 
-    // Re-seal with the current field-bound AAD. An old bridge copy may still
-    // hold pre-hardening ciphertext; this migrates it on adoption.
+    // Re-seal with the current field-bound AAD. New uploads also carry the
+    // whole-document MAC produced by the sync client.
     let canary = secrets::seal_canary(&key, CANARY).map_err(|e| e.to_string())?;
     let sealed_vault = secrets::seal_vault(&vault, &key, &epoch).map_err(|e| e.to_string())?;
     let mut file = VaultFile::new(&state.settings.device_id, Some(kdf.clone()), canary);
     file.revision = revision;
     file.updated_at = Utc::now();
+    file.owner = Some(account_id.clone());
     file.vault = sealed_vault;
     store::write_atomic(&state.paths.vault, &file)?;
+
+    // Adoption replaces the local key entirely; a cached key for the old vault
+    // must not be offered at the next unlock screen.
+    keyring_delete(KEY_VAULT);
+    {
+        let mut settings = state.settings_rw.write().await;
+        settings.key_saved = false;
+        settings.vault_owner = Some(account_id);
+        settings.google_linked = true;
+        settings.aad_migration_complete = true;
+        let _ = store::write_settings(&state.paths.settings, &settings);
+    }
 
     *state.key.write().await = Some(key);
     *state.kdf.write().await = Some(kdf);
@@ -731,21 +899,48 @@ async fn unlock_with_key(
     file: &VaultFile,
     key: rterm_core::crypto::SecretKey,
 ) -> Result<VaultPayload, String> {
-    if !secrets::verify_canary(&key, &file.canary, CANARY) {
-        return Err("Wrong passphrase".into());
+    let allow_legacy = !state.settings_rw.read().await.aad_migration_complete;
+    let canary_ok = if allow_legacy {
+        secrets::verify_canary(&key, &file.canary, CANARY)
+    } else {
+        secrets::verify_canary_strict(&key, &file.canary, CANARY)
+    };
+    if !canary_ok {
+        return Err(if allow_legacy {
+            "Wrong passphrase".into()
+        } else {
+            "The saved vault uses an obsolete encryption context — restore a current copy or reset the vault".into()
+        });
     }
     let epoch = secrets::kdf_epoch(file.kdf.as_ref());
-    let (vault, legacy_vault) =
-        secrets::open_vault_with_context(&file.vault, &key, &epoch).map_err(|e| e.to_string())?;
+    let (vault, legacy_vault) = if allow_legacy {
+        secrets::open_vault_with_context(&file.vault, &key, &epoch).map_err(|e| e.to_string())?
+    } else {
+        (
+            secrets::open_vault_strict(&file.vault, &key, &epoch)
+                .map_err(|_| "The saved vault uses an obsolete encryption context — restore a current copy or reset the vault".to_string())?,
+            false,
+        )
+    };
 
     // Vaults written before the AAD hardening kept the same `enc:v1:` prefix.
     // The passphrase was never wrong — the AEAD context was. Re-seal the local
     // copy once so future opens use the strict, field-bound context.
-    if legacy_vault || secrets::canary_is_legacy(&key, &file.canary, CANARY) {
+    let legacy_canary = allow_legacy && secrets::canary_is_legacy(&key, &file.canary, CANARY);
+    if legacy_vault || legacy_canary {
         let mut migrated = file.clone();
         migrated.canary = secrets::seal_canary(&key, CANARY).map_err(|e| e.to_string())?;
         migrated.vault = secrets::seal_vault(&vault, &key, &epoch).map_err(|e| e.to_string())?;
         store::write_atomic(&state.paths.vault, &migrated)?;
+    }
+    // Record the migration so the compatibility fallback is disabled from the
+    // next unlock onward — including for remote documents (L1).
+    {
+        let mut settings = state.settings_rw.write().await;
+        if !settings.aad_migration_complete {
+            settings.aad_migration_complete = true;
+            let _ = store::write_settings(&state.paths.settings, &settings);
+        }
     }
 
     *state.key.write().await = Some(key);
@@ -755,15 +950,52 @@ async fn unlock_with_key(
     Ok(sealed_payload(&vault, file.revision))
 }
 
-#[tauri::command]
-pub async fn vault_lock(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    *state.key.write().await = None;
-    *state.kdf.write().await = None;
-    *state.vault.write().await = None;
+/// Closes every live transport and drops all in-memory authorisation state.
+/// Used by both `vault_lock` and `auth_sign_out`; safe when a session has
+/// already gone away (L9/H3).
+async fn wipe_locked_state(state: &AppState) {
+    // Disable reconnect supervisors before closing handles: a deliberate lock
+    // must never be followed by an automatic reconnect.
+    if let Ok(mut map) = state.reconnect.lock() {
+        for entry in map.values_mut() {
+            entry.enabled = false;
+            entry.in_progress = false;
+        }
+        map.clear();
+    }
+
+    let ssh_handles: Vec<_> = state
+        .ssh
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain()
+        .map(|(_, handle)| handle)
+        .collect();
+    for handle in ssh_handles {
+        handle.close();
+    }
+    crate::local::close_all(&state.local);
+
+    // Collect under the async lock, then close outside it so no other SFTP
+    // command can deadlock with the lock/close path.
+    let sftp_sessions: Vec<_> = state.sftp.lock().await.drain().map(|(_, s)| s).collect();
+    for session in sftp_sessions {
+        let _ = session.close().await;
+    }
+
+    if let Ok(mut output) = state.output.lock() {
+        output.clear();
+    }
     if let Ok(mut tokens) = state.session_tokens.lock() {
         tokens.clear();
     }
     if let Ok(mut tokens) = state.sftp_tokens.lock() {
+        tokens.clear();
+    }
+    if let Ok(mut tokens) = state.local_file_tokens.lock() {
+        tokens.clear();
+    }
+    if let Ok(mut tokens) = state.ssh_key_tokens.lock() {
         tokens.clear();
     }
     state
@@ -771,8 +1003,8 @@ pub async fn vault_lock(state: tauri::State<'_, AppState>) -> Result<(), String>
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
-    // Drop every in-memory chat conversation and pending approval so nothing
-    // from the previous unlock survives a lock (pending senders deny on drop).
+    // Dropping pending senders denies their approvals; conversations and
+    // "always allow" grants never outlive the unlocked vault.
     state
         .chat_sessions
         .lock()
@@ -793,6 +1025,14 @@ pub async fn vault_lock(state: tauri::State<'_, AppState>) -> Result<(), String>
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+}
+
+#[tauri::command]
+pub async fn vault_lock(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    *state.key.write().await = None;
+    *state.kdf.write().await = None;
+    *state.vault.write().await = None;
+    wipe_locked_state(state.inner()).await;
     Ok(())
 }
 
@@ -833,6 +1073,7 @@ pub(crate) async fn persist_vault(
     }
     file.revision += 1;
     file.updated_at = Utc::now();
+    file.owner = state.settings_rw.read().await.vault_owner.clone();
     let epoch = secrets::kdf_epoch(file.kdf.as_ref());
     file.vault = secrets::seal_vault(&vault, &key, &epoch).map_err(|e| e.to_string())?;
     store::write_atomic(&state.paths.vault, &file)?;
@@ -863,9 +1104,7 @@ pub async fn host_probe_os(
     state: tauri::State<'_, AppState>,
     host_id: String,
 ) -> Result<VaultPayload, String> {
-    let id: Uuid = host_id
-        .parse()
-        .map_err(|_| "Invalid host id".to_string())?;
+    let id: Uuid = host_id.parse().map_err(|_| "Invalid host id".to_string())?;
 
     let vault = state.unlocked_vault().await?;
     let host = vault.host(&id).cloned().ok_or("Host not found")?;
@@ -901,6 +1140,10 @@ pub async fn host_probe_os(
 pub async fn vault_sync(state: tauri::State<'_, AppState>) -> Result<VaultPayload, String> {
     let key = state.unlocked_key().await?;
     let local = state.unlocked_vault().await?;
+    let account_id = {
+        let file = store::read(&state.paths.vault)?;
+        ensure_sync_owner(&state, file.as_ref().and_then(|f| f.owner.as_deref())).await?
+    };
     let token = ensure_access_token(&state).await?;
     let bridge_url = state.bridge_url().await?;
 
@@ -914,11 +1157,18 @@ pub async fn vault_sync(state: tauri::State<'_, AppState>) -> Result<VaultPayloa
         file.kdf = state.kdf.read().await.clone();
     }
     let epoch = secrets::kdf_epoch(file.kdf.as_ref());
-    let sealed = secrets::seal_vault(&local, &key, &epoch).map_err(|e| e.to_string())?;
+    // Local-only chat permissions never leave this device, even in an
+    // authenticated sync document (H2).
+    let mut upload_local = local.clone();
+    upload_local.settings.chat_allow_credentials = false;
+    upload_local.settings.chat_allow_vps = false;
+    let upload_local =
+        secrets::seal_vault(&upload_local, &key, &epoch).map_err(|e| e.to_string())?;
 
     let outcome = client
         .sync_json(
-            &sealed,
+            &key,
+            &upload_local,
             file.kdf.clone(),
             &file.canary,
             &state.settings.device_id,
@@ -926,17 +1176,28 @@ pub async fn vault_sync(state: tauri::State<'_, AppState>) -> Result<VaultPayloa
         )
         .await
         .map_err(|e| e.to_string())?;
-    let (merged, _) = secrets::open_vault_with_context(&outcome.vault, &key, &epoch).map_err(|e| {
+    // Remote content only ever opens with the current field-bound AAD; the
+    // legacy fallback is reserved for local unlock migration (L1).
+    let merged = secrets::open_vault_strict(&outcome.vault, &key, &epoch).map_err(|e| {
         format!(
             "the synced vault cannot be opened with this passphrase ({e}). \
              Every device must use the same vault passphrase."
         )
     })?;
-    // R-13: validate the merged remote vault before persisting it.
+    // R-13/H2: validate the merged remote vault before persisting it. The
+    // bridge already verified the MAC and envelope before merging.
     validate_vault(&merged)?;
+    merged
+        .validate_for_sync()
+        .map_err(|e| format!("Invalid synced vault: {e}"))?;
+    // AI-chat permissions stay local even when remote settings are newer.
+    let mut merged = merged;
+    merged.settings.chat_allow_credentials = local.settings.chat_allow_credentials;
+    merged.settings.chat_allow_vps = local.settings.chat_allow_vps;
 
     file.revision = outcome.revision;
     file.updated_at = Utc::now();
+    file.owner = Some(account_id.clone());
     // Persist the merged copy under the current AAD, even when the remote copy
     // came from a pre-hardening build.
     file.vault = secrets::seal_vault(&merged, &key, &epoch).map_err(|e| e.to_string())?;
@@ -951,6 +1212,12 @@ pub async fn vault_sync(state: tauri::State<'_, AppState>) -> Result<VaultPayloa
     }
     store::write_atomic(&state.paths.vault, &file)?;
 
+    {
+        let mut settings = state.settings_rw.write().await;
+        settings.vault_owner = Some(account_id);
+        settings.aad_migration_complete = true;
+        let _ = store::write_settings(&state.paths.settings, &settings);
+    }
     *state.vault.write().await = Some(merged.clone());
     *state.revision.write().await = outcome.revision;
     mark_synced(&state, outcome.revision).await;
@@ -975,9 +1242,7 @@ pub async fn ssh_open(
 ) -> Result<String, String> {
     let vault = state.unlocked_vault().await?;
     let session_id = checked_session_id(&session_id)?;
-    let id: Uuid = host_id
-        .parse()
-        .map_err(|_| "Invalid host id".to_string())?;
+    let id: Uuid = host_id.parse().map_err(|_| "Invalid host id".to_string())?;
     let host = vault.host(&id).cloned().ok_or("Host not found")?;
 
     let identity = match &host.auth {
@@ -1055,24 +1320,35 @@ fn mark_reconnect_progress(app: &tauri::AppHandle, id: &str, active: bool) -> bo
 }
 
 /// Snapshot the reconnect recipe so no lock is held across an `await`.
-fn reconnect_snapshot(app: &tauri::AppHandle, id: &str) -> Option<(Option<String>, String, TermSize)> {
-    app.state::<AppState>().reconnect.lock().ok().and_then(|map| {
-        map.get(id).map(|entry| {
-            (
-                entry.host_id.clone(),
-                entry.display_name.clone(),
-                TermSize {
-                    cols: entry.cols,
-                    rows: entry.rows,
-                },
-            )
+fn reconnect_snapshot(
+    app: &tauri::AppHandle,
+    id: &str,
+) -> Option<(Option<String>, String, TermSize)> {
+    app.state::<AppState>()
+        .reconnect
+        .lock()
+        .ok()
+        .and_then(|map| {
+            map.get(id).map(|entry| {
+                (
+                    entry.host_id.clone(),
+                    entry.display_name.clone(),
+                    TermSize {
+                        cols: entry.cols,
+                        rows: entry.rows,
+                    },
+                )
+            })
         })
-    })
 }
 
 /// Rebuild a saved-host target from the vault so a reconnect picks up changed
 /// credentials or a new address. Quick-connect tabs reuse the cached target.
-async fn reconnect_target(state: &AppState, host_id: Option<&str>, cached: &SshTarget) -> SshTarget {
+async fn reconnect_target(
+    state: &AppState,
+    host_id: Option<&str>,
+    cached: &SshTarget,
+) -> SshTarget {
     let Some(host_id) = host_id else {
         return cached.clone();
     };
@@ -1178,7 +1454,9 @@ async fn open_shell_session(
                 );
                 match &event {
                     SshEvent::Data { data_b64 } | SshEvent::Stderr { data_b64 } => {
-                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data_b64) {
+                        if let Ok(bytes) =
+                            base64::engine::general_purpose::STANDARD.decode(data_b64)
+                        {
                             if let Ok(mut output) = state.output.lock() {
                                 if let Some(entry) = output.get_mut(&channel_id) {
                                     entry.push(&bytes);
@@ -1244,7 +1522,8 @@ async fn open_shell_session(
                 else {
                     break 'supervise;
                 };
-                let next_target = reconnect_target(state.inner(), stored_host.as_deref(), &target).await;
+                let next_target =
+                    reconnect_target(state.inner(), stored_host.as_deref(), &target).await;
                 match ssh::open_shell(next_target.clone(), stored_size).await {
                     Ok(new_session) => {
                         let key = tofu_host_key(
@@ -1253,9 +1532,12 @@ async fn open_shell_session(
                             next_target.port,
                         );
                         let next_policy = next_target.host_key_policy.clone();
-                        if let Err(error) =
-                            persist_tofu(state.inner(), &key, &next_policy, &new_session.fingerprint)
-                        {
+                        if let Err(error) = persist_tofu(
+                            state.inner(),
+                            &key,
+                            &next_policy,
+                            &new_session.fingerprint,
+                        ) {
                             attempts += 1;
                             let _ = app.emit(
                                 &channel,
@@ -1538,18 +1820,56 @@ pub fn session_attach(
     }))
 }
 
+/// Native "choose an SSH private key" dialog. Only a one-shot token crosses
+/// IPC; Rust keeps the path so the renderer never reads key bytes itself (M12).
+#[tauri::command]
+pub async fn ssh_pick_key(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    state.unlocked_key().await?;
+    let picked = app
+        .dialog()
+        .file()
+        .blocking_pick_file()
+        .ok_or("No key file selected")?;
+    let path = picked.into_path().map_err(|e| e.to_string())?;
+    let token = Uuid::new_v4().to_string();
+    state
+        .ssh_key_tokens
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(token.clone(), path);
+    Ok(token)
+}
+
 /// Reads an uploaded `.pem` / OpenSSH key and returns an `Identity` for the
-/// vault. The file never leaves the machine; only the sealed copy is stored.
+/// vault. The file is read and parsed in Rust from a native-dialog token; only
+/// the sealed copy is stored. Passphrases and temporary buffers are zeroized
+/// and never logged.
 #[tauri::command]
 pub async fn ssh_import_key(
     state: tauri::State<'_, AppState>,
     label: String,
-    pem: String,
+    token: String,
     passphrase: Option<String>,
 ) -> Result<Identity, String> {
     state.unlocked_key().await?;
-    let pass = passphrase.filter(|value| !value.trim().is_empty());
-    let inspected = ssh::inspect_private_key(&pem, pass.as_deref()).map_err(|e| e.to_string())?;
+    let path = state
+        .ssh_key_tokens
+        .lock()
+        .map_err(|_| "state lock".to_string())?
+        .remove(&token)
+        .ok_or("Invalid or expired file handle")?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("cannot read key file: {e}"))?;
+    let pem = zeroize::Zeroizing::new(
+        String::from_utf8(bytes).map_err(|_| "The key file is not valid UTF-8".to_string())?,
+    );
+    let pass = passphrase
+        .filter(|value| !value.trim().is_empty())
+        .map(zeroize::Zeroizing::new);
+    let inspected = ssh::inspect_private_key(&pem, pass.as_ref().map(|p| p.as_str()))
+        .map_err(|e| e.to_string())?;
     let kind = match inspected.kind.as_str() {
         "ed25519" => IdentityKind::Ed25519,
         "rsa" => IdentityKind::Rsa,
@@ -1558,15 +1878,20 @@ pub async fn ssh_import_key(
     };
     let now = Utc::now();
     let name = label.trim();
+    let default_label = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Imported key".to_string());
     let identity = Identity {
         id: Uuid::new_v4(),
         label: if name.is_empty() {
-            "Imported key".to_string()
+            default_label
         } else {
             name.to_string()
         },
         private_key: inspected.private_key,
-        passphrase: pass,
+        passphrase: pass.map(|p| (*p).clone()),
         kind: Some(kind),
         fingerprint: Some(inspected.fingerprint),
         created_at: now,
@@ -1579,6 +1904,76 @@ pub async fn ssh_import_key(
         .unwrap_or_else(|e| e.into_inner())
         .insert(identity.id, identity.clone());
     Ok(redact_identity(&identity))
+}
+
+/// Rejects path-like strings inside the one renderer-supplied environment
+/// value. The real OpenCode config contains loopback URLs and a token, never a
+/// filesystem path (M8/M11).
+fn safe_agent_config_string(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 4096
+        || value.chars().any(char::is_control)
+        || value.contains('\\')
+        || value.contains("..")
+        || value.starts_with('/')
+        || value.starts_with('~')
+    {
+        return false;
+    }
+    if let Some(rest) = value.split_once("://").map(|(_, rest)| rest) {
+        let host = rest.split(['/', ':', '?', '#']).next().unwrap_or("");
+        return host == "127.0.0.1" || host == "localhost" || host == "[::1]";
+    }
+    true
+}
+
+fn check_config_json(value: &serde_json::Value) -> Result<(), String> {
+    match value {
+        serde_json::Value::String(text) if !safe_agent_config_string(text) => {
+            Err("Environment value contains a path-like string".into())
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                check_config_json(item)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values() {
+                check_config_json(item)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Only the OpenCode config variable may come from IPC. Every other entry is
+/// built in Rust by `local::sanitized_env`; dangerous names and path-like
+/// values are rejected rather than silently dropped (M11).
+fn validated_local_env(
+    env: Option<HashMap<String, String>>,
+) -> Result<Option<HashMap<String, String>>, String> {
+    let Some(env) = env else {
+        return Ok(None);
+    };
+    let mut out = HashMap::new();
+    for (name, value) in env {
+        if !crate::local::is_allowed_env_name(&name) {
+            return Err(format!("Environment variable {name} is not allowed"));
+        }
+        if value.is_empty() || value.len() > 16 * 1024 || value.chars().any(char::is_control) {
+            return Err("Invalid OpenCode config content".into());
+        }
+        let json: serde_json::Value =
+            serde_json::from_str(&value).map_err(|_| "Invalid OpenCode config content".into())?;
+        if !json.is_object() {
+            return Err("Invalid OpenCode config content".into());
+        }
+        check_config_json(&json)?;
+        out.insert(name, value);
+    }
+    Ok(Some(out))
 }
 
 #[tauri::command]
@@ -1595,7 +1990,16 @@ pub async fn local_open(
     // an IPC caller spawn one while the vault is locked.
     state.unlocked_key().await?;
     let session_id = checked_session_id(&session_id)?;
-    crate::local::open(app, &state.local, session_id.clone(), cols, rows, expand_cwd(cwd), env)?;
+    let env = validated_local_env(env)?;
+    crate::local::open(
+        app,
+        &state.local,
+        session_id.clone(),
+        cols,
+        rows,
+        expand_cwd(cwd),
+        env,
+    )?;
     Ok(issue_session_token(&state, &session_id))
 }
 
@@ -1865,9 +2269,7 @@ async fn sftp_target_for_host(
     host_id: &str,
 ) -> Result<(SshTarget, String, String, u16), String> {
     let vault = state.unlocked_vault().await?;
-    let id: Uuid = host_id
-        .parse()
-        .map_err(|_| "Invalid host id".to_string())?;
+    let id: Uuid = host_id.parse().map_err(|_| "Invalid host id".to_string())?;
     let host = vault.host(&id).cloned().ok_or("Host not found")?;
     let identity = match &host.auth {
         AuthMethod::Key { identity_id, .. } => vault.identity(identity_id).cloned(),
@@ -2035,20 +2437,26 @@ pub async fn sftp_remove(
 pub async fn sftp_pick_upload(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
+    sftp_id: String,
+    token: String,
 ) -> Result<String, String> {
+    let sftp_id = require_sftp_token(&state, &sftp_id, &token)?;
     let picked = app
         .dialog()
         .file()
         .blocking_pick_file()
         .ok_or("No file selected")?;
     let path = picked.into_path().map_err(|e| e.to_string())?;
-    let token = Uuid::new_v4().to_string();
+    let handle = Uuid::new_v4().to_string();
     state
         .local_file_tokens
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(token.clone(), path);
-    Ok(token)
+        .insert(
+            handle.clone(),
+            LocalFileHandle::for_upload(path, &sftp_id, &token),
+        );
+    Ok(handle)
 }
 
 /// Multi-file variant used by the upload button.
@@ -2056,7 +2464,10 @@ pub async fn sftp_pick_upload(
 pub async fn sftp_pick_uploads(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
+    sftp_id: String,
+    token: String,
 ) -> Result<Vec<String>, String> {
+    let sftp_id = require_sftp_token(&state, &sftp_id, &token)?;
     let picked = app
         .dialog()
         .file()
@@ -2065,13 +2476,16 @@ pub async fn sftp_pick_uploads(
     let mut handles = Vec::with_capacity(picked.len());
     for file in picked {
         let path = file.into_path().map_err(|e| e.to_string())?;
-        let token = Uuid::new_v4().to_string();
+        let handle = Uuid::new_v4().to_string();
         state
             .local_file_tokens
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(token.clone(), path);
-        handles.push(token);
+            .insert(
+                handle.clone(),
+                LocalFileHandle::for_upload(path, &sftp_id, &token),
+            );
+        handles.push(handle);
     }
     Ok(handles)
 }
@@ -2095,7 +2509,7 @@ pub async fn sftp_pick_download(
         .local_file_tokens
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(token.clone(), path);
+        .insert(token.clone(), LocalFileHandle::new(path));
     Ok(token)
 }
 
@@ -2113,13 +2527,47 @@ fn safe_remote_path(path: &str) -> Result<String, String> {
     Ok(format!("/{}", segments.join("/")))
 }
 
-fn take_local_path(state: &AppState, token: &str) -> Result<PathBuf, String> {
+fn take_local_handle(state: &AppState, token: &str) -> Result<LocalFileHandle, String> {
     state
         .local_file_tokens
         .lock()
         .map_err(|_| "state lock".to_string())?
         .remove(token)
         .ok_or_else(|| "Invalid or expired file handle".to_string())
+}
+
+/// Consumes an upload handle only when the SFTP id, capability token and
+/// one-shot handle all match. The check and removal share the handle-map lock,
+/// so a token from another tab cannot be replayed against this upload (L7).
+fn take_upload_path(
+    state: &AppState,
+    sftp_id: &str,
+    capability: &str,
+    handle_token: &str,
+) -> Result<PathBuf, String> {
+    let id = checked_session_id(sftp_id)?;
+    let mut handles = state
+        .local_file_tokens
+        .lock()
+        .map_err(|_| "state lock".to_string())?;
+    let capabilities = state
+        .sftp_tokens
+        .lock()
+        .map_err(|_| "state lock".to_string())?;
+    if capabilities.get(&id).map(String::as_str) != Some(capability) {
+        return Err("Invalid or expired SFTP token".into());
+    }
+    match handles.get(handle_token) {
+        Some(handle)
+            if handle.sftp_id.as_deref() == Some(id.as_str())
+                && handle.capability.as_deref() == Some(capability) =>
+        {
+            let path = handle.path.clone();
+            handles.remove(handle_token);
+            Ok(path)
+        }
+        _ => Err("Invalid or expired file handle".into()),
+    }
 }
 
 /// Uploads one local file chosen through [`sftp_pick_upload`] into
@@ -2133,7 +2581,7 @@ pub async fn sftp_upload(
     remote_dir: String,
 ) -> Result<String, String> {
     let sftp_id = require_sftp_token(&state, &sftp_id, &token)?;
-    let local = take_local_path(&state, &local_token)?;
+    let local = take_upload_path(&state, &sftp_id, &token, &local_token)?;
     let name = local
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -2185,7 +2633,7 @@ pub async fn sftp_download(
     local_token: String,
 ) -> Result<(), String> {
     let sftp_id = require_sftp_token(&state, &sftp_id, &token)?;
-    let local = take_local_path(&state, &local_token)?;
+    let local = take_local_handle(&state, &local_token)?.path;
     let map = state.sftp.lock().await;
     let session = map.get(&sftp_id).ok_or("SFTP session is not open")?;
     sftp::download(session, &safe_remote_path(&remote_path)?, &local)

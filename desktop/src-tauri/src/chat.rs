@@ -10,14 +10,19 @@ use chrono::{Local, Utc};
 use rterm_core::model::{now, AuthMethod, Host, Note, Snippet};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
 };
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_dialog::{
+    DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult,
+};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -28,13 +33,60 @@ const BEGIN_MARKER: &str = "# BEGIN RUTERM AI CHAT";
 const END_MARKER: &str = "# END RUTERM AI CHAT";
 /// Agent names must never be mistaken for SSH hosts by `create_host`.
 const AGENT_NAMES: &[&str] = &[
-    "opencode", "freebuff", "kilo", "kilo code", "claude", "kiro", "kiro-cli", "cmd",
+    "opencode",
+    "freebuff",
+    "kilo",
+    "kilo code",
+    "claude",
+    "kiro",
+    "kiro-cli",
+    "cmd",
     "command ai",
 ];
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
+
+/// "Always allow" is only valid for the current assistant reply (M5). It is
+/// kept here instead of in `AppState.chat_always` so it cannot survive a turn.
+static SCOPED_ALWAYS: OnceLock<Mutex<HashMap<String, HashSet<String>>>> = OnceLock::new();
+
+fn scoped_always() -> &'static Mutex<HashMap<String, HashSet<String>>> {
+    SCOPED_ALWAYS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn scoped_allowed(session: &str, dedupe: &str) -> bool {
+    lock(scoped_always())
+        .get(session)
+        .is_some_and(|entries| entries.contains(dedupe))
+}
+
+fn remember_scoped_allow(session: &str, dedupe: &str) {
+    lock(scoped_always())
+        .entry(session.to_string())
+        .or_default()
+        .insert(dedupe.to_string());
+}
+
+fn clear_scoped_allow(session: &str) {
+    lock(scoped_always()).remove(session);
+}
+
+/// Drops every one-turn approval when the chat turn ends, including error and
+/// cancellation exits.
+struct ScopedAllowGuard(String);
+
+impl Drop for ScopedAllowGuard {
+    fn drop(&mut self) {
+        clear_scoped_allow(&self.0);
+    }
+}
+
+/// Kept for API/event-name stability. The chat approval id is no longer sent
+/// here (M2); the native dialog in Rust owns the decision.
+#[allow(dead_code)]
+const LEGACY_CHAT_APPROVAL_EVENT: &str = "chat://approval";
 
 /// The drawer's watchdog must not kill a turn that is still doing real work.
 /// A tool can legitimately wait up to 60 seconds, and recovery can make two
@@ -83,7 +135,14 @@ fn cap_tool_text(text: &str, limit: usize) -> String {
         return text.to_string();
     }
     let head: String = text.chars().take(limit / 2).collect();
-    let tail: String = text.chars().rev().take(limit / 2).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(limit / 2)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("{head}\n... truncated ...\n{tail}")
 }
 
@@ -114,10 +173,7 @@ fn looks_unfinished(text: &str) -> bool {
     if INTENT.iter().any(|phrase| value.contains(phrase)) {
         return true;
     }
-    value.ends_with("...")
-        || value.ends_with('…')
-        || value.ends_with(':')
-        || value.ends_with('—')
+    value.ends_with("...") || value.ends_with('…') || value.ends_with(':') || value.ends_with('—')
 }
 
 fn last_user_text(messages: &[ChatMessage]) -> &str {
@@ -147,7 +203,10 @@ fn command_words(command: &str) -> Vec<String> {
     let mut index = 0;
     if tokens.first().map(String::as_str) == Some("sudo") {
         index = 1;
-        while tokens.get(index).is_some_and(|token| token.starts_with('-')) {
+        while tokens
+            .get(index)
+            .is_some_and(|token| token.starts_with('-'))
+        {
             index += 1;
         }
     }
@@ -177,7 +236,10 @@ fn long_running_command(command: &str) -> bool {
     let long = match first {
         "brew" => matches!(second, "update" | "upgrade" | "install" | "reinstall"),
         "npm" | "pnpm" | "yarn" => matches!(second, "install" | "i" | "ci" | "add" | "run"),
-        "cargo" => matches!(second, "build" | "test" | "check" | "clippy" | "run" | "install"),
+        "cargo" => matches!(
+            second,
+            "build" | "test" | "check" | "clippy" | "run" | "install"
+        ),
         "docker" => matches!(second, "build" | "compose" | "pull" | "push"),
         "pip" | "pip3" => matches!(second, "install" | "uninstall"),
         "composer" => matches!(second, "install" | "update" | "require"),
@@ -196,13 +258,14 @@ fn interactive_command(command: &str) -> bool {
     let words = command_words(&normalized);
     let first = words.first().map(String::as_str).unwrap_or("");
     const TUIS: &[&str] = &[
-        "htop", "top", "btop", "atop", "vim", "nvim", "vi", "nano", "micro", "less", "more",
-        "man", "mc", "ranger", "tmux", "screen", "watch", "ping", "ssh",
+        "htop", "top", "btop", "atop", "vim", "nvim", "vi", "nano", "micro", "less", "more", "man",
+        "mc", "ranger", "tmux", "screen", "watch", "ping", "ssh",
     ];
     if TUIS.contains(&first) {
         return true;
     }
-    (first == "tail" || first == "journalctl") && words.iter().any(|word| word == "-f" || word == "--follow")
+    (first == "tail" || first == "journalctl")
+        && words.iter().any(|word| word == "-f" || word == "--follow")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -217,6 +280,8 @@ pub enum ApprovalChoice {
 pub struct PendingApproval {
     pub session: String,
     pub dedupe: String,
+    /// Used to reject `always` for credential reads in the legacy IPC path.
+    pub kind: String,
     pub tx: oneshot::Sender<ApprovalChoice>,
 }
 
@@ -929,7 +994,11 @@ fn percent_decode(input: &str) -> String {
                 continue;
             }
         }
-        out.push(if bytes[index] == b'+' { b' ' } else { bytes[index] });
+        out.push(if bytes[index] == b'+' {
+            b' '
+        } else {
+            bytes[index]
+        });
         index += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
@@ -964,13 +1033,23 @@ fn parse_ddg_results(html: &str, limit: usize) -> Vec<SearchHit> {
         }
         let rest = &chunk[close..];
         let snippet = if let Some(snip) = rest.split("class=\"result__snippet\"").nth(1) {
-            let body = snip.find('>').map(|index| &snip[index + 1..]).unwrap_or(snip);
-            let body = body.find("</a>").map(|index| &body[..index]).unwrap_or(body);
+            let body = snip
+                .find('>')
+                .map(|index| &snip[index + 1..])
+                .unwrap_or(snip);
+            let body = body
+                .find("</a>")
+                .map(|index| &body[..index])
+                .unwrap_or(body);
             strip_html_tags(body).chars().take(400).collect()
         } else {
             String::new()
         };
-        hits.push(SearchHit { title, url, snippet });
+        hits.push(SearchHit {
+            title,
+            url,
+            snippet,
+        });
         if hits.len() >= limit {
             break;
         }
@@ -1045,7 +1124,9 @@ async fn web_search(query: &str, limit: usize) -> Result<String, String> {
     }
 
     if hits.is_empty() {
-        return Ok(format!("No web results found for '{query}'. Try a different query."));
+        return Ok(format!(
+            "No web results found for '{query}'. Try a different query."
+        ));
     }
     let mut output = format!("Web results for '{query}':\n");
     for (index, hit) in hits.iter().enumerate() {
@@ -1101,12 +1182,8 @@ async fn short_completion(
             { "role": "user", "content": user }
         ]
     });
-    let response = send_with_retry(|| {
-        http.post(OPENROUTER_CHAT)
-            .bearer_auth(key)
-            .json(&body)
-    })
-    .await?;
+    let response =
+        send_with_retry(|| http.post(OPENROUTER_CHAT).bearer_auth(key).json(&body)).await?;
     if !response.status().is_success() {
         let status = response.status();
         let raw = response.text().await.unwrap_or_default();
@@ -1211,7 +1288,11 @@ async fn recover_after_tools(
     let prompt = format!(
         "User question:\n{question}\n\nTool `{last_tool_name}` returned:\n{shown}\n\n\
          Assistant's unfinished message: {}\n\nSSH control available: {}",
-        if partial.trim().is_empty() { "(none)" } else { partial.trim() },
+        if partial.trim().is_empty() {
+            "(none)"
+        } else {
+            partial.trim()
+        },
         if may_run { "yes" } else { "no" }
     );
     let first = short_completion(&http, key, model, RECOVERY_SYSTEM, &prompt, 500)
@@ -1229,7 +1310,8 @@ async fn recover_after_tools(
         if let Ok(text) = short_completion(&http, key, model, COMMAND_SYSTEM, question, 120).await {
             if note_allowed {
                 if let Some((title, body)) = proposed_note(&text) {
-                    return persist_recovery_note(app, state, session, allow_vps, &title, &body).await;
+                    return persist_recovery_note(app, state, session, allow_vps, &title, &body)
+                        .await;
                 }
             }
             command = proposed_command(&text).or_else(|| {
@@ -1258,18 +1340,18 @@ async fn recover_after_tools(
                 "User question:\n{question}\n\nCommand run on the VPS:\n{command}\n\nOutput:\n{}",
                 cap_tool_text(&ran, 4_000)
             );
-            let answer = match short_completion(&http, key, model, ANSWER_SYSTEM, &follow_up, 500)
-                .await
-            {
-                Ok(text) => text,
-                Err(_) => format!(
-                    "Sudah saya jalankan di VPS, tetapi model tidak mengirim ringkasan:\n{}",
-                    cap_tool_text(&ran, 2_500)
-                ),
-            };
+            let answer =
+                match short_completion(&http, key, model, ANSWER_SYSTEM, &follow_up, 500).await {
+                    Ok(text) => text,
+                    Err(_) => format!(
+                        "Sudah saya jalankan di VPS, tetapi model tidak mengirim ringkasan:\n{}",
+                        cap_tool_text(&ran, 2_500)
+                    ),
+                };
             if note_allowed {
                 if let Some((title, body)) = proposed_note(&answer) {
-                    return persist_recovery_note(app, state, session, allow_vps, &title, &body).await;
+                    return persist_recovery_note(app, state, session, allow_vps, &title, &body)
+                        .await;
                 }
             }
             return answer;
@@ -1310,21 +1392,19 @@ async fn stream_completion(
         body["tools"] = tools_for(allow_vps, has_target);
         body["tool_choice"] = json!("auto");
     }
-    let mut response = match send_with_retry(|| {
-        http.post(OPENROUTER_CHAT)
-            .bearer_auth(key)
-            .json(&body)
-    })
-    .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            if messages.last().is_some_and(|message| message.role == "tool") {
-                return Ok((String::new(), Vec::new(), true));
+    let mut response =
+        match send_with_retry(|| http.post(OPENROUTER_CHAT).bearer_auth(key).json(&body)).await {
+            Ok(response) => response,
+            Err(error) => {
+                if messages
+                    .last()
+                    .is_some_and(|message| message.role == "tool")
+                {
+                    return Ok((String::new(), Vec::new(), true));
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
-    };
+        };
 
     if !response.status().is_success() {
         let status = response.status();
@@ -1341,7 +1421,10 @@ async fn stream_completion(
             ))
             .await;
         }
-        if messages.last().is_some_and(|message| message.role == "tool") {
+        if messages
+            .last()
+            .is_some_and(|message| message.role == "tool")
+        {
             return Ok((String::new(), Vec::new(), true));
         }
         return Err(format!("OpenRouter {status} — {message}"));
@@ -1358,7 +1441,10 @@ async fn stream_completion(
         // model itself is silent. A token-idle watchdog is the only reliable
         // way to stop waiting and hand control back to RuTerm.
         if last_delta.elapsed() > Duration::from_secs(30) {
-            if messages.last().is_some_and(|message| message.role == "tool") {
+            if messages
+                .last()
+                .is_some_and(|message| message.role == "tool")
+            {
                 return Ok((content, Vec::new(), true));
             }
             return Err("Model stopped responding before finishing.".into());
@@ -1370,7 +1456,10 @@ async fn stream_completion(
                 // A stalled completion right after a tool result must not eat
                 // the tool work. Hand an empty turn back so the caller can use
                 // its deterministic fallback.
-                if messages.last().is_some_and(|message| message.role == "tool") {
+                if messages
+                    .last()
+                    .is_some_and(|message| message.role == "tool")
+                {
                     return Ok((content, Vec::new(), true));
                 }
                 return Err(format!("Stream interrupted: {error}"));
@@ -1404,26 +1493,22 @@ async fn stream_completion(
             let Some(choice) = value.get("choices").and_then(|list| list.get(0)) else {
                 continue;
             };
-            let Some(delta) = choice.get("delta") else { continue };
+            let Some(delta) = choice.get("delta") else {
+                continue;
+            };
 
             if let Some(text) = delta.get("content").and_then(Value::as_str) {
                 if !text.is_empty() {
                     last_delta = Instant::now();
                     content.push_str(text);
-                    let _ = app.emit(
-                        "chat://delta",
-                        json!({ "session": session, "text": text }),
-                    );
+                    let _ = app.emit("chat://delta", json!({ "session": session, "text": text }));
                 }
             }
 
             if let Some(fragments) = delta.get("tool_calls").and_then(Value::as_array) {
                 for fragment in fragments {
                     last_delta = Instant::now();
-                    let index = fragment
-                        .get("index")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0) as usize;
+                    let index = fragment.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
                     while calls.len() <= index {
                         calls.push(Call::default());
                     }
@@ -1451,7 +1536,10 @@ async fn stream_completion(
     }
 
     if !saw_data {
-        return Err(format!("Unexpected OpenRouter response: {}", short_error(&buffer)));
+        return Err(format!(
+            "Unexpected OpenRouter response: {}",
+            short_error(&buffer)
+        ));
     }
     for call in &mut calls {
         if call.id.is_empty() {
@@ -1460,12 +1548,17 @@ async fn stream_completion(
     }
     Ok((
         content,
-        calls.into_iter().filter(|call| !call.name.is_empty()).collect(),
+        calls
+            .into_iter()
+            .filter(|call| !call.name.is_empty())
+            .collect(),
         false,
     ))
 }
 
 pub(crate) fn host_view(host: &Host, with_credentials: bool) -> Value {
+    // M4: host notes are private text and are omitted unless the user has
+    // approved a credential read.
     let mut view = json!({
         "label": host.label,
         "address": host.address,
@@ -1474,11 +1567,11 @@ pub(crate) fn host_view(host: &Host, with_credentials: bool) -> Value {
         "group": host.group_id,
         "tags": host.tags,
         "favorite": host.favorite,
-        "notes": host.notes,
         "os": host.os,
         "host_key_fingerprint": host.host_key_fingerprint,
     });
     if with_credentials {
+        view["notes"] = json!(host.notes);
         view["auth"] = serde_json::to_value(&host.auth).unwrap_or_else(|_| json!({}));
         view["env"] = json!(host.env);
     }
@@ -1645,9 +1738,14 @@ pub(crate) fn find_host<'a>(vault: &'a rterm_core::model::Vault, query: &str) ->
     }
     vault.hosts.iter().find(|host| {
         !host.deleted
-            && [&host.label, &host.address, &host.username, &host.id.to_string()]
-                .iter()
-                .any(|value| value.to_lowercase().contains(&needle))
+            && [
+                &host.label,
+                &host.address,
+                &host.username,
+                &host.id.to_string(),
+            ]
+            .iter()
+            .any(|value| value.to_lowercase().contains(&needle))
     })
 }
 
@@ -1656,9 +1754,7 @@ fn session_file(host: &Host) -> PathBuf {
     let safe: String = label
         .chars()
         .map(|character| {
-            if character.is_ascii_alphanumeric()
-                || matches!(character, '-' | '_' | '.')
-            {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
                 character
             } else {
                 '-'
@@ -1747,9 +1843,8 @@ pub(crate) fn note_title(body: &str) -> String {
         .lines()
         .map(|line| {
             let line = line.trim();
-            let line = line.trim_start_matches(|c: char| {
-                c.is_whitespace() || "#>*+-`_".contains(c)
-            });
+            let line =
+                line.trim_start_matches(|c: char| c.is_whitespace() || "#>*+-`_".contains(c));
             line.replace("**", "")
                 .replace("__", "")
                 .replace('`', "")
@@ -1886,8 +1981,18 @@ fn find_note<'a>(
 }
 
 fn append_action(path: &PathBuf, entry: &str) {
+    // M10: never follow a planted symlink, never leave a world-readable log,
+    // and never persist raw secret values.
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return;
+        }
+    }
     let stamp = Utc::now().format("%Y-%m-%d %H:%M UTC");
-    let line = format!("- [{stamp}] {}\n", compact_entry(entry, 500));
+    let line = format!(
+        "- [{stamp}] {}\n",
+        crate::mcp::redact_secrets(&compact_entry(entry, 500))
+    );
     let existing = fs::read_to_string(path).unwrap_or_default();
     let content = if existing.trim().is_empty() {
         format!("# RuTerm session memory\n\n## Work log\n\n{line}\n## Notes\n")
@@ -1896,10 +2001,77 @@ fn append_action(path: &PathBuf, entry: &str) {
     } else {
         format!("{existing}{line}\n")
     };
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+    let _ = crate::mcp::write_atomic_private(path, &content);
+}
+
+#[cfg(target_os = "macos")]
+const O_NOFOLLOW: i32 = 0x10000;
+#[cfg(target_os = "linux")]
+const O_NOFOLLOW: i32 = 0x80000;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const O_NOFOLLOW: i32 = 0;
+
+/// The home directory is owned by the unlocked user; compare config ownership
+/// against it without pulling in a new dependency just to call `getuid()`.
+fn home_owner_uid() -> Result<u32, String> {
+    use std::os::unix::fs::MetadataExt;
+    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+    let meta = fs::metadata(home).map_err(|e| e.to_string())?;
+    Ok(meta.uid())
+}
+
+fn read_owned_no_follow(path: &std::path::Path, expected_uid: u32) -> Result<String, String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(O_NOFOLLOW);
+    let mut file = options.open(path).map_err(|e| e.to_string())?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.file_type().is_file() || meta.uid() != expected_uid {
+        return Err(format!(
+            "Refusing to read an untrusted file: {}",
+            path.display()
+        ));
     }
-    let _ = fs::write(path, content);
+    let mut body = String::new();
+    file.read_to_string(&mut body).map_err(|e| e.to_string())?;
+    Ok(body)
+}
+
+fn ensure_owned_private_dir(path: &std::path::Path, expected_uid: u32) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    fs::create_dir_all(path).map_err(|e| e.to_string())?;
+    let meta = fs::metadata(path).map_err(|e| e.to_string())?;
+    if !meta.is_dir() || meta.uid() != expected_uid {
+        return Err(format!(
+            "Refusing an untrusted directory: {}",
+            path.display()
+        ));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn write_owned_atomic(path: &std::path::Path, body: &str, expected_uid: u32) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() || meta.uid() != expected_uid {
+            return Err(format!(
+                "Refusing to write an untrusted file: {}",
+                path.display()
+            ));
+        }
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        let meta = fs::metadata(parent).map_err(|e| e.to_string())?;
+        if !meta.is_dir() || meta.uid() != expected_uid {
+            return Err(format!(
+                "Refusing an untrusted directory: {}",
+                parent.display()
+            ));
+        }
+    }
+    crate::mcp::write_atomic_file(path, body)
 }
 
 /// Every chat action is recorded in the focused VPS's memory file, so the next
@@ -1920,9 +2092,9 @@ fn safe_filename(input: Option<&str>, fallback: &str) -> Result<String, String> 
         || name.contains('\\')
         || name.contains("..")
         || name == "."
-        || !name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+        || !name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
     {
         return Err("Filename must be a simple name without paths".into());
     }
@@ -1931,7 +2103,7 @@ fn safe_filename(input: Option<&str>, fallback: &str) -> Result<String, String> 
 
 async fn ask_approval(
     app: &AppHandle,
-    state: &AppState,
+    _state: &AppState,
     session: &str,
     dedupe: &str,
     kind: &str,
@@ -1939,41 +2111,71 @@ async fn ask_approval(
     detail: &str,
     preview: &str,
 ) -> Result<bool, String> {
-    if lock(&state.chat_always).contains(dedupe) {
+    if scoped_allowed(session, dedupe) {
         return Ok(true);
     }
-    let id = Uuid::new_v4().simple().to_string();
+    let allow_always = kind != "credential";
     let (tx, rx) = oneshot::channel();
-    lock(&state.chat_pending).insert(
-        id.clone(),
-        PendingApproval {
-            session: session.into(),
-            dedupe: dedupe.into(),
-            tx,
-        },
-    );
-    let _ = app.emit(
-        "chat://approval",
-        json!({
-            "id": id,
-            "kind": kind,
-            "title": title,
-            "detail": detail,
-            "preview": preview.chars().take(1200).collect::<String>(),
-        }),
-    );
-    // A modal left unanswered (or lost during a dev reload) must never block
-    // the chat forever. Deny it after the same window used by the MCP bridge.
+    let message = if preview.trim().is_empty() {
+        detail.to_string()
+    } else {
+        format!(
+            "{detail}\n\n{}",
+            preview.chars().take(1200).collect::<String>()
+        )
+    };
+    let title = if kind == "credential" {
+        "Allow AI to read private vault data?"
+    } else {
+        title
+    };
+    let mut dialog = app
+        .dialog()
+        .message(message)
+        .title(title)
+        .kind(MessageDialogKind::Warning);
+    // M5: credential dialogs never offer "Always allow".
+    dialog = if allow_always {
+        dialog.buttons(MessageDialogButtons::YesNoCancelCustom(
+            "Allow".into(),
+            "Deny".into(),
+            "Always for this reply".into(),
+        ))
+    } else {
+        dialog.buttons(MessageDialogButtons::OkCancelCustom(
+            "Allow".into(),
+            "Deny".into(),
+        ))
+    };
+    dialog.show_with_result(move |result| {
+        let choice = match result {
+            MessageDialogResult::Custom(label)
+                if label == "Always for this reply" || label.eq_ignore_ascii_case("always") =>
+            {
+                ApprovalChoice::Always
+            }
+            MessageDialogResult::Custom(label)
+                if label == "Allow" || label == "Yes" || label == "Ok" =>
+            {
+                ApprovalChoice::Allow
+            }
+            MessageDialogResult::Yes | MessageDialogResult::Ok => ApprovalChoice::Allow,
+            _ => ApprovalChoice::Deny,
+        };
+        let _ = tx.send(choice);
+    });
+    // A modal left unanswered must never block the chat forever.
     let choice = tokio::time::timeout(Duration::from_secs(120), rx)
         .await
         .unwrap_or(Ok(ApprovalChoice::Deny))
         .unwrap_or(ApprovalChoice::Deny);
-    lock(&state.chat_pending).remove(&id);
     match choice {
         ApprovalChoice::Deny => Ok(false),
         ApprovalChoice::Allow => Ok(true),
         ApprovalChoice::Always => {
-            lock(&state.chat_always).insert(dedupe.into());
+            if allow_always {
+                remember_scoped_allow(session, dedupe);
+            }
             Ok(true)
         }
     }
@@ -2024,7 +2226,9 @@ async fn run_tool(
             // SSH tab the user is looking at. Strip a hallucinated `session`
             // and refuse the bridge's tab-switching tool entirely.
             if mcp_name == "switch_target" {
-                return Err("AI Chat cannot switch SSH tabs. Ask the user to focus the target tab.".into());
+                return Err(
+                    "AI Chat cannot switch SSH tabs. Ask the user to focus the target tab.".into(),
+                );
             }
             let mut safe_args = args.clone();
             if let Value::Object(map) = &mut safe_args {
@@ -2063,7 +2267,10 @@ async fn run_tool(
                 .as_deref()
                 .filter(|value| interactive_command(value))
                 .map(|value| value.trim().to_string());
-            if normalized.as_deref().is_some_and(crate::mcp::nested_ssh_command) {
+            if normalized
+                .as_deref()
+                .is_some_and(crate::mcp::nested_ssh_command)
+            {
                 return Ok(
                     "Already inside the SSH tab — do not run a nested `ssh` command. Run the command directly in this VPS."
                         .into(),
@@ -2111,11 +2318,11 @@ async fn run_tool(
             {
                 launched_tui = true;
                 if let Value::Object(map) = &mut safe_args {
-                    let keys = args
-                        .get("keys")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    map.insert("command".into(), json!(crate::mcp::terminal_keys(keys).trim()));
+                    let keys = args.get("keys").and_then(Value::as_str).unwrap_or("");
+                    map.insert(
+                        "command".into(),
+                        json!(crate::mcp::terminal_keys(keys).trim()),
+                    );
                     map.remove("keys");
                 }
                 "open_tui"
@@ -2128,15 +2335,17 @@ async fn run_tool(
             } else {
                 mcp_name
             };
+            // M10: raw interactive keystrokes can contain passwords and must
+            // never be copied into a session memory file.
             let action_args = safe_args
                 .get("command")
-                .or_else(|| safe_args.get("keys"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let action = format!(
-                "AI chat tool {name}({})",
-                compact_entry(action_args, 200)
-            );
+            let action = if invoke_name == "send_keys" || mcp_name == "send_keys" {
+                format!("AI chat tool {name}(interactive keys omitted)")
+            } else {
+                format!("AI chat tool {name}({})", compact_entry(action_args, 200))
+            };
             let result = match crate::mcp::invoke_tool(app, &bridge, invoke_name, &safe_args) {
                 Ok(result) => {
                     remember_chat_action(app, &format!("{action} -> ok"));
@@ -2190,7 +2399,11 @@ async fn run_tool(
             Ok(format!(
                 "{} saved host(s). Credentials {}.\n{}",
                 hosts.len(),
-                if with_credentials { "included" } else { "omitted" },
+                if with_credentials {
+                    "included"
+                } else {
+                    "omitted"
+                },
                 serde_json::to_string_pretty(&hosts).unwrap_or_default()
             ))
         }
@@ -2230,11 +2443,27 @@ async fn run_tool(
             };
             Ok(format!(
                 "Host details (credentials {}):\n{}",
-                if with_credentials { "included" } else { "omitted" },
-                serde_json::to_string_pretty(&host_view(host, with_credentials)).unwrap_or_default()
+                if with_credentials {
+                    "included"
+                } else {
+                    "omitted"
+                },
+                serde_json::to_string_pretty(&host_view(host, with_credentials))
+                    .unwrap_or_default()
             ))
         }
         "list_notes" => {
+            let approved = credentials_allowed(
+                app,
+                state,
+                session,
+                "credential:notes",
+                "All saved note previews",
+            )
+            .await?;
+            if !approved {
+                return Ok("Note list denied by user.".into());
+            }
             let vault = state.unlocked_vault().await?;
             let notes: Vec<Value> = vault
                 .notes
@@ -2260,6 +2489,17 @@ async fn run_tool(
             let query = args.get("query").and_then(Value::as_str).unwrap_or("");
             if id.is_empty() && query.is_empty() {
                 return Err("id or query is required".into());
+            }
+            let approved = credentials_allowed(
+                app,
+                state,
+                session,
+                "credential:note-text",
+                "Saved note text",
+            )
+            .await?;
+            if !approved {
+                return Ok("Note read denied by user.".into());
             }
             let vault = state.unlocked_vault().await?;
             let matches: Vec<&rterm_core::model::Note> = vault
@@ -2340,7 +2580,10 @@ async fn run_tool(
                 deleted: false,
             });
             let payload = commands::persist_vault(state, vault).await?;
-            let _ = app.emit("rterm:note-created", json!({ "id": note_id, "payload": payload }));
+            let _ = app.emit(
+                "rterm:note-created",
+                json!({ "id": note_id, "payload": payload }),
+            );
             Ok(format!(
                 "Note '{label}' saved in your RuTerm vault and opened in a new tab."
             ))
@@ -2385,7 +2628,11 @@ async fn run_tool(
                 return Err("body must not be empty".into());
             }
             let append = args.get("append").and_then(Value::as_bool).unwrap_or(false);
-            let title = args.get("title").and_then(Value::as_str).unwrap_or("").trim();
+            let title = args
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
             if !append && !title.is_empty() {
                 let clean = title.chars().take(80).collect::<String>();
                 content = format!("# {clean}\n\n{}", strip_leading_title(&content, &clean));
@@ -2416,7 +2663,10 @@ async fn run_tool(
                 note.favorite = favorite;
             }
             let payload = commands::persist_vault(state, vault).await?;
-            let _ = app.emit("rterm:note-updated", json!({ "id": note_id, "payload": payload }));
+            let _ = app.emit(
+                "rterm:note-updated",
+                json!({ "id": note_id, "payload": payload }),
+            );
             Ok(format!(
                 "Note '{label}' updated in your RuTerm vault and refreshed in its tab."
             ))
@@ -2451,12 +2701,18 @@ async fn run_tool(
             note.deleted = true;
             note.updated_at = now();
             let payload = commands::persist_vault(state, vault).await?;
-            let _ = app.emit("rterm:note-deleted", json!({ "id": note_id, "payload": payload }));
+            let _ = app.emit(
+                "rterm:note-deleted",
+                json!({ "id": note_id, "payload": payload }),
+            );
             Ok(format!("Note '{label}' deleted from your RuTerm vault."))
         }
         "clear_chat_history" => {
             let _ = app.emit("chat://clear-request", json!({ "session": session }));
-            Ok("Clear chat history confirmation opened. Nothing was deleted until you confirm.".into())
+            Ok(
+                "Clear chat history confirmation opened. Nothing was deleted until you confirm."
+                    .into(),
+            )
         }
         "web_search" => {
             let query = args.get("query").and_then(Value::as_str).unwrap_or("");
@@ -2468,6 +2724,17 @@ async fn run_tool(
             web_search(query, limit).await
         }
         "list_snippets" => {
+            let approved = credentials_allowed(
+                app,
+                state,
+                session,
+                "credential:snippets",
+                "All saved snippet content",
+            )
+            .await?;
+            if !approved {
+                return Ok("Snippet list denied by user.".into());
+            }
             let vault = state.unlocked_vault().await?;
             let snippets: Vec<Value> = vault
                 .snippets
@@ -2518,7 +2785,8 @@ async fn run_tool(
                     .unwrap_or_default();
                 return Ok(format!("Available VPS memory files: {files}"));
             }
-            let host = find_host(&vault, name).ok_or_else(|| format!("No saved host matches '{name}'"))?;
+            let host =
+                find_host(&vault, name).ok_or_else(|| format!("No saved host matches '{name}'"))?;
             let path = session_file(host);
             let body = fs::read_to_string(&path).unwrap_or_default();
             Ok(format!(
@@ -2526,7 +2794,11 @@ async fn run_tool(
                 host.label,
                 format!("{}@{}:{}", host.username, host.address, host.port),
                 path.display(),
-                if body.trim().is_empty() { "(empty)" } else { &body }
+                if body.trim().is_empty() {
+                    "(empty)"
+                } else {
+                    &body
+                }
             ))
         }
         "create_snippet" => {
@@ -2600,19 +2872,29 @@ async fn run_tool(
                     home_dir()
                         .join(".ruterm")
                         .join("ai-configs")
-                        .join(safe_filename(args.get("filename").and_then(Value::as_str), "config.txt")?),
+                        .join(safe_filename(
+                            args.get("filename").and_then(Value::as_str),
+                            "config.txt",
+                        )?),
                     "~/.ruterm/ai-configs/".to_string(),
                 ),
                 "desktop" => (
-                    home_dir()
-                        .join("Desktop")
-                        .join(safe_filename(args.get("filename").and_then(Value::as_str), "ruterm-config.txt")?),
+                    home_dir().join("Desktop").join(safe_filename(
+                        args.get("filename").and_then(Value::as_str),
+                        "ruterm-config.txt",
+                    )?),
                     "~/Desktop/".to_string(),
                 ),
-                "ssh_config" => (home_dir().join(".ssh").join("config"), "~/.ssh/config".to_string()),
+                "ssh_config" => (
+                    home_dir().join(".ssh").join("config"),
+                    "~/.ssh/config".to_string(),
+                ),
                 other => return Err(format!("Unknown target '{other}'")),
             };
-            let dedupe = format!("write:config:{target}:{}", path.file_name().unwrap_or_default().to_string_lossy());
+            let dedupe = format!(
+                "write:config:{target}:{}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            );
             let approved = ask_approval(
                 app,
                 state,
@@ -2627,19 +2909,24 @@ async fn run_tool(
             if !approved {
                 return Ok("Config write denied by user.".into());
             }
-            if let Ok(metadata) = fs::symlink_metadata(&path) {
-                if metadata.file_type().is_symlink() {
-                    return Err("Refusing to write through a symlink".into());
-                }
-            }
+            let owner = home_owner_uid()?;
             if target == "ssh_config" {
-                let existing = fs::read_to_string(&path).unwrap_or_default();
+                ensure_owned_private_dir(&home_dir().join(".ssh"), owner)?;
+                // L10: O_NOFOLLOW read, ownership check, 0600 temp + atomic
+                // rename, and 0600 backups inside a 0700 ~/.ssh directory.
+                let existing = if path.exists() {
+                    read_owned_no_follow(&path, owner)?
+                } else {
+                    String::new()
+                };
                 let backup = home_dir().join(".ssh").join(format!(
                     "config.ruterm-backup-{}",
                     Utc::now().format("%Y%m%d-%H%M%S")
                 ));
-                fs::write(&backup, &existing)
-                    .map_err(|error| format!("Could not back up SSH config: {error}"))?;
+                if path.exists() {
+                    write_owned_atomic(&backup, &existing, owner)
+                        .map_err(|error| format!("Could not back up SSH config: {error}"))?;
+                }
                 let block = format!("{BEGIN_MARKER}\n{}\n{END_MARKER}\n", content.trim_end());
                 let updated = if let Some(start) = existing.find(BEGIN_MARKER) {
                     let end = existing[start..]
@@ -2655,18 +2942,19 @@ async fn run_tool(
                     text.push_str(&block);
                     text
                 };
-                fs::write(&path, &updated)
+                write_owned_atomic(&path, &updated, owner)
                     .map_err(|error| format!("Could not write SSH config: {error}"))?;
                 Ok(format!(
                     "SSH config updated (backup: {}).",
                     backup.display()
                 ))
             } else {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)
-                        .map_err(|error| format!("Could not create directory: {error}"))?;
+                if target == "ai-configs" {
+                    if let Some(parent) = path.parent() {
+                        ensure_owned_private_dir(parent, owner)?;
+                    }
                 }
-                fs::write(&path, content)
+                write_owned_atomic(&path, content, owner)
                     .map_err(|error| format!("Could not write config: {error}"))?;
                 Ok(format!("Config written to {}.", path.display()))
             }
@@ -2685,10 +2973,12 @@ async fn run_tool(
             let found = agents
                 .iter()
                 .find(|agent| {
-                    [&agent.id, &agent.label, &agent.command].iter().any(|value| {
-                        let value = value.to_lowercase();
-                        value == needle || value.contains(&needle)
-                    })
+                    [&agent.id, &agent.label, &agent.command]
+                        .iter()
+                        .any(|value| {
+                            let value = value.to_lowercase();
+                            value == needle || value.contains(&needle)
+                        })
                 })
                 .ok_or_else(|| {
                     let available: Vec<&str> = agents.iter().map(|a| a.label.as_str()).collect();
@@ -2728,8 +3018,16 @@ async fn run_tool(
             let has_password = matches!(host.auth, AuthMethod::Password { .. });
             let preview = format!(
                 "Label: {}\nAddress: {}:{}\nUser: {}\nAuth: {}\nNotes: {}",
-                host.label, host.address, host.port, host.username, auth_label,
-                if host.notes.is_empty() { "—" } else { &host.notes }
+                host.label,
+                host.address,
+                host.port,
+                host.username,
+                auth_label,
+                if host.notes.is_empty() {
+                    "—"
+                } else {
+                    &host.notes
+                }
             );
             let approved = ask_approval(
                 app,
@@ -2766,7 +3064,10 @@ async fn run_tool(
             let address = host.address.clone();
             vault.hosts.push(host);
             let payload = commands::persist_vault(state, vault).await?;
-            let _ = app.emit("rterm:host-created", json!({ "id": id, "payload": payload }));
+            let _ = app.emit(
+                "rterm:host-created",
+                json!({ "id": id, "payload": payload }),
+            );
             Ok(format!(
                 "Host '{label}' ({address}) saved and opened in a new SSH tab."
             ))
@@ -2893,10 +3194,7 @@ async fn fetch_models(state: &AppState) -> Result<Vec<ChatModel>, String> {
                 .iter()
                 .filter_map(|entry| {
                     let id = entry.get("id")?.as_str()?;
-                    let name = entry
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or(id);
+                    let name = entry.get("name").and_then(Value::as_str).unwrap_or(id);
                     Some(ChatModel {
                         id: id.to_string(),
                         name: name.to_string(),
@@ -2944,12 +3242,8 @@ pub async fn chat_test_key(state: State<'_, AppState>) -> Result<String, String>
             { "role": "user", "content": "Hello" }
         ]
     });
-    let response = send_with_retry(|| {
-        http.post(OPENROUTER_CHAT)
-            .bearer_auth(&key)
-            .json(&body)
-    })
-    .await?;
+    let response =
+        send_with_retry(|| http.post(OPENROUTER_CHAT).bearer_auth(&key).json(&body)).await?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
@@ -2980,6 +3274,8 @@ pub async fn chat_send(
     session: String,
     text: String,
 ) -> Result<(), String> {
+    clear_scoped_allow(&session);
+    let _scoped_allow_guard = ScopedAllowGuard(session.clone());
     let text = text.trim();
     if text.is_empty() {
         return Err("Message cannot be empty".into());
@@ -3033,29 +3329,28 @@ pub async fn chat_send(
 
         // On the final turn hide the tools so the model must wrap up in text.
         let allow_tools = turn < MAX_TURNS;
-        let (content, calls, _stalled) =
-            match stream_completion(
-                &app,
-                &session,
-                &http,
-                &key,
-                &model,
-                &messages,
-                allow_tools,
-                allow_vps,
-                has_target,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    let _ = app.emit(
-                        "chat://error",
-                        json!({ "session": session, "message": error }),
-                    );
-                    return Err(error);
-                }
-            };
+        let (content, calls, _stalled) = match stream_completion(
+            &app,
+            &session,
+            &http,
+            &key,
+            &model,
+            &messages,
+            allow_tools,
+            allow_vps,
+            has_target,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = app.emit(
+                    "chat://error",
+                    json!({ "session": session, "message": error }),
+                );
+                return Err(error);
+            }
+        };
         // Never let a tool-hungry model loop past the cap.
         let calls = if allow_tools { calls } else { Vec::new() };
 
@@ -3139,8 +3434,7 @@ pub async fn chat_send(
         }
 
         for call in &calls {
-            let args: Value = serde_json::from_str(&call.arguments)
-                .unwrap_or_else(|_| json!({}));
+            let args: Value = serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({}));
             let result = run_tool(&app, &state, &session, &call.name, &args, allow_vps)
                 .await
                 .unwrap_or_else(|error| format!("Tool error: {error}"));
@@ -3155,20 +3449,25 @@ pub async fn chat_send(
                 }),
             );
             let mut sessions = lock(&state.chat_sessions);
-            sessions.entry(session.clone()).or_default().push(ChatMessage {
-                role: "tool".into(),
-                content: result.clone(),
-                tool_calls: None,
-                tool_call_id: Some(call.id.clone()),
-                name: Some(call.name.clone()),
-            });
+            sessions
+                .entry(session.clone())
+                .or_default()
+                .push(ChatMessage {
+                    role: "tool".into(),
+                    content: result.clone(),
+                    tool_calls: None,
+                    tool_call_id: Some(call.id.clone()),
+                    name: Some(call.name.clone()),
+                });
             let lower = result.to_lowercase();
             if lower.contains("timed out")
                 || lower.contains("command produced no output")
                 || lower.starts_with("tool error")
             {
-                sessions.entry(session.clone()).or_default().push(
-                    ChatMessage::plain(
+                sessions
+                    .entry(session.clone())
+                    .or_default()
+                    .push(ChatMessage::plain(
                         "user",
                         format!(
                             "The last tool ({}) FAILED and returned no usable data. Do NOT report \
@@ -3176,8 +3475,7 @@ pub async fn chat_send(
                              Retry with a different tool or say the check failed.",
                             call.name
                         ),
-                    ),
-                );
+                    ));
             }
         }
 
@@ -3210,11 +3508,20 @@ pub async fn chat_approve(
     choice: String,
 ) -> Result<(), String> {
     let choice = parse_choice(&choice)?;
+    // M5: a credential read can never be approved persistently.
+    if choice == ApprovalChoice::Always {
+        let denied = lock(&state.chat_pending)
+            .get(&id)
+            .is_some_and(|approval| approval.kind == "credential");
+        if denied {
+            return Err("'Always allow' is not available for credential access".into());
+        }
+    }
     let approval = lock(&state.chat_pending)
         .remove(&id)
         .ok_or("Approval request expired")?;
-    if choice == ApprovalChoice::Always {
-        lock(&state.chat_always).insert(approval.dedupe);
+    if choice == ApprovalChoice::Always && approval.kind != "credential" {
+        remember_scoped_allow(&approval.session, &approval.dedupe);
     }
     let _ = approval.tx.send(choice);
     Ok(())
@@ -3272,7 +3579,9 @@ mod tests {
             address: "10.0.0.1".into(),
             port: 22,
             username: "root".into(),
-            auth: AuthMethod::Password { password: "hunter2".into() },
+            auth: AuthMethod::Password {
+                password: "hunter2".into(),
+            },
             group_id: None,
             tags: vec![],
             color: None,
@@ -3297,6 +3606,10 @@ mod tests {
         let safe = serde_json::to_string(&host_view(&host, false)).unwrap();
         assert!(!safe.contains("hunter2"));
         assert!(!safe.contains("secret"));
+        assert!(
+            !safe.contains("web server"),
+            "host notes need credential approval"
+        );
         assert!(safe.contains("production-api"));
 
         let full = serde_json::to_string(&host_view(&host, true)).unwrap();
@@ -3493,15 +3806,21 @@ mod tests {
 
     #[test]
     fn unfinished_answers_are_detected() {
-        assert!(looks_unfinished("Sekarang saya cek konfigurasi nginx dan SSL."));
+        assert!(looks_unfinished(
+            "Sekarang saya cek konfigurasi nginx dan SSL."
+        ));
         assert!(looks_unfinished("I'll check the disk usage now."));
         assert!(looks_unfinished("Baik, saya coba jalankan apt update."));
-        assert!(!looks_unfinished("RAM 522 MiB / 5.78 GiB (9%). Disk 8.56 GiB / 18.25 GiB (47%)."));
+        assert!(!looks_unfinished(
+            "RAM 522 MiB / 5.78 GiB (9%). Disk 8.56 GiB / 18.25 GiB (47%)."
+        ));
     }
 
     #[test]
     fn recovery_can_propose_a_note_artifact() {
-        let parsed = proposed_note("CREATE_NOTE: Nginx check\nPanel listen 80;\nSSL aktif sampai 2027.").unwrap();
+        let parsed =
+            proposed_note("CREATE_NOTE: Nginx check\nPanel listen 80;\nSSL aktif sampai 2027.")
+                .unwrap();
         assert_eq!(parsed.0, "Nginx check");
         assert_eq!(parsed.1, "Panel listen 80;\nSSL aktif sampai 2027.");
         assert!(proposed_note("CREATE_NOTE: only a title").is_none());
@@ -3532,28 +3851,39 @@ mod tests {
     #[test]
     fn leading_title_copies_are_removed_before_the_heading_is_added() {
         let title = "Validasi Sesi Auth di JavaScript";
-        let body = format!(
-            "{title}\n{title}\nKode 1 baris (versi ringkas)\nconst isSessionValid = true;"
-        );
+        let body =
+            format!("{title}\n{title}\nKode 1 baris (versi ringkas)\nconst isSessionValid = true;");
         assert_eq!(
             strip_leading_title(&body, title),
             "Kode 1 baris (versi ringkas)\nconst isSessionValid = true;"
         );
-        assert_eq!(strip_leading_title(&format!("# {title}\n\nDetail"), title), "Detail");
-        assert_eq!(strip_leading_title("Detail tanpa judul", title), "Detail tanpa judul");
+        assert_eq!(
+            strip_leading_title(&format!("# {title}\n\nDetail"), title),
+            "Detail"
+        );
+        assert_eq!(
+            strip_leading_title("Detail tanpa judul", title),
+            "Detail tanpa judul"
+        );
     }
 
     #[test]
     fn nested_ssh_is_blocked_before_it_reaches_the_vps() {
-        assert!(crate::mcp::nested_ssh_command("ssh root@109.123.235.168 -p 20153 'free -h'"));
+        assert!(crate::mcp::nested_ssh_command(
+            "ssh root@109.123.235.168 -p 20153 'free -h'"
+        ));
         assert!(crate::mcp::nested_ssh_command("sudo ssh root@example.com"));
-        assert!(!crate::mcp::nested_ssh_command("sshd -T | grep PermitRootLogin"));
+        assert!(!crate::mcp::nested_ssh_command(
+            "sshd -T | grep PermitRootLogin"
+        ));
         assert!(!crate::mcp::nested_ssh_command("grep -R 'ssh' /etc/nginx"));
     }
 
     #[test]
     fn recovery_parses_any_next_command_without_topic_keywords() {
-        let a = proposed_command("Need to look at the config.\nNEED_COMMAND: `grep -R server_name /etc/nginx`");
+        let a = proposed_command(
+            "Need to look at the config.\nNEED_COMMAND: `grep -R server_name /etc/nginx`",
+        );
         assert_eq!(a.as_deref(), Some("grep -R server_name /etc/nginx"));
         let b = proposed_command("need_command: $ df -h");
         assert_eq!(b.as_deref(), Some("df -h"));

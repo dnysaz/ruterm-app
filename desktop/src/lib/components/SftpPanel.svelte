@@ -166,7 +166,7 @@
   // ------------------------------------------------------------- actions
   async function uploadFiles() {
     try {
-      const handles = await api.sftpPickUploads();
+      const handles = await api.sftpPickUploads(sftpId, sftpToken);
       if (!handles.length) return;
       busy += handles.length;
       let failed = 0;

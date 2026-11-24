@@ -1,5 +1,10 @@
 # Cara Build & Deploy RuTerm (macOS)
 
+![RuTerm icon](desktop/static/app-icon.png)
+
+Ikon aplikasi kanonik ada di `desktop/static/app-icon.png` (salinan dari
+`~/Downloads/RuTerm_.png`) dan dipakai juga di README serta halaman About.
+
 Catatan ini dibuat setelah incident **CSS terminal (xterm) dan code editor (Monaco) tidak terload di release bundle**, padahal di `npm run dev`正常. Ikuti persis supaya tidak terulang.
 
 ---
@@ -18,7 +23,7 @@ Vite/SvelteKit **memecah CSS menjadi chunk terpisah** untuk modul yang di-import
 
 Chunk ini **disuntikkan lewat JavaScript saat runtime** (`<link>` ditambahkan dinamis ke `<head>`). Di browser biasa (Chrome/Firefox) ini works. Di **Tauri WKWebView macOS**, suntikan runtime ini **tidak reliably diterapkan** — stylesheet-nya tidak pernah dipakai, sehingga xterm & Monaco render tanpa style.
 
-Selain itu, **CSP (Content Security Policy) yang dikonfigurasi di `tauri.conf.json` ikut memblokir** stylesheet inline/external pada WebView.
+CSP tidak boleh dimatikan. Gunakan CSP yang mengizinkan `<style>` inline lewat `style-src 'self' 'unsafe-inline'`; itu cukup untuk WKWebView tanpa membuka celah script inline.
 
 ### Fix yang dipakai (SUDAH TERBUKTI AMAN)
 Dua perubahan, **keduanya wajib ada**:
@@ -33,15 +38,15 @@ Dua perubahan, **keduanya wajib ada**:
    - Juga me-rewrite `url(...)` relatif (font, codicon) jadi path absolut `/...` supaya tetap ke-load.
    - **Jangan dihapus** dan jangan diubah menjadi `<link>` lagi.
 
-2. **Nonaktifkan CSP di `desktop/src-tauri/tauri.conf.json`**
+2. **Biarkan CSP aktif di `desktop/src-tauri/tauri.conf.json`**
    ```json
    "security": {
-     "csp": null,
-     "devCsp": null
+     "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; ...",
+     "devCsp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; ..."
    }
    ```
-   - Ini yang membuat inline `<style>` benar-benar dipakai WKWebView.
-   - Jika CSP dikembalikan, CSS bisa kacau lagi.
+   - `style-src 'unsafe-inline'` membuat inline `<style>` tetap dipakai WKWebView.
+   - `script-src 'self'` (tanpa `unsafe-inline` di produksi) menahan script suntikan; jangan kembalikan ke `null`.
 
 > Catatan: `vite.config.js` tidak boleh pakai `build.cssCodeSplit: false` — SvelteKit meng-override opsi itu (warning `vite_config_overridden`), jadi tidak ada efek.
 
@@ -74,11 +79,11 @@ ps aux | grep '/Applications/RuTerm.app' | grep -v grep | awk '{print $2}' | xar
 rm -rf /Applications/RuTerm.app
 cp -R /Users/ketutdana/Desktop/rterm/desktop/src-tauri/target/release/bundle/macos/RuTerm.app /Applications/RuTerm.app
 xattr -d com.apple.quarantine /Applications/RuTerm.app 2>/dev/null || true
-git -C /Users/ketutdana/Desktop/rterm checkout -- News/index.json 2>/dev/null || true
+git -C /Users/ketutdana/Desktop/rterm checkout -- news/index.json 2>/dev/null || true
 open -a /Applications/RuTerm.app
 ```
 
-`git checkout -- News/index.json` penting karena `npm run build` (prebuild) selalu regenerate `News/index.json` + `desktop/static/news/`. Jangan sampai ikut ter-commit.
+`git checkout -- news/index.json` penting karena `npm run build` (prebuild) selalu regenerate `news/index.json` + `desktop/static/news/`. Jangan sampai ikut ter-commit.
 
 ---
 
@@ -141,9 +146,9 @@ grep -c 'rel="stylesheet"' /Users/ketutdana/Desktop/rterm/desktop/build/index.ht
 - [ ] `npm run check` → 0 error
 - [ ] `npm run tauri build` sukses
 - [ ] `build/index.html` punya 5 blok `data-inline-css`, 0 `<link rel="stylesheet">`
-- [ ] `tauri.conf.json` → `"csp": null`
+- [ ] `tauri.conf.json` → CSP aktif, `style-src` mengizinkan `'unsafe-inline'`, `script-src` tidak
 - [ ] `desktop/scripts/link-all-css.mjs` ada dan dipanggil di `package.json`
-- [ ] `News/index.json` sudah di-revert (tidak ikut modified)
+- [ ] `news/index.json` berisi `sha256` tiap entry dan ikut di-commit saat rilis
 - [ ] `.app` dicopy ke `/Applications/RuTerm.app`, quarantine dihapus
 - [ ] Buka app, coba `htop` / `opencode` di terminal + buka file SFTP di editor
 - [ ] Jangan commit/push tanpa izin eksplisit
