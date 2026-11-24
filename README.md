@@ -136,9 +136,10 @@ A Termius-class workflow, built in the open.
 
 ### Security posture
 
-- Strict Content Security Policy is enabled (inline styles only, so themes
-  still render), `withGlobalTauri` is off, and the main window and About window
-  have separate minimal capabilities.
+- Content Security Policy is enabled with strict sources; inline CSS and the
+  first-party inline bootstrap scripts are allowed because SvelteKit and the
+  theme boot code need them. `withGlobalTauri` is off, and the main window and
+  About window have separate minimal capabilities.
 - MCP/chat logs use private 0600 atomic writes with secret redaction, SSH config
   writes use `O_NOFOLLOW` + 0600 rename, `vault_lock` closes live sessions, and
   external links are HTTPS-only.

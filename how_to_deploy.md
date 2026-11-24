@@ -148,7 +148,7 @@ grep -c 'rel="stylesheet"' /Users/ketutdana/Desktop/rterm/desktop/build/index.ht
 - [ ] `npm run check` → 0 error
 - [ ] `npm run tauri build` sukses
 - [ ] `build/index.html` punya 5 blok `data-inline-css`, 0 `<link rel="stylesheet">`
-- [ ] `tauri.conf.json` → CSP aktif, `style-src` mengizinkan `'unsafe-inline'`, `script-src` tidak
+- [ ] `tauri.conf.json` → CSP aktif, `style-src` dan `script-src` mengizinkan `'unsafe-inline'` (SvelteKit butuh inline bootstrap), source lain tetap ketat
 - [ ] `desktop/scripts/link-all-css.mjs` ada dan dipanggil di `package.json`
 - [ ] `news/index.json` berisi `sha256` tiap entry dan ikut di-commit saat rilis
 - [ ] `.app` dicopy ke `/Applications/RuTerm.app`, quarantine dihapus
