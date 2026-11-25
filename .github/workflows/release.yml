@@ -7,7 +7,7 @@
 #   git push origin v0.1.0
 #
 # Artifacts produced:
-#   macOS    RuTerm_<ver>_<arch>.dmg        (.app inside)
+#   macOS    RuTerm_<ver>_aarch64.dmg + RuTerm_<ver>_x64.dmg (.app inside)
 #   Windows  RuTerm_<ver>_x64-setup.exe     (NSIS) +_RuTerm_<ver>_x64_en-US.msi (WiX)
 #   Linux    RuTerm_<ver>_amd64.deb         + .AppImage
 #
@@ -42,12 +42,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos
+          - platform: macos-arm
             os: macos-latest
+            args: --target aarch64-apple-darwin
+          - platform: macos-x64
+            os: macos-latest
+            args: --target x86_64-apple-darwin
           - platform: windows
             os: windows-latest
+            args: ''
           - platform: linux
             os: ubuntu-22.04
+            args: ''
 
     steps:
       # Pinned to full commit SHAs so a moved floating tag cannot alter builds.
@@ -63,6 +69,8 @@ jobs:
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          targets: ${{ startsWith(matrix.platform, 'macos') && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Install Linux system dependencies
         if: matrix.platform == 'linux'
@@ -78,7 +86,7 @@ jobs:
         run: npm ci
 
       - name: Build & upload installers (unsigned)
-        if: ${{ vars.ENABLE_MACOS_SIGNING != 'true' || matrix.platform != 'macos' }}
+        if: ${{ vars.ENABLE_MACOS_SIGNING != 'true' || !startsWith(matrix.platform, 'macos') }}
         # generates SHA256SUMS in a separate job below, after all builds finish
         uses: tauri-apps/tauri-action@fce9c6108b31ea247710505d3aaaa893ee6768d4 # v0
         env:
@@ -103,9 +111,10 @@ jobs:
             contact address in the README, never a public issue.
           releaseDraft: true
           prerelease: false
+          args: ${{ matrix.args }}
 
       - name: Build & upload signed macOS installers
-        if: ${{ vars.ENABLE_MACOS_SIGNING == 'true' && matrix.platform == 'macos' }}
+        if: ${{ vars.ENABLE_MACOS_SIGNING == 'true' && startsWith(matrix.platform, 'macos') }}
         uses: tauri-apps/tauri-action@fce9c6108b31ea247710505d3aaaa893ee6768d4 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -134,6 +143,7 @@ jobs:
             contact address in the README, never a public issue.
           releaseDraft: true
           prerelease: false
+          args: ${{ matrix.args }}
 
   checksums:
     name: SHA256SUMS
