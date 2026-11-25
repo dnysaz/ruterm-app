@@ -40,11 +40,39 @@ pub enum LocalEvent {
     },
 }
 
-fn shell() -> String {
-    std::env::var("SHELL")
+/// Resolve the interactive shell and its startup flags for this platform.
+///
+/// Windows has no `/bin/zsh`, and `SHELL` may be inherited from Git Bash as a
+/// full command line (`/bin/zsh -l`), which cannot be passed to
+/// `CreateProcessW` as a single program name. Prefer an explicitly resolved
+/// PowerShell executable, then `cmd.exe`.
+#[cfg(windows)]
+fn shell() -> (String, Vec<String>) {
+    fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
+        let paths = std::env::var_os("PATH")?;
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(name))
+            .find(|candidate| candidate.is_file())
+    }
+
+    for name in ["pwsh.exe", "powershell.exe"] {
+        if let Some(path) = find_on_path(name) {
+            return (
+                path.to_string_lossy().into_owned(),
+                vec!["-NoLogo".to_string()],
+            );
+        }
+    }
+    ("cmd.exe".to_string(), Vec::new())
+}
+
+#[cfg(not(windows))]
+fn shell() -> (String, Vec<String>) {
+    let program = std::env::var("SHELL")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "/bin/zsh".to_string())
+        .unwrap_or_else(|| "/bin/zsh".to_string());
+    (program, vec!["-l".to_string()])
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -85,6 +113,17 @@ fn sanitized_env(cmd: &mut CommandBuilder) {
         "USERPROFILE",
         "APPDATA",
         "LOCALAPPDATA",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "ComSpec",
+        "PATHEXT",
+        "PSModulePath",
+        "windir",
+        "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+        "PROCESSOR_IDENTIFIER",
+        "PROCESSOR_LEVEL",
+        "PROCESSOR_REVISION",
     ];
     for name in INHERIT {
         if let Ok(value) = std::env::var(name) {
@@ -92,6 +131,13 @@ fn sanitized_env(cmd: &mut CommandBuilder) {
                 cmd.env(name, value);
             }
         }
+    }
+    #[cfg(windows)]
+    if std::env::var_os("HOME").is_none() {
+        cmd.env(
+            "HOME",
+            crate::store::home_dir().to_string_lossy().into_owned(),
+        );
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
@@ -124,8 +170,11 @@ pub fn open(
         .openpty(size)
         .map_err(|e| format!("pty: {e}"))?;
 
-    let mut cmd = CommandBuilder::new(shell());
-    cmd.arg("-l");
+    let (program, args) = shell();
+    let mut cmd = CommandBuilder::new(program);
+    for arg in args {
+        cmd.arg(arg);
+    }
     sanitized_env(&mut cmd);
     // Per-tab environment for AI agents (e.g. OPENCODE_CONFIG_CONTENT). The
     // variable belongs to the login shell, so any command typed into it
