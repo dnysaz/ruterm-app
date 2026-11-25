@@ -1,7 +1,10 @@
-# RuTerm v0.1.0 installers
+# RuTerm installers
 
-These files are copied from the GitHub release for tag `v0.1.0` (commit `70f4c7e`)
-so they can be downloaded directly from this repository.
+**Latest: [v0.1.1](v0.1.1/)** — fixes the Windows startup crash. Use that folder.
+
+The files in this folder are the archived `v0.1.0` installers, copied from the
+GitHub release for tag `v0.1.0` (commit `70f4c7e`) so they can still be
+downloaded directly from this repository.
 
 Builds are **unsigned**. Verify the SHA-256 checksums before running anything.
 
