@@ -1,6 +1,6 @@
 {
   "name": "ruterm",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "RuTerm — open-source SSH workspace for the desktop: local JSON vault, sealed secrets, credential-encrypted sync",
   "type": "module",
   "scripts": {
