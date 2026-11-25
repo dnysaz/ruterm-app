@@ -29,13 +29,22 @@ sudo dnf install ./RuTerm-0.1.2-1.x86_64.rpm
 chmod +x RuTerm_0.1.2_amd64.AppImage && ./RuTerm_0.1.2_amd64.AppImage
 ```
 
-## macOS Apple Silicon
+## macOS
 
-Open `RuTerm_0.1.2_aarch64.dmg` and drag RuTerm into Applications. If
-Gatekeeper blocks it, right-click → **Open** → **Open**, or after copying:
+- Apple Silicon / M1–M4: `RuTerm_0.1.2_aarch64.dmg`
+- Intel / x86_64: `RuTerm_0.1.2_x64.dmg`
+
+Open the matching DMG and drag RuTerm into Applications. If Gatekeeper blocks
+it, right-click → **Open** → **Open**, or after copying:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/RuTerm.app
+```
+
+Check the architecture with:
+
+```bash
+file /Applications/RuTerm.app/Contents/MacOS/rterm-app
 ```
 
 ## Verify
