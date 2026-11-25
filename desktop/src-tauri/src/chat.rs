@@ -396,9 +396,7 @@ where
 }
 
 fn home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
+    crate::store::home_dir()
 }
 
 /// The no-target variant is sent on every request, so an old tool result in

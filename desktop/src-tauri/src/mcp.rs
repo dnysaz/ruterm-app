@@ -286,8 +286,7 @@ impl Bridge {
                 }
             })
             .collect();
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home)
+        crate::store::home_dir()
             .join(".ruterm")
             .join("sessions")
             .join(format!("{safe}.md"))
@@ -493,8 +492,7 @@ fn agent_workspace(agent: &str) -> Result<PathBuf, String> {
     if safe.is_empty() {
         return Err("invalid agent id".into());
     }
-    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
-    Ok(PathBuf::from(home)
+    Ok(crate::store::home_dir()
         .join(".ruterm")
         .join("agents")
         .join(safe))
@@ -543,6 +541,13 @@ pub(crate) fn write_atomic_file(path: &Path, body: &str) -> Result<(), String> {
         file.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
         file.flush().map_err(|e| e.to_string())?;
         drop(file);
+        // Unlike Unix, std::fs::rename on Windows cannot replace an existing
+        // file. The symlink check above already rejected a planted link, so
+        // removing the old file before the rename is safe here.
+        #[cfg(windows)]
+        if path.exists() {
+            fs::remove_file(path).map_err(|e| e.to_string())?;
+        }
         fs::rename(&temp, path).map_err(|e| e.to_string())?;
         #[cfg(unix)]
         {
@@ -573,8 +578,9 @@ fn write_private_config(path: &Path, body: &str) -> Result<(), String> {
 
 /// Private file holding the raw bridge token. Only Rust reads/writes it.
 fn bridge_token_file() -> Result<PathBuf, String> {
-    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
-    Ok(PathBuf::from(home).join(".ruterm").join("bridge.token"))
+    Ok(crate::store::home_dir()
+        .join(".ruterm")
+        .join("bridge.token"))
 }
 
 fn write_token_file(token: &str) -> Result<PathBuf, String> {
@@ -707,9 +713,8 @@ pub fn agent_launch(
     bridge.rotate_token_once()?;
     let url = format!("http://127.0.0.1:{}/mcp", bridge.port);
     let token = bridge.current_token();
-    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
     // L8: paths are passed as data (cwd), never interpolated into shell text.
-    let desktop = PathBuf::from(home)
+    let desktop = crate::store::home_dir()
         .join("Desktop")
         .to_string_lossy()
         .to_string();

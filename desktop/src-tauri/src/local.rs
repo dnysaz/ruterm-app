@@ -138,9 +138,8 @@ pub fn open(
             }
         }
     }
-    if let Some(dir) = cwd.or_else(|| std::env::var("HOME").ok()) {
-        cmd.cwd(dir);
-    }
+    let dir = cwd.unwrap_or_else(|| crate::store::home_dir().to_string_lossy().into_owned());
+    cmd.cwd(dir);
 
     let child = pair
         .slave

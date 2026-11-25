@@ -2007,7 +2007,7 @@ pub async fn local_open(
 /// back to home when the given directory does not exist — the PTY spawn
 /// would fail otherwise.
 fn expand_cwd(cwd: Option<String>) -> Option<String> {
-    let home = std::env::var("HOME").ok();
+    let home = Some(crate::store::home_dir().to_string_lossy().into_owned());
     let dir = cwd?.trim().to_string();
     if dir.is_empty() {
         return home;

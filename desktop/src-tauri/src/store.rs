@@ -17,6 +17,31 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+/// Cross-platform home directory.
+///
+/// Windows does not normally define `HOME`; using it unconditionally made the
+/// MCP bridge fail during `setup()` and the app exited immediately after the
+/// splash. Prefer the native Windows variables, then fall back to `HOME` on
+/// Unix-like systems.
+pub fn home_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            if !profile.trim().is_empty() {
+                return PathBuf::from(profile);
+            }
+        }
+        if let (Ok(drive), Ok(path)) = (std::env::var("HOMEDRIVE"), std::env::var("HOMEPATH")) {
+            if !drive.trim().is_empty() && !path.trim().is_empty() {
+                return PathBuf::from(format!("{drive}{path}"));
+            }
+        }
+    }
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
 /// Owner-only permissions for app data (F-11).
 #[cfg(unix)]
 pub fn restrict_dir(path: &Path) -> Result<(), String> {
